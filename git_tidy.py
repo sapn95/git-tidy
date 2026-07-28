@@ -1064,18 +1064,32 @@ def default_branch(git: Git, cfg: dict[str, Any]) -> str | None:
     if configured != "auto":
         return str(configured)
     remote = cfg["remote"]
-    head = git.out("symbolic-ref", "--quiet", f"refs/remotes/{remote}/HEAD", check=False)
-    if head.startswith(f"refs/remotes/{remote}/"):
-        return head.split("/", 3)[3]
-    # No cached HEAD: ask the remote to record one, then re-read it.
+
+    def exists(branch: str) -> bool:
+        return git.ok("show-ref", "--verify", "--quiet", f"refs/remotes/{remote}/{branch}")
+
+    cached = _cached_head(git, remote)
+    if cached and exists(cached):
+        return cached
+    # Either there is no cached HEAD, or it is stale — a repository renamed from
+    # master to main upstream keeps pointing at a branch that is no longer there.
+    # Both cases are answered by asking the remote again.
     if git.ok("remote", "set-head", remote, "--auto"):
-        head = git.out("symbolic-ref", "--quiet", f"refs/remotes/{remote}/HEAD", check=False)
-        if head.startswith(f"refs/remotes/{remote}/"):
-            return head.split("/", 3)[3]
+        fresh = _cached_head(git, remote)
+        if fresh and exists(fresh):
+            return fresh
     for candidate in cfg["default_branch_candidates"]:
-        if git.ok("show-ref", "--verify", "--quiet", f"refs/remotes/{remote}/{candidate}"):
+        if exists(candidate):
             return str(candidate)
-    return None
+    # Nothing resolved. Hand back the stale name if there was one, so the report
+    # says which branch is missing rather than that there is no default at all.
+    return cached
+
+
+def _cached_head(git: Git, remote: str) -> str | None:
+    head = git.out("symbolic-ref", "--quiet", f"refs/remotes/{remote}/HEAD", check=False)
+    prefix = f"refs/remotes/{remote}/"
+    return head[len(prefix) :] if head.startswith(prefix) else None
 
 
 def is_dirty(git: Git) -> bool:
