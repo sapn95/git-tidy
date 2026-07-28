@@ -513,6 +513,26 @@ def test_default_branch_falls_back_to_a_candidate(workspace: Path):
     assert gt.default_branch(gt.Git(repo), config()["sync"]) == "main"
 
 
+def test_default_branch_recovers_from_a_stale_cached_head(workspace: Path):
+    """A repo renamed master -> main upstream keeps a HEAD pointing at nothing.
+
+    Trusting that cached name reports "remote branch missing" and syncs nothing,
+    for as long as the clone lives.
+    """
+    repo = workspace / "repo"
+    git(repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/master")
+    assert gt.default_branch(gt.Git(repo), config()["sync"]) == "main"
+
+
+def test_default_branch_reports_the_stale_name_when_nothing_resolves(workspace: Path):
+    """With the remote unreachable too, say which branch is missing."""
+    repo = workspace / "repo"
+    git(repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/master")
+    git(repo, "update-ref", "-d", "refs/remotes/origin/main")
+    git(repo, "remote", "set-url", "origin", str(workspace / "gone.git"))
+    assert gt.default_branch(gt.Git(repo), config()["sync"]) == "master"
+
+
 def test_default_branch_can_be_forced(workspace: Path):
     cfg = config(sync={"default_branch": "release"})["sync"]
     assert gt.default_branch(gt.Git(workspace / "repo"), cfg) == "release"
