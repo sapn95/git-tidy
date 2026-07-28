@@ -986,13 +986,63 @@ def test_clean_never_reaches_into_dot_git(workspace: Path):
 def test_a_branch_checked_out_in_another_worktree_is_reported_not_lost(
     workspace: Path, remote: Path, tmp_path: Path
 ):
+    """git cannot delete it, and saying so beats one failure line per branch."""
     repo = workspace / "repo"
     make_gone_branch(repo, remote, "feature")
     git(repo, "worktree", "add", "-q", str(tmp_path / "wt"), "feature")
 
     actions = gt.prune_branches(repo, "repo", config(), run())
     assert "feature" in git(repo, "branch", "--format=%(refname:short)").split()
-    assert any(a.error for a in actions if a.target == "feature")
+    held = [a for a in actions if a.target == "feature"]
+    assert held and held[0].skipped and "checked out in" in held[0].detail
+    assert not any(a.error for a in actions)
+
+
+def test_force_does_not_help_a_branch_a_worktree_holds(
+    workspace: Path, remote: Path, tmp_path: Path
+):
+    """--force lowers git-tidy's guards, not git's. Removing a worktree is a decision."""
+    repo = workspace / "repo"
+    make_gone_branch(repo, remote, "feature", extra_commit=True)
+    git(repo, "worktree", "add", "-q", str(tmp_path / "wt"), "feature")
+
+    forced = gt._merge(gt.DEFAULTS, gt.FORCE_OVERRIDES, "force")
+    actions = gt.prune_branches(repo, "repo", forced, run())
+    assert "feature" in git(repo, "branch", "--format=%(refname:short)").split()
+    assert not any(a.error for a in actions)
+
+
+def test_force_stashes_instead_of_discarding(workspace: Path, remote: Path, tmp_path: Path):
+    """--force gets the switch done without throwing uncommitted work away."""
+    git(tmp_path, "clone", "-q", str(remote), "other")
+    commit(tmp_path / "other", "theirs.txt")
+    git(tmp_path / "other", "push", "-q")
+
+    repo = workspace / "repo"
+    git(repo, "switch", "-q", "-c", "side")
+    (repo / "README.md").write_text("work in progress\n", encoding="utf-8")
+
+    forced = gt._merge(gt.DEFAULTS, gt.FORCE_OVERRIDES, "force")
+    actions = gt.sync_repo(repo, "repo", forced, run())
+
+    assert gt.current_branch(gt.Git(repo)) == "main", "the switch happened"
+    assert any(a.kind == "stash" and a.applied for a in actions)
+    assert not any(a.error for a in actions)
+    # The work is not gone, it is one `git stash pop` away.
+    assert "git-tidy: repo" in git(repo, "stash", "list")
+    git(repo, "switch", "-q", "side")
+    git(repo, "stash", "pop")
+    assert (repo / "README.md").read_text(encoding="utf-8") == "work in progress\n"
+
+
+def test_without_force_uncommitted_work_is_never_stashed(workspace: Path):
+    repo = workspace / "repo"
+    git(repo, "switch", "-q", "-c", "side")
+    (repo / "README.md").write_text("work in progress\n", encoding="utf-8")
+
+    gt.sync_repo(repo, "repo", config(), run())
+    assert git(repo, "stash", "list") == ""
+    assert (repo / "README.md").read_text(encoding="utf-8") == "work in progress\n"
 
 
 def test_guard_refuses_to_escape_the_root(tmp_path: Path):

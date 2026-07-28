@@ -64,7 +64,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NoReturn
 
-__version__ = "1.0.3"
+__version__ = "1.1.0"
 
 CONFIG_NAMES = (".git-tidy.yaml", ".git-tidy.yml")
 QUARANTINE_DIRNAME = ".git-tidy-trash"
@@ -134,6 +134,7 @@ DEFAULTS: dict[str, Any] = {
         "prune_tags": False,
         "submodules": "none",
         "gc": False,
+        "stash": False,
         "timeout": 120,
     },
     "branches": {
@@ -259,6 +260,11 @@ COMMENTS: dict[str, str] = {
     "init:   init and update missing ones\n"
     "update: also force existing ones onto the recorded commit",
     "sync.gc": "Repack loose objects when git itself thinks it is worth it.",
+    "sync.stash": "Stash uncommitted work rather than refusing to move. This is what\n"
+    "--force turns on: the switch and the fast-forward then happen, and the\n"
+    "changes come back with `git stash pop`. Nothing is discarded — a stash is\n"
+    "the only way to force this that does not throw away work git cannot\n"
+    "recover.",
     "sync.timeout": "Seconds any one git command may take. A remote behind a VPN that has\n"
     "just dropped does not refuse the connection, it stops answering, and\n"
     "without a bound the run simply appears to hang. Lower it for a workspace\n"
@@ -1179,11 +1185,18 @@ def _switch(
         return _Outcome([Action("switch", name, branch, f"staying on {where}", skipped=True)])
     if policy not in ("always", "clean-only"):
         raise Failure(f"sync.switch must be always, clean-only or never, not {policy!r}")
-    if policy == "clean-only" and is_dirty(git):
-        return _Outcome(
-            [Action("switch", name, branch, f"uncommitted changes on {where}", skipped=True)],
-            stop=True,
-        )
+    stashed: list[Action] = []
+    if is_dirty(git):
+        if policy == "clean-only":
+            return _Outcome(
+                [Action("switch", name, branch, f"uncommitted changes on {where}", skipped=True)],
+                stop=True,
+            )
+        if sync["stash"] and not decider.dry:
+            put_aside = _stash(git, name)
+            stashed.append(put_aside)
+            if put_aside.error:
+                return _Outcome(stashed, stop=True)
     # A branch can only be checked out in one worktree at a time, and a workspace
     # that keeps .worktrees/ next to the clones hits this constantly. Nothing is
     # wrong: the branch is simply in use elsewhere, so say so rather than fail.
@@ -1196,7 +1209,7 @@ def _switch(
 
     action = Action("switch", name, branch, f"switch from {where}")
     if not decider.allow(action):
-        return _Outcome([action], stop=True)
+        return _Outcome([*stashed, action], stop=True)
     result = git.run("switch", branch, check=False)
     if result.returncode != 0 and not git.ok(
         "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"
@@ -1207,10 +1220,23 @@ def _switch(
         result = git.run("switch", "--create", branch, "--track", target, check=False)
     if result.returncode != 0:
         action.error = last_line(result)
-        return _Outcome([action], stop=True)
+        return _Outcome([*stashed, action], stop=True)
     action.applied = True
     action.detail = f"switched from {where}"
-    return _Outcome([action])
+    return _Outcome([*stashed, action])
+
+
+def _stash(git: Git, name: str) -> Action:
+    """Put uncommitted work aside so a switch or fast-forward can proceed.
+
+    Deliberately a stash and not `checkout --force`: the point of --force is to
+    get the move done, not to destroy work that was never committed anywhere.
+    `git stash pop` brings it back.
+    """
+    result = git.run("stash", "push", "--include-untracked", "-m", f"git-tidy: {name}", check=False)
+    if result.returncode != 0:
+        return Action("stash", name, "-", "", error=last_line(result))
+    return Action("stash", name, "-", "stashed uncommitted work", applied=True)
 
 
 def _checked_out_elsewhere(git: Git, branch: str) -> str | None:
@@ -1265,21 +1291,29 @@ def _fast_forward(
         return [
             Action("update", name, head, f"diverged: {ahead} ahead, {behind} behind", skipped=True)
         ]
+    stashed: list[Action] = []
     if is_dirty(git):
-        # git would refuse anyway, with "Your local changes would be overwritten
-        # by merge". Refusing first turns a failure into a plain statement of
-        # fact, which is what it is.
-        return [Action("update", name, head, f"uncommitted changes, {behind} behind", skipped=True)]
+        if not sync["stash"] or decider.dry:
+            # git would refuse anyway, with "Your local changes would be
+            # overwritten by merge". Refusing first turns a failure into a plain
+            # statement of fact, which is what it is.
+            return [
+                Action("update", name, head, f"uncommitted changes, {behind} behind", skipped=True)
+            ]
+        put_aside = _stash(git, name)
+        stashed.append(put_aside)
+        if put_aside.error:
+            return stashed
     action = Action("update", name, head, f"fast-forward {plural(behind, 'commit')}")
     if not decider.allow(action):
-        return [action]
+        return [*stashed, action]
     result = git.run("merge", "--ff-only", "--quiet", upstream, check=False)
     if result.returncode != 0:
         action.error = last_line(result)
     else:
         action.applied = True
         action.detail = f"fast-forwarded {plural(behind, 'commit')}"
-    return [action]
+    return [*stashed, action]
 
 
 def _sync_submodules(git: Git, name: str, sync: dict[str, Any], decider: Decider) -> list[Action]:
@@ -1359,16 +1393,20 @@ def prune_branches(path: Path, name: str, cfg: dict[str, Any], decider: Decider)
             reason = "never pushed"
         else:
             continue
+        # A branch checked out in a linked worktree cannot be deleted either.
+        # Saying so beats one failure line per branch, and --force cannot help:
+        # the answer is to remove the worktree, which is a decision, not a detail.
+        held_by = _checked_out_elsewhere(git, branch.name)
+        if held_by:
+            actions.append(
+                Action("branch", name, branch.name, f"checked out in {held_by}", skipped=True)
+            )
+            continue
 
         if rules["require_merged"]:
-            kept = _unmerged_reason(git, branch, trunk, remote)
-            if kept is VANISHED:
-                actions.append(
-                    Action("branch", name, branch.name, f"already deleted ({reason})", skipped=True)
-                )
-                continue
+            kept = _keep_reason(git, branch, trunk, remote, reason)
             if kept is not None:
-                actions.append(Action("branch", name, branch.name, str(kept), skipped=True))
+                actions.append(Action("branch", name, branch.name, kept, skipped=True))
                 continue
 
         action = Action("branch", name, branch.name, f"delete ({reason})")
@@ -1396,6 +1434,16 @@ def prune_branches(path: Path, name: str, cfg: dict[str, Any], decider: Decider)
 # sharing this ref store got to it first. Distinct from "keep it", which is what
 # a bare reason string means.
 VANISHED = object()
+
+
+def _keep_reason(
+    git: Git, branch: BranchInfo, trunk: str | None, remote: str, reason: str
+) -> str | None:
+    """The message to report, or None when the branch may go."""
+    kept = _unmerged_reason(git, branch, trunk, remote)
+    if kept is VANISHED:
+        return f"already deleted ({reason})"
+    return None if kept is None else str(kept)
 
 
 def _unmerged_reason(git: Git, branch: BranchInfo, trunk: str | None, remote: str) -> Any:
@@ -2668,7 +2716,7 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
 # back, and none of which anyone means when they say "force".
 FORCE_OVERRIDES: dict[str, Any] = {
     "branches": {"require_merged": False},
-    "sync": {"switch": "always"},
+    "sync": {"switch": "always", "stash": True},
     "clean": {"regenerable": ["*"]},
 }
 
