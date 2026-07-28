@@ -1,0 +1,90 @@
+.TH GIT-TIDY 1 "2026" "git-tidy" "Git Extensions"
+.SH NAME
+git-tidy \- keep a directory full of git checkouts clean
+.SH SYNOPSIS
+.B git tidy
+[\fB\-C\fR \fIDIR\fR] [\fB\-n\fR|\fB\-i\fR|\fB\-\-apply\fR] [\fB\-j\fR \fIN\fR]
+\fIsync\fR|\fIprune\fR|\fIclean\fR|\fItrash\fR|\fIdoctor\fR|\fIrun\fR|\fIinit\fR|\fIconfig\fR|\fIrestore\fR
+.SH DESCRIPTION
+Fetches every repository under a directory, puts each back on the branch its
+remote calls default, deletes the local branches whose upstream is gone, and
+reclaims the space build tools left behind.
+.PP
+Nothing is modified without \fB\-\-ask\fR or \fB\-\-apply\fR.
+.SH COMMANDS
+.TP
+.B sync
+Fetch, prune remote-tracking refs, switch to the default branch, fast-forward.
+Never merges, never rebases. A repository that has diverged is reported.
+.TP
+.B prune
+Delete local branches whose upstream is gone from the remote, but only once
+their commits are contained in the default branch. Unpushed work is reported.
+.TP
+.B clean
+Remove build output and caches. With \fBclean.ignored\fR, everything
+.B .gitignore
+already calls disposable. A tracked file is never deleted.
+.TP
+.B trash
+Sweep loose junk in the workspace into a timestamped quarantine with a
+manifest. Off until a config turns it on.
+.TP
+.B doctor
+Report what needs a human: credentials in remote URLs, detached HEADs,
+unpushed commits, repositories with no remote. Changes nothing.
+.TP
+.B run
+sync, prune, clean, trash and doctor, in that order.
+.TP
+.B init
+Write a commented configuration file, globally or for one directory.
+.TP
+.B config
+Print the effective configuration for any path.
+.TP
+.B restore
+Put quarantined files back.
+.SH MODES
+.TP
+.BR \-n ", " \-\-dry\-run
+The default. Print what would happen and change nothing.
+.TP
+.BR \-i ", " \-\-ask
+Confirm every change: y, n, a (all of this kind), s (skip this kind),
+Y (everything), q (stop). Runs single-threaded so the prompts do not interleave.
+.TP
+.B \-\-apply
+Carry every change out without asking.
+.SH OPTIONS
+.TP
+.BR \-C ", " \-\-workspace " " \fIDIR\fR
+The directory holding the repositories. Defaults to the current one.
+.TP
+.BR \-j ", " \-\-jobs " " \fIN\fR
+How much to do at once. The default is one worker per CPU core.
+.TP
+.BR \-\-include ", " \-\-exclude " " \fIGLOB\fR
+Limit which repositories are touched. Repeatable.
+.TP
+.B \-\-json
+Print the report as JSON.
+.SH FILES
+.TP
+.I ~/.config/git-tidy/config.yaml
+Global configuration.
+.TP
+.I .git\-tidy.yaml
+Per-directory configuration, in the workspace root or any directory down to a
+single repository. Merged over the global file; the deepest one wins.
+.TP
+.I .git\-tidy\-trash/
+Quarantine, one timestamped directory per sweep, each with a manifest.
+.SH EXIT STATUS
+0 on success, 1 if anything failed, 2 on a usage or configuration error.
+.SH SEE ALSO
+.BR git\-clean (1),
+.BR git\-fetch (1),
+.BR git\-worktree (1)
+.PP
+https://github.com/sapn95/git-tidy

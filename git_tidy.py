@@ -64,7 +64,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NoReturn
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 
 CONFIG_NAMES = (".git-tidy.yaml", ".git-tidy.yml")
 QUARANTINE_DIRNAME = ".git-tidy-trash"
@@ -134,6 +134,7 @@ DEFAULTS: dict[str, Any] = {
         "prune_tags": False,
         "submodules": "none",
         "gc": False,
+        "timeout": 120,
     },
     "branches": {
         "enabled": True,
@@ -258,6 +259,10 @@ COMMENTS: dict[str, str] = {
     "init:   init and update missing ones\n"
     "update: also force existing ones onto the recorded commit",
     "sync.gc": "Repack loose objects when git itself thinks it is worth it.",
+    "sync.timeout": "Seconds any one git command may take. A remote behind a VPN that has\n"
+    "just dropped does not refuse the connection, it stops answering, and\n"
+    "without a bound the run simply appears to hang. Lower it for a workspace\n"
+    "full of remotes that are sometimes unreachable.",
     "branches": "Deleting local branches that the remote no longer has.",
     "branches.enabled": "Turn the whole branch step off for this directory.",
     "branches.prune_gone": "Delete local branches whose upstream has disappeared from\nthe remote.",
@@ -1104,7 +1109,7 @@ def current_branch(git: Git) -> str:
 def sync_repo(path: Path, name: str, cfg: dict[str, Any], decider: Decider) -> list[Action]:
     """Fetch, then fast-forward this repo onto its default branch."""
     sync = cfg["sync"]
-    git = Git(path)
+    git = Git(path, timeout=int(sync["timeout"]))
     actions: list[Action] = []
     remote = sync["remote"]
 
@@ -1251,7 +1256,11 @@ def _fast_forward(
     if not counts:
         return [Action("update", name, head, "cannot compare with upstream", skipped=True)]
     if behind == "0":
-        return [Action("update", name, head, "already up to date", skipped=True)]
+        # In a dry run nothing was fetched, so this is measured against the
+        # remote-tracking ref as it already stood. Saying "already up to date"
+        # would be claiming something this run did not check.
+        when = " as of the last fetch" if decider.dry else ""
+        return [Action("update", name, head, f"up to date{when}", skipped=True)]
     if ahead != "0":
         return [
             Action("update", name, head, f"diverged: {ahead} ahead, {behind} behind", skipped=True)
@@ -1333,7 +1342,7 @@ def list_branches(git: Git) -> list[BranchInfo]:
 def prune_branches(path: Path, name: str, cfg: dict[str, Any], decider: Decider) -> list[Action]:
     """Delete local branches the remote no longer has, keeping unpushed work."""
     rules = cfg["branches"]
-    git = Git(path)
+    git = Git(path, timeout=int(cfg["sync"]["timeout"]))
     actions: list[Action] = []
     trunk = default_branch(git, cfg["sync"])
     remote = cfg["sync"]["remote"]
@@ -1567,6 +1576,11 @@ def clean_tree(
                 continue
             if stay_inside and candidate != root and is_repo(candidate):
                 continue  # a repo of its own; not this walk's business
+            if not clean["dependencies"] and _matches(name, clean["dependency_dirs"]):
+                # A .venv full of __pycache__ is the package manager's business,
+                # not ours. Descending into it produced hundreds of lines of
+                # output for a few megabytes nobody asked about.
+                continue
             if _matches(name, dir_patterns) and not _protected(candidate, root, keep, tracked):
                 matched.append(name)
             else:
@@ -1916,7 +1930,7 @@ def redact(url: str) -> str:
 def doctor_repo(path: Path, name: str, cfg: dict[str, Any]) -> list[Action]:
     """Report the things that need a decision rather than a command."""
     checks = cfg["doctor"]
-    git = Git(path)
+    git = Git(path, timeout=int(cfg["sync"]["timeout"]))
     actions: list[Action] = []
 
     remotes = git.out("remote", check=False).split()
@@ -2006,14 +2020,57 @@ def human_size(count: int) -> str:
     return f"{size:.1f} TB"
 
 
+# Kinds where one line per path is noise rather than information: a workspace
+# produces thousands of them, and no one reads past the first screen.
+# Doctor findings are deliberately not here: each one says something different,
+# and collapsing them would print the first one's message over all of them.
+ROLLED_UP = ("remove", "ignored")
+
+
+def _past_tense(action: Action) -> str:
+    """What a group of identical actions did, in one word."""
+    if action.applied:
+        return "quarantined" if "quarantin" in action.detail else "removed"
+    return "would remove"
+
+
 class Printer:
     """Prints as work finishes, so a long run is not a silent one."""
 
-    def __init__(self, stream: Any, quiet: bool, color: bool) -> None:
+    def __init__(self, stream: Any, quiet: bool, color: bool, verbose: bool = False) -> None:
         self.stream = stream
         self.quiet = quiet
         self.color = color
+        self.verbose = verbose
         self._lock = threading.Lock()
+
+    def batch(self, actions: Sequence[Action]) -> None:
+        """Print one repository's worth of work, rolled up unless -v is on."""
+        if self.quiet:
+            return
+        rolled: dict[tuple[str, str, bool], list[Action]] = {}
+        for action in actions:
+            if self.verbose or action.kind not in ROLLED_UP or action.error:
+                self.action(action)
+                continue
+            rolled.setdefault((action.kind, action.scope, action.skipped), []).append(action)
+        for (kind, scope, skipped), group in rolled.items():
+            if len(group) == 1:
+                self.action(group[0])
+                continue
+            size = sum(a.size for a in group)
+            verb = group[0].detail.split(":")[0] if skipped else _past_tense(group[0])
+            self.action(
+                Action(
+                    kind,
+                    scope,
+                    plural(len(group), "path"),
+                    verb,
+                    size=size,
+                    applied=group[0].applied,
+                    skipped=skipped,
+                )
+            )
 
     def paint(self, text: str, code: str) -> str:
         return f"\033[{code}m{text}\033[0m" if self.color else text
@@ -2046,40 +2103,108 @@ class Printer:
             print(text, file=self.stream)
 
 
+# How each kind of action reads in the summary, in the order it is listed.
+DID: tuple[tuple[str, str, str], ...] = (
+    # kind, what happened, what would happen
+    ("fetch", "repositories fetched", "repositories to fetch"),
+    ("switch", "branches switched", "branches to switch"),
+    ("update", "repositories fast-forwarded", "repositories to fast-forward"),
+    ("submodules", "submodules updated", "submodules to update"),
+    ("branch", "branches deleted", "branches to delete"),
+    ("remove", "artefacts removed", "artefacts to remove"),
+    ("ignored", "ignored paths removed", "ignored paths to remove"),
+    ("trash", "loose files swept", "loose files to sweep"),
+    ("restore", "files restored", "files to restore"),
+    ("expire", "quarantines deleted", "quarantines to delete"),
+)
+
+
 def summarise(report: Report, mode: str, printer: Printer) -> None:
-    kinds: dict[str, list[Action]] = {}
+    """A summary a person can act on: what happened, what needs them, what broke."""
+    if printer.quiet:
+        return
+    done: dict[str, int] = {}
     for action in report.actions:
-        kinds.setdefault(action.kind, []).append(action)
+        if action.applied or (mode == DRY and not action.skipped and not action.error):
+            done[action.kind] = done.get(action.kind, 0) + 1
+
     printer.heading("Summary")
-    for kind, actions in sorted(kinds.items()):
-        done = sum(1 for a in actions if a.applied)
-        skipped = sum(1 for a in actions if a.skipped)
-        failed = sum(1 for a in actions if a.error)
-        pending = len(actions) - done - skipped - failed
-        bits = []
-        if done:
-            bits.append(f"{done} done")
-        if pending:
-            bits.append(f"{pending} pending")
-        if skipped:
-            bits.append(f"{skipped} skipped")
-        if failed:
-            bits.append(f"{failed} failed")
-        printer.line(f"  {kind:<12} {', '.join(bits) or 'nothing to do'}")
+    for kind, did, would in DID:
+        if done.get(kind):
+            printer.line(f"  {done[kind]:>6}  {would if mode == DRY else did}")
+
     freed = report.bytes_found if mode == DRY else report.bytes_freed
     if freed:
-        printer.line(
-            f"  {'disk':<12} {'would free' if mode == DRY else 'freed'} {human_size(freed)}"
-        )
-    # Never let a safety rule quietly shrink the result: a run that held twenty
-    # directories back should say so, rather than read as "that was everything".
-    held = [a for a in report.actions if a.skipped and a.detail.startswith("kept:")]
-    if held:
-        printer.line(f"  {'held back':<12} {plural(len(held), 'item')}, listed above with -")
+        printer.line(f"  {human_size(freed):>6}  {'to free' if mode == DRY else 'freed'}")
+
+    _summarise_held_back(report, printer)
+    _summarise_errors(report, printer)
+
     if mode == DRY and any(not a.skipped and not a.error for a in report.actions):
-        printer.line(
-            "\n  This was a dry run. Use --ask to confirm each change, or --apply for all."
-        )
+        printer.line("\n  Nothing was changed. --ask to confirm each one, --apply to do all.")
+
+
+def _summarise_held_back(report: Report, printer: Printer) -> None:
+    """Group everything skipped by *why*, because the why is the actionable part."""
+    reasons: dict[str, int] = {}
+    for action in report.actions:
+        if not action.skipped:
+            continue
+        reason = _reason_of(action.detail)
+        if reason:
+            reasons[reason] = reasons.get(reason, 0) + 1
+    if not reasons:
+        return
+    printer.line("\n  Held back — these need you:")
+    for reason, count in sorted(reasons.items(), key=lambda pair: -pair[1]):
+        printer.line(f"  {count:>6}  {reason}")
+    printer.line("           re-run with --force to do them anyway, or -v to see each one")
+
+
+# Substring seen in a per-item message -> the class of problem it belongs to.
+# Ordered, because "not in the trunk" and "not pushed" both mention commits.
+NOT_HELD_BACK = ("up to date", "already deleted", "nothing to fast-forward")
+REASONS: tuple[tuple[str, str], ...] = (
+    ("uncommitted changes", "uncommitted changes — left on their branch"),
+    ("not in origin", "branches with commits not in the trunk"),
+    ("commits not in", "branches with commits not in the trunk"),
+    ("diverged", "diverged from upstream — needs a merge or rebase by hand"),
+    ("contains a git repository", "artefact directories holding a git repository"),
+    ("checked out in", "default branch checked out in another worktree"),
+    ("ignored_keep", "ignored files kept as local state (.env, *.tfstate, keys)"),
+    ("no such remote", "no remote configured"),
+    ("no remote", "no remote configured"),
+    ("credential in the remote url", "a credential sits in the remote URL"),
+    ("not pushed", "branches with commits that exist only here"),
+    ("detached", "detached HEAD"),
+    ("declined", "declined at the prompt"),
+    ("remote branch missing", "no usable default branch"),
+    ("no default branch", "no usable default branch"),
+    ("consider git gc", ".git big enough to be worth a git gc"),
+)
+
+
+def _reason_of(detail: str) -> str | None:
+    """Collapse a per-item message into the class of problem it belongs to."""
+    text = detail.lower()
+    if any(quiet in text for quiet in NOT_HELD_BACK):
+        return None  # nothing was held back; there was nothing to do
+    for needle, reason in REASONS:
+        if needle in text:
+            return reason
+    return "other, see the lines marked -"
+
+
+def _summarise_errors(report: Report, printer: Printer) -> None:
+    if not report.errors:
+        return
+    printer.line(f"\n  {len(report.errors)} failed:")
+    seen: dict[str, int] = {}
+    for action in report.errors:
+        seen[action.error or "failed"] = seen.get(action.error or "failed", 0) + 1
+    for message, count in sorted(seen.items(), key=lambda pair: -pair[1])[:5]:
+        prefix = f"{count}x " if count > 1 else ""
+        printer.line(f"      {prefix}{message[:100]}")
 
 
 # --------------------------------------------------------------------------- #
@@ -2115,17 +2240,17 @@ def _in_parallel(context: Context, work: Callable[[Path], list[Action]], report:
     jobs = context.jobs
     if jobs <= 1:
         for repo in context.repos:
-            for action in _guarded(work, repo, context):
-                report.add(action)
-                context.printer.action(action)
+            results = _guarded(work, repo, context)
+            report.extend(results)
+            context.printer.batch(results)
         return
     with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
         futures = [pool.submit(_guarded, work, repo, context) for repo in context.repos]
         try:
             for future in concurrent.futures.as_completed(futures):
-                for action in future.result():
-                    report.add(action)
-                    context.printer.action(action)
+                results = future.result()
+                report.extend(results)
+                context.printer.batch(results)
         except Quit:  # pragma: no cover - only reachable from --ask, which is serial
             for future in futures:
                 future.cancel()
@@ -2200,9 +2325,9 @@ def cmd_clean(context: Context, report: Report) -> None:
     if root_cfg["clean"]["enabled"]:
         context.printer.heading("Artefacts outside repositories")
         holding = context.quarantine if root_cfg["clean"]["quarantine"] else None
-        for action in _outside_repos(context, root_cfg, holding):
-            report.add(action)
-            context.printer.action(action)
+        loose = _outside_repos(context, root_cfg, holding)
+        report.extend(loose)
+        context.printer.batch(loose)
 
 
 def _outside_repos(
@@ -2286,11 +2411,9 @@ def cmd_trash(context: Context, report: Report) -> None:
     if not cfg["trash"]["enabled"]:
         context.printer.line("  trash is off; set trash.enabled: true to sweep loose files")
         return
-    for action in sweep_trash(
-        context.workspace, cfg, context.decider, context.quarantine, context.repos
-    ):
-        report.add(action)
-        context.printer.action(action)
+    swept = sweep_trash(context.workspace, cfg, context.decider, context.quarantine, context.repos)
+    report.extend(swept)
+    context.printer.batch(swept)
 
 
 def cmd_doctor(context: Context, report: Report) -> None:
@@ -2433,7 +2556,20 @@ def add_common_options(parser: argparse.ArgumentParser, after_command: bool) -> 
         help="carry every change out without asking",
         **hide,
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="also do what the safety rules held back (see the description)",
+        **hide,
+    )
     parser.add_argument("--json", action="store_true", help="print the report as JSON", **hide)
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="print every path, instead of one line per repository",
+        **hide,
+    )
     parser.add_argument("-q", "--quiet", action="store_true", help="only print the summary", **hide)
     parser.add_argument("--no-color", action="store_true", help="never colour the output", **hide)
     parser.add_argument(
@@ -2496,8 +2632,9 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=f"write {global_config_path()}",
     )
+    # --force comes from the common options: for init it means the same thing it
+    # means everywhere else, "do it even though something is in the way".
     where.add_argument("--path", metavar="DIR", help="write .git-tidy.yaml in this directory")
-    init_cmd.add_argument("--force", action="store_true", help="overwrite an existing file")
 
     restore_cmd = command("restore", "put quarantined files back")
     restore_cmd.add_argument("stamp", nargs="?", help="which quarantine (default: the newest)")
@@ -2518,8 +2655,28 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     return args
 
 
+# What --force lowers, and what it deliberately does not.
+#
+# It lowers the guards that hold back git-tidy's own actions: keeping a branch
+# whose commits are not in the trunk, keeping an artefact directory because
+# something cloned a repository into it, staying on a branch because the worktree
+# is dirty.
+#
+# It does not touch clean.tracked, clean.ignored_keep or trash.sensitive. Those
+# protect committed content, local-only state like .env and *.tfstate, and files
+# that may hold the only copy of a credential — none of which this tool can put
+# back, and none of which anyone means when they say "force".
+FORCE_OVERRIDES: dict[str, Any] = {
+    "branches": {"require_merged": False},
+    "sync": {"switch": "always"},
+    "clean": {"regenerable": ["*"]},
+}
+
+
 def overrides_from(args: argparse.Namespace) -> dict[str, Any]:
     overrides: dict[str, Any] = {}
+    if getattr(args, "force", False):
+        overrides = {k: dict(v) for k, v in FORCE_OVERRIDES.items()}
     if getattr(args, "jobs", None) is not None:
         if args.jobs < 1:
             raise Failure("--jobs must be at least 1")
@@ -2563,6 +2720,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         sys.stdout,
         quiet=args.quiet or args.json,
         color=not args.no_color and sys.stdout.isatty() and os.environ.get("NO_COLOR") is None,
+        verbose=args.verbose,
     )
     if args.mode == ASK and not sys.stdin.isatty():
         raise Failure("--ask needs a terminal; use --apply for an unattended run")

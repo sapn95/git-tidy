@@ -84,6 +84,7 @@ jobs:
           ./dist/git_tidy.dist/git-tidy --version
       - name: package
         run: |
+          cp man/git-tidy.1 dist/git_tidy.dist/
           cd dist/git_tidy.dist
           tar -czf "../git-tidy-linux-${{ matrix.arch }}.tar.gz" .
           cd ..
@@ -110,6 +111,7 @@ jobs:
           ./dist/git_tidy.dist/git-tidy --version
       - name: package
         run: |
+          cp man/git-tidy.1 dist/git_tidy.dist/
           cd dist/git_tidy.dist
           tar -czf ../git-tidy-macos-arm64.tar.gz .
           cd ..
