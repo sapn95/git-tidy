@@ -1,0 +1,18 @@
+extends: default
+
+rules:
+  # GitHub workflows are long lines by nature; ruff's 100 columns govern Python,
+  # not YAML.
+  line-length:
+    max: 120
+    level: warning
+  # `on:` in a workflow is the trigger block, not the boolean.
+  truthy:
+    check-keys: false
+  comments:
+    min-spaces-from-content: 1
+  document-start: disable
+
+ignore: |
+  .venv/
+  dist/
