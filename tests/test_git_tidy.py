@@ -481,6 +481,60 @@ def test_sync_reports_a_diverged_branch(workspace: Path, remote: Path, tmp_path:
     assert diverged and diverged[0].skipped
 
 
+def test_sync_reports_a_branch_held_by_another_worktree(workspace: Path, tmp_path: Path):
+    """A branch lives in one worktree at a time. That is a fact, not a failure."""
+    repo = workspace / "repo"
+    git(repo, "switch", "-q", "-c", "side")
+    git(repo, "worktree", "add", "-q", str(tmp_path / "wt"), "main")
+
+    actions = gt.sync_repo(repo, "repo", config(), run())
+    switch = [a for a in actions if a.kind == "switch"]
+    assert switch and switch[0].skipped and "checked out in" in switch[0].detail
+    assert not any(a.error for a in actions)
+    assert gt.current_branch(gt.Git(repo)) == "side"
+
+
+def test_sync_does_not_fast_forward_over_uncommitted_changes(
+    workspace: Path, remote: Path, tmp_path: Path
+):
+    """Already on the default branch, but the worktree is dirty."""
+    git(tmp_path, "clone", "-q", str(remote), "other")
+    commit(tmp_path / "other", "theirs.txt")
+    git(tmp_path / "other", "push", "-q")
+
+    repo = workspace / "repo"
+    (repo / "README.md").write_text("mine\n", encoding="utf-8")
+    actions = gt.sync_repo(repo, "repo", config(), run())
+
+    update = [a for a in actions if a.kind == "update"]
+    assert update and update[0].skipped and "uncommitted changes" in update[0].detail
+    assert not any(a.error for a in actions)
+    assert (repo / "README.md").read_text(encoding="utf-8") == "mine\n"
+
+
+def test_checked_out_elsewhere_finds_the_other_worktree(workspace: Path, tmp_path: Path):
+    repo = workspace / "repo"
+    git(repo, "switch", "-q", "-c", "side")
+    git(repo, "worktree", "add", "-q", str(tmp_path / "wt"), "main")
+
+    where = gt._checked_out_elsewhere(gt.Git(repo), "main")
+    assert where and Path(where).name == "wt"
+    assert gt._checked_out_elsewhere(gt.Git(repo), "side") is None, "this worktree does not count"
+
+
+def test_switch_creates_a_branch_that_only_exists_on_the_remote(workspace: Path, remote: Path):
+    """The --create path is still taken when there is no local branch."""
+    repo = workspace / "repo"
+    git(repo, "push", "-q", "origin", "main:release")
+    git(repo, "fetch", "-q", "origin")
+    git(repo, "switch", "-q", "-c", "side")
+
+    cfg = config(sync={"default_branch": "release"})
+    actions = gt.sync_repo(repo, "repo", cfg, run())
+    assert gt.current_branch(gt.Git(repo)) == "release"
+    assert any(a.kind == "switch" and a.applied for a in actions)
+
+
 def test_sync_reports_a_repo_with_no_remote(tmp_path: Path):
     lonely = tmp_path / "lonely"
     lonely.mkdir()
