@@ -21,18 +21,18 @@ class GitTidy < Formula
 
     on_arm do
       url "https://github.com/sapn95/git-tidy/releases/download/v1.0.0/git-tidy-macos-arm64.tar.gz"
-      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+      sha256 "1f950967786afad8078423ec3c0d501e20270a763e705990f07bdec1682a7d37"
     end
   end
 
   on_linux do
     on_arm do
       url "https://github.com/sapn95/git-tidy/releases/download/v1.0.0/git-tidy-linux-arm64.tar.gz"
-      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+      sha256 "736c5a0453ab7c2a71687639bc307fc92c4a6e62dea4b98394274ddd3ec836e6"
     end
     on_intel do
       url "https://github.com/sapn95/git-tidy/releases/download/v1.0.0/git-tidy-linux-x86_64.tar.gz"
-      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+      sha256 "123b9e89289b8b0fdbdc3c3376bb19b49b4a42d44d1f5458ea823af60a112f73"
     end
   end
 
