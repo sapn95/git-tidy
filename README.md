@@ -37,15 +37,15 @@ git-tidy does the safe parts automatically, and reports the parts that need you.
 
 | Command            | Does                                                                              |
 | ------------------ | --------------------------------------------------------------------------------- |
-| `git-tidy sync`    | Fetch, prune remote refs, switch to the default branch, fast-forward               |
-| `git-tidy prune`   | Delete local branches whose upstream is gone, once their commits are in the trunk  |
-| `git-tidy clean`   | Remove build output and caches, including everything `.gitignore` already covers   |
-| `git-tidy trash`   | Sweep loose junk files into a quarantine you can undo                              |
-| `git-tidy doctor`  | Report what needs a human, and change nothing                                      |
-| `git-tidy run`     | All of the above, in that order                                                    |
-| `git-tidy init`    | Write a commented config file, globally or for one directory                       |
-| `git-tidy config`  | Print the effective config for any path                                            |
-| `git-tidy restore` | Put quarantined files back                                                         |
+| `git-tidy sync`    | Fetch, prune remote refs, switch to the default branch, fast-forward              |
+| `git-tidy prune`   | Delete local branches whose upstream is gone, once their commits are in the trunk |
+| `git-tidy clean`   | Remove build output and caches, including everything `.gitignore` already covers  |
+| `git-tidy trash`   | Sweep loose junk files into a quarantine you can undo                             |
+| `git-tidy doctor`  | Report what needs a human, and change nothing                                     |
+| `git-tidy run`     | All of the above, in that order                                                   |
+| `git-tidy init`    | Write a commented config file, globally or for one directory                      |
+| `git-tidy config`  | Print the effective config for any path                                           |
+| `git-tidy restore` | Put quarantined files back                                                        |
 
 ### sync
 
@@ -146,11 +146,11 @@ Changes nothing. Reports:
 
 ## Modes
 
-| Flag        | Behaviour                                                        |
-| ----------- | ---------------------------------------------------------------- |
-| `--dry-run` | The default. Print what would happen, change nothing.            |
+| Flag        | Behaviour                                                                                                |
+| ----------- | -------------------------------------------------------------------------------------------------------- |
+| `--dry-run` | The default. Print what would happen, change nothing.                                                    |
 | `--ask`     | Prompt per change: `y`, `n`, `a` (all of this kind), `s` (skip this kind), `Y` (everything), `q` (stop). |
-| `--apply`   | Do everything without asking.                                    |
+| `--apply`   | Do everything without asking.                                                                            |
 
 `--ask` runs single-threaded so the prompts do not interleave; the other two use
 all cores.

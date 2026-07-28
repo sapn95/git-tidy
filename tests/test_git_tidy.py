@@ -761,6 +761,35 @@ def test_a_repo_buried_in_an_artefact_directory_survives(workspace: Path):
     assert kept and kept[0].skipped and "git repository" in kept[0].detail
 
 
+def test_a_tool_cache_is_removed_even_though_it_holds_clones(workspace: Path):
+    """`terraform init` clones modules into .terraform, and that is still a cache.
+
+    Without this exception a single `terraform init` would make a gigabyte
+    permanently unreclaimable, which is the opposite of the point.
+    """
+    repo = workspace / "repo"
+    cloned = repo / ".terraform" / "modules" / "vpc"
+    cloned.mkdir(parents=True)
+    git(cloned, "init", "-q", "-b", "main")
+    commit(cloned, "main.tf")
+
+    actions = gt.clean_tree(repo, "repo", config(), run(), gt.Git(repo), None)
+    assert not (repo / ".terraform").exists()
+    assert any(a.target == ".terraform" and a.applied for a in actions)
+
+
+def test_the_regenerable_exception_is_configurable(workspace: Path):
+    repo = workspace / "repo"
+    cloned = repo / ".terraform" / "modules" / "vpc"
+    cloned.mkdir(parents=True)
+    git(cloned, "init", "-q", "-b", "main")
+
+    cfg = config(clean={"regenerable": []})
+    actions = gt.clean_tree(repo, "repo", cfg, run(), gt.Git(repo), None)
+    assert (repo / ".terraform").exists()
+    assert any(a.skipped and "git repository" in a.detail for a in actions)
+
+
 def test_a_repo_buried_in_a_loose_artefact_directory_survives(workspace: Path):
     """The same, for the walk that covers everything outside a repository."""
     buried = workspace / "dist" / "checkout"
@@ -1065,7 +1094,9 @@ def _holding(workspace: Path) -> gt.Quarantine:
 
 def test_doctor_finds_a_credential_in_a_remote_url(workspace: Path):
     repo = workspace / "repo"
-    git(repo, "remote", "set-url", "origin", "https://user:s3cr3t-token-value@example.invalid/x.git")
+    git(
+        repo, "remote", "set-url", "origin", "https://user:s3cr3t-token-value@example.invalid/x.git"
+    )
     actions = gt.doctor_repo(repo, "repo", config())
     hit = [a for a in actions if "credential" in a.detail]
     assert hit
