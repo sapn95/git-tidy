@@ -941,9 +941,17 @@ def plural(count: str | int, word: str) -> str:
 
 
 def last_line(result: subprocess.CompletedProcess[str]) -> str:
-    """The most useful line of a failed git command: its last complaint."""
-    text = (result.stderr or result.stdout).strip().splitlines()
-    return text[-1] if text else "failed"
+    """The most useful line of a failed git command.
+
+    The *first* line, not the last: git puts the cause at the top and generic
+    advice underneath, so the tail of an unreachable remote is the useless
+    "and the repository exists." while the top is
+    "ssh: connect to host example.com port 22: Operation timed out".
+    """
+    for line in (result.stderr or result.stdout).splitlines():
+        if line.strip():
+            return line.strip()
+    return "failed"
 
 
 def is_repo(path: Path) -> bool:

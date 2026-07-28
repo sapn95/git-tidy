@@ -1156,6 +1156,37 @@ def test_human_size(count, expected):
     assert gt.human_size(count) == expected
 
 
+def test_error_message_reports_the_cause_not_the_boilerplate():
+    """git puts the reason first and generic advice underneath."""
+    failed = subprocess.CompletedProcess(
+        args=["git", "fetch"],
+        returncode=128,
+        stdout="",
+        stderr=(
+            "ssh: connect to host example.invalid port 22: Operation timed out\n"
+            "fatal: Could not read from remote repository.\n"
+            "\n"
+            "Please make sure you have the correct access rights\n"
+            "and the repository exists.\n"
+        ),
+    )
+    assert gt.last_line(failed).startswith("ssh: connect to host")
+
+
+def test_error_message_falls_back_when_git_says_nothing():
+    empty = subprocess.CompletedProcess(args=["git"], returncode=1, stdout="", stderr="")
+    assert gt.last_line(empty) == "failed"
+
+
+def test_an_unreachable_remote_is_reported_per_repo(workspace: Path):
+    """A dead remote must be one failed line, not an exception mid-run."""
+    repo = workspace / "repo"
+    git(repo, "remote", "set-url", "origin", str(workspace / "does-not-exist.git"))
+    actions = gt.sync_repo(repo, "repo", config(), run())
+    assert len(actions) == 1
+    assert actions[0].kind == "fetch" and actions[0].error
+
+
 def test_report_totals():
     report = gt.Report(
         [
