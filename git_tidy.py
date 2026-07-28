@@ -64,7 +64,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NoReturn
 
-__version__ = "1.1.1"
+__version__ = "1.2.0"
 
 CONFIG_NAMES = (".git-tidy.yaml", ".git-tidy.yml")
 QUARANTINE_DIRNAME = ".git-tidy-trash"
@@ -135,6 +135,8 @@ DEFAULTS: dict[str, Any] = {
         "submodules": "none",
         "gc": False,
         "stash": False,
+        "worktrees": "skip",
+        "diverged": "report",
         "timeout": 120,
     },
     "branches": {
@@ -260,6 +262,16 @@ COMMENTS: dict[str, str] = {
     "init:   init and update missing ones\n"
     "update: also force existing ones onto the recorded commit",
     "sync.gc": "Repack loose objects when git itself thinks it is worth it.",
+    "sync.worktrees": "What to do with a linked worktree (one made by `git worktree add`).\n"
+    "skip:   leave it on its branch — holding a branch of its own is the entire\n"
+    "        reason it exists, and git allows one worktree per branch anyway\n"
+    "switch: treat it like any other checkout, which will fail for whichever\n"
+    "        worktree does not get the default branch first",
+    "sync.diverged": "A branch with local commits *and* commits upstream.\n"
+    "report: say so and change nothing\n"
+    "rebase: replay the local commits on top of the upstream ones. The originals\n"
+    "        stay reachable through the reflog, but the commit ids change, so\n"
+    "        this is off by default.",
     "sync.stash": "Stash uncommitted work rather than refusing to move. This is what\n"
     "--force turns on: the switch and the fast-forward then happen, and the\n"
     "changes come back with `git stash pop`. Nothing is discarded — a stash is\n"
@@ -1181,6 +1193,12 @@ def _switch(
 ) -> _Outcome:
     policy = sync["switch"]
     where = head or "detached HEAD"
+    if sync["worktrees"] == "skip" and is_linked_worktree(git):
+        # Nothing is wrong here: this checkout exists to hold its own branch.
+        return _Outcome(
+            [Action("switch", name, branch, f"linked worktree, left on {where}", skipped=True)],
+            stop=False,
+        )
     if policy == "never":
         return _Outcome([Action("switch", name, branch, f"staying on {where}", skipped=True)])
     if policy not in ("always", "clean-only"):
@@ -1239,6 +1257,17 @@ def _stash(git: Git, name: str) -> Action:
     return Action("stash", name, "-", "stashed uncommitted work", applied=True)
 
 
+def is_linked_worktree(git: Git) -> bool:
+    """True when this checkout was made by `git worktree add`.
+
+    A linked worktree keeps its own .git *file* pointing into the parent's
+    .git/worktrees/<name>, so its git-dir and its common git-dir differ.
+    """
+    own = git.out("rev-parse", "--absolute-git-dir", check=False)
+    shared = git.out("rev-parse", "--path-format=absolute", "--git-common-dir", check=False)
+    return bool(own) and bool(shared) and own != shared
+
+
 def _checked_out_elsewhere(git: Git, branch: str) -> str | None:
     """The other worktree holding `branch`, or None.
 
@@ -1288,9 +1317,7 @@ def _fast_forward(
         when = " as of the last fetch" if decider.dry else ""
         return [Action("update", name, head, f"up to date{when}", skipped=True)]
     if ahead != "0":
-        return [
-            Action("update", name, head, f"diverged: {ahead} ahead, {behind} behind", skipped=True)
-        ]
+        return _diverged(git, name, head, upstream, ahead, behind, sync, decider)
     stashed: list[Action] = []
     if is_dirty(git):
         if not sync["stash"] or decider.dry:
@@ -1313,6 +1340,43 @@ def _fast_forward(
     else:
         action.applied = True
         action.detail = f"fast-forwarded {plural(behind, 'commit')}"
+    return [*stashed, action]
+
+
+def _diverged(
+    git: Git,
+    name: str,
+    head: str,
+    upstream: str,
+    ahead: str,
+    behind: str,
+    sync: dict[str, Any],
+    decider: Decider,
+) -> list[Action]:
+    """Local commits and upstream commits both. Report, or replay ours on theirs."""
+    summary = f"diverged: {ahead} ahead, {behind} behind"
+    if sync["diverged"] != "rebase":
+        if sync["diverged"] != "report":
+            raise Failure(f"sync.diverged must be report or rebase, not {sync['diverged']!r}")
+        return [Action("update", name, head, summary, skipped=True)]
+    if is_dirty(git) and not sync["stash"]:
+        return [Action("update", name, head, f"{summary}, and uncommitted changes", skipped=True)]
+
+    action = Action("update", name, head, f"rebase {plural(ahead, 'commit')} onto {upstream}")
+    if not decider.allow(action):
+        return [action]
+    stashed = [_stash(git, name)] if is_dirty(git) else []
+    if stashed and stashed[0].error:
+        return stashed
+    result = git.run("rebase", "--autostash", upstream, check=False)
+    if result.returncode != 0:
+        # Leave nothing half-applied: a conflicted rebase in 200 repositories is
+        # far worse than a report saying it did not happen.
+        git.run("rebase", "--abort", check=False)
+        action.error = f"{last_line(result)} (rebase aborted, nothing changed)"
+    else:
+        action.applied = True
+        action.detail = f"rebased {plural(ahead, 'commit')} onto {upstream}"
     return [*stashed, action]
 
 
@@ -2224,7 +2288,12 @@ def _summarise_held_back(report: Report, printer: Printer, forced: bool = False)
 
 # Substring seen in a per-item message -> the class of problem it belongs to.
 # Ordered, because "not in the trunk" and "not pushed" both mention commits.
-NOT_HELD_BACK = ("up to date", "already deleted", "nothing to fast-forward")
+NOT_HELD_BACK = (
+    "up to date",
+    "already deleted",
+    "nothing to fast-forward",
+    "linked worktree",
+)
 REASONS: tuple[tuple[str, str], ...] = (
     ("uncommitted changes", "uncommitted changes — left on their branch"),
     ("not in origin", "branches with commits not in the trunk"),
@@ -2296,6 +2365,24 @@ class Context:
         return worker_count(self.config_for(self.workspace)["jobs"])
 
 
+def _families(repos: Sequence[Path]) -> list[list[Path]]:
+    """Group checkouts that share one .git, so they never run at the same time.
+
+    A linked worktree shares its parent's object store, index lock and refs.
+    Two of them fetching or deleting branches concurrently produces
+    "error: could not write index" and branches that vanish between being listed
+    and being deleted. Families run in parallel with each other; within a family
+    the work is serial.
+    """
+    families: dict[str, list[Path]] = {}
+    for repo in repos:
+        shared = Git(repo).out(
+            "rev-parse", "--path-format=absolute", "--git-common-dir", check=False
+        )
+        families.setdefault(shared or str(repo), []).append(repo)
+    return list(families.values())
+
+
 def _in_parallel(context: Context, work: Callable[[Path], list[Action]], report: Report) -> None:
     """Run `work(repo)` over every repo, printing results as they land."""
     jobs = context.jobs
@@ -2305,8 +2392,15 @@ def _in_parallel(context: Context, work: Callable[[Path], list[Action]], report:
             report.extend(results)
             context.printer.batch(results)
         return
+
+    def whole_family(family: list[Path]) -> list[Action]:
+        found: list[Action] = []
+        for repo in family:
+            found.extend(_guarded(work, repo, context))
+        return found
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
-        futures = [pool.submit(_guarded, work, repo, context) for repo in context.repos]
+        futures = [pool.submit(whole_family, family) for family in _families(context.repos)]
         try:
             for future in concurrent.futures.as_completed(futures):
                 results = future.result()
@@ -2505,6 +2599,38 @@ workspace sets. `git-tidy config <path>` prints the result of that merge.
 Docs: https://github.com/sapn95/git-tidy"""
 
 
+def _number(question: str, default: str, prompt_input: Callable[[str], str] | None) -> int:
+    answer = ask_value(question, default, prompt_input)
+    try:
+        return int(answer)
+    except ValueError as exc:
+        raise Failure(f"{answer!r} is not a number") from exc
+
+
+def _interview(printer: Printer, prompt_input: Callable[[str], str] | None) -> dict[str, Any]:
+    """The handful of questions whose answers actually differ between people."""
+    chosen: dict[str, Any] = {}
+    jobs = _number("Workers? 0 = one per CPU core", str(DEFAULTS["jobs"]), prompt_input)
+    if jobs != DEFAULTS["jobs"]:
+        chosen["jobs"] = jobs
+    if ask_yes_no("Delete everything .gitignore covers?", False, prompt_input):
+        chosen.setdefault("clean", {})["ignored"] = True
+    if ask_yes_no("Also node_modules, .venv, vendor?", False, prompt_input):
+        chosen.setdefault("clean", {})["dependencies"] = True
+    if ask_yes_no("Also dist, build, target, out?", False, prompt_input):
+        chosen.setdefault("clean", {})["builds"] = True
+    if not ask_yes_no("Delete branches whose upstream is gone?", True, prompt_input):
+        chosen.setdefault("branches", {})["prune_gone"] = False
+    if ask_yes_no("Rebase repositories that have diverged?", False, prompt_input):
+        chosen.setdefault("sync", {})["diverged"] = "rebase"
+    if ask_yes_no("Sweep loose junk files in the workspace?", False, prompt_input):
+        trash = chosen.setdefault("trash", {})
+        trash["enabled"] = True
+        trash["min_age_days"] = _number("  Older than how many days?", "14", prompt_input)
+    printer.line("")
+    return chosen
+
+
 def cmd_init(
     target: Path,
     mode: str,
@@ -2517,35 +2643,13 @@ def cmd_init(
         raise Failure(f"{target} already exists; pass --force to overwrite it")
 
     chosen: dict[str, Any] = {}
-    if mode == ASK:
-        printer.line(f"Writing {target}. Press enter to accept each default.\n")
-        jobs = ask_value("How many repositories at once?", str(DEFAULTS["jobs"]), prompt_input)
-        if jobs != str(DEFAULTS["jobs"]):
-            try:
-                chosen["jobs"] = int(jobs)
-            except ValueError as exc:
-                raise Failure(f"{jobs!r} is not a number") from exc
-        if ask_yes_no(
-            "Delete everything .gitignore already calls disposable?", False, prompt_input
-        ):
-            chosen.setdefault("clean", {})["ignored"] = True
-        if ask_yes_no(
-            "Also delete dependency directories (node_modules, .venv, vendor)?", False, prompt_input
-        ):
-            chosen.setdefault("clean", {})["dependencies"] = True
-        if ask_yes_no("Also delete build output (dist, build, target, out)?", False, prompt_input):
-            chosen.setdefault("clean", {})["builds"] = True
-        if ask_yes_no("Sweep loose junk files out of the workspace?", False, prompt_input):
-            trash = chosen.setdefault("trash", {})
-            trash["enabled"] = True
-            if ask_yes_no(
-                "  Look in every non-repository directory, not just the root?", False, prompt_input
-            ):
-                trash["scope"] = "workspace"
-        if ask_yes_no("Delete local branches whose upstream is gone?", True, prompt_input):
-            chosen.setdefault("branches", {})["prune_gone"] = True
-        else:
-            chosen.setdefault("branches", {})["prune_gone"] = False
+    # Asking is the point of init, so it asks whenever there is someone to ask —
+    # not only under --ask. -n writes the plain commented template, and so does a
+    # pipe or a CI job, where there is nobody at the other end.
+    interactive = mode != DRY and (prompt_input is not None or sys.stdin.isatty())
+    if interactive:
+        printer.line(f"Writing {target}. Enter accepts the default in brackets.\n")
+        chosen = _interview(printer, prompt_input)
 
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(render_config(chosen, INIT_HEADER), encoding="utf-8")
