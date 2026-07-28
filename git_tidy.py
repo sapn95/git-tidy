@@ -64,7 +64,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NoReturn
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 CONFIG_NAMES = (".git-tidy.yaml", ".git-tidy.yml")
 QUARANTINE_DIRNAME = ".git-tidy-trash"
