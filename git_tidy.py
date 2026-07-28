@@ -1304,8 +1304,13 @@ def prune_branches(path: Path, name: str, cfg: dict[str, Any], decider: Decider)
 
         if rules["require_merged"]:
             kept = _unmerged_reason(git, branch, trunk, remote)
+            if kept is VANISHED:
+                actions.append(
+                    Action("branch", name, branch.name, f"already deleted ({reason})", skipped=True)
+                )
+                continue
             if kept is not None:
-                actions.append(Action("branch", name, branch.name, kept, skipped=True))
+                actions.append(Action("branch", name, branch.name, str(kept), skipped=True))
                 continue
 
         action = Action("branch", name, branch.name, f"delete ({reason})")
@@ -1313,17 +1318,35 @@ def prune_branches(path: Path, name: str, cfg: dict[str, Any], decider: Decider)
             actions.append(action)
             continue
         result = git.run("branch", "--delete", "--force", branch.name, check=False)
-        if result.returncode != 0:
-            action.error = last_line(result)
-        else:
+        if result.returncode == 0:
             action.applied = True
             action.detail = f"deleted ({reason})"
+        elif not git.ok("show-ref", "--verify", "--quiet", f"refs/heads/{branch.name}"):
+            # Gone already. Two entries in the workspace can share one ref store —
+            # a linked worktree, or a second clone made with --shared — so another
+            # worker may have deleted it between the listing and here. The
+            # outcome is the one that was wanted; it is not a failure.
+            action.skipped = True
+            action.detail = f"already deleted ({reason})"
+        else:
+            action.error = last_line(result)
         actions.append(action)
     return actions
 
 
-def _unmerged_reason(git: Git, branch: BranchInfo, trunk: str | None, remote: str) -> str | None:
-    """Why this branch must be kept, or None when it is safe to delete."""
+# The branch was there when it was listed and is not there now: another worker
+# sharing this ref store got to it first. Distinct from "keep it", which is what
+# a bare reason string means.
+VANISHED = object()
+
+
+def _unmerged_reason(git: Git, branch: BranchInfo, trunk: str | None, remote: str) -> Any:
+    """Why this branch must be kept, None when it is safe to delete.
+
+    Returns VANISHED when the branch has disappeared underneath us, which a
+    workspace holding linked worktrees or --shared clones of the same repository
+    produces routinely.
+    """
     if trunk is None:
         return "kept: cannot check merged, no trunk found"
     trunk_ref = f"{remote}/{trunk}"
@@ -1334,6 +1357,8 @@ def _unmerged_reason(git: Git, branch: BranchInfo, trunk: str | None, remote: st
     if git.ok("merge-base", "--is-ancestor", branch.name, trunk_ref):
         return None
     unpushed = git.out("rev-list", "--count", f"{trunk_ref}..{branch.name}", check=False)
+    if not unpushed and not git.ok("show-ref", "--verify", "--quiet", f"refs/heads/{branch.name}"):
+        return VANISHED
     return f"kept: {plural(unpushed, 'commit') if unpushed else 'some commits'} not in {trunk_ref}"
 
 
