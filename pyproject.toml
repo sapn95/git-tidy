@@ -1,0 +1,62 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "git-tidy"
+version = "1.0.0"
+description = "Keep a directory full of git checkouts clean: sync, prune, clean, sweep."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+keywords = ["git", "cleanup", "maintenance", "workspace", "monorepo"]
+# Standard library only, on purpose. PyYAML is used when it happens to be
+# installed, and a strict parser for the documented config subset stands in when
+# it is not — so there is nothing to install alongside the script or the binary.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/sapn95/git-tidy"
+Issues = "https://github.com/sapn95/git-tidy/issues"
+
+[project.scripts]
+git-tidy = "git_tidy:entrypoint"
+
+[dependency-groups]
+dev = ["pytest>=8", "pytest-cov>=6", "ruff>=0.14", "nuitka>=2.5", "pyyaml>=6"]
+
+[tool.hatch.build.targets.wheel]
+only-include = ["git_tidy.py"]
+
+[tool.hatch.build.targets.sdist]
+include = ["git_tidy.py", "tests", "README.md", "LICENSE"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes
+    "I",        # import sorting
+    "UP",       # pyupgrade
+    "B",        # bugbear
+    "S",        # bandit (security)
+    "SIM",      # simplify
+    "C90",      # mccabe complexity
+    "RUF",
+]
+
+[tool.ruff.lint.mccabe]
+# A cleaner that deletes files has to stay readable.
+max-complexity = 12
+
+[tool.ruff.lint.per-file-ignores]
+# Tests poke at internals and use assert, which is the point of them, and they
+# drive real git the same way the tool does.
+"tests/*" = ["S101", "SLF001", "S603", "S607"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --cov=git_tidy --cov-report=term-missing --cov-fail-under=80"

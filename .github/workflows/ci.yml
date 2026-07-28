@@ -1,0 +1,168 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # Weekly, so a new git release breaking an assumption is caught without commits.
+    - cron: "0 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # UBI10 is the base everything Python runs in; the runner OS is only a host.
+  # uv supplies the interpreter, because UBI10's own Python packages stop at 3.12.
+  # ruff is pinned so a new release cannot turn an unrelated pull request red.
+  PYTHON_VERSION: "3.14"
+  RUFF_VERSION: "0.16.0"
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    container: registry.access.redhat.com/ubi10/ubi:latest
+    steps:
+      - name: base tools
+        run: dnf install -y --setopt=install_weak_deps=0 git tar gzip
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v9.0.0
+      - name: ruff check
+        run: uvx "ruff==${RUFF_VERSION}" check --output-format=github .
+      - name: ruff format
+        run: uvx "ruff==${RUFF_VERSION}" format --check --diff .
+
+  workflows:
+    name: lint workflows
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: actionlint
+        uses: raven-actions/actionlint@v2.2.0
+      - name: yamllint
+        run: pipx run yamllint .
+      - name: markdownlint
+        uses: DavidAnson/markdownlint-cli2-action@v24
+
+  secrets:
+    name: secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+  test:
+    name: unit tests (py${{ matrix.python }}, ${{ matrix.yaml }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container: registry.access.redhat.com/ubi10/ubi:latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The oldest version the project claims to support, and the newest there
+        # is. Both with and without PyYAML, because the built-in parser is only
+        # exercised when PyYAML is absent — which is the common case for anyone
+        # running the script straight from a checkout.
+        python: ["3.10", "3.14"]
+        yaml: ["with-pyyaml", "without-pyyaml"]
+    steps:
+      - name: base tools
+        run: dnf install -y --setopt=install_weak_deps=0 git tar gzip
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v9.0.0
+      - name: pytest with coverage
+        run: |
+          extra=""
+          if [ "${{ matrix.yaml }}" = "with-pyyaml" ]; then extra="--with pyyaml"; fi
+          # shellcheck disable=SC2086
+          uv run --python ${{ matrix.python }} --with pytest --with pytest-cov $extra pytest
+
+  package:
+    name: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container: registry.access.redhat.com/ubi10/ubi:latest
+    steps:
+      - name: base tools
+        run: dnf install -y --setopt=install_weak_deps=0 git tar gzip
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v9.0.0
+      - name: build a wheel and check the console script works
+        run: |
+          uv build --wheel
+          uv tool install --python "${PYTHON_VERSION}" dist/*.whl
+          "${HOME}/.local/bin/git-tidy" --version
+          "${HOME}/.local/bin/git-tidy" --help > /dev/null
+
+  smoke:
+    name: smoke (real repositories)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: build a workspace of real clones
+        run: |
+          set -eux
+          git config --global user.email ci@example.invalid
+          git config --global user.name CI
+          git config --global init.defaultBranch main
+          mkdir -p /tmp/space && cd /tmp/space
+          git init -q --bare origin.git
+          git clone -q origin.git seed
+          (cd seed && echo hello > README.md && git add -A &&
+           git commit -qm first && git push -q -u origin main)
+          git clone -q origin.git repo
+          # A branch that exists upstream, then does not: the case prune is for.
+          (cd repo && git switch -qc feature && git push -q -u origin feature &&
+           git switch -q main)
+          git -C origin.git branch -D feature
+          # Artefacts to clean, and a tracked file that must survive.
+          mkdir -p repo/.terraform/providers repo/__pycache__
+          head -c 1048576 /dev/urandom > repo/.terraform/providers/blob.bin
+          touch repo/__pycache__/m.pyc repo/.coverage
+          mkdir -p loose/.ruff_cache
+      - name: a dry run changes nothing
+        run: |
+          ./git_tidy.py -C /tmp/space run
+          test -d /tmp/space/repo/.terraform
+          git -C /tmp/space/repo branch --list feature | grep -q feature
+      - name: apply, then check what actually happened
+        run: |
+          ./git_tidy.py -C /tmp/space run --apply
+          test ! -d /tmp/space/repo/.terraform
+          test ! -d /tmp/space/repo/__pycache__
+          test ! -e /tmp/space/repo/.coverage
+          test ! -d /tmp/space/loose/.ruff_cache
+          test -f /tmp/space/repo/README.md
+          git -C /tmp/space/repo branch --list feature | grep -q feature && exit 1
+          test "$(git -C /tmp/space/repo rev-parse --abbrev-ref HEAD)" = main
+      - name: a second run is a no-op
+        run: ./git_tidy.py -C /tmp/space run --apply --json > /tmp/second.json
+      - name: unpushed work is never deleted
+        run: |
+          set -eux
+          repo=/tmp/space/repo
+          git -C "$repo" switch -qc keepme
+          git -C "$repo" push -q -u origin keepme
+          echo local > "$repo/only-here.txt"
+          git -C "$repo" add -A
+          git -C "$repo" commit -qm "not pushed"
+          git -C "$repo" switch -q main
+          git -C /tmp/space/origin.git branch -D keepme
+          ./git_tidy.py -C /tmp/space prune --apply
+          # The upstream is gone, but the commit is not in main: it must survive.
+          git -C "$repo" branch --list keepme | grep -q keepme

@@ -1,0 +1,11 @@
+{
+  "config": {
+    // Prose wraps at whatever reads well; a hard column limit fights the tables.
+    "MD013": false,
+    // Bare URLs in output examples are fine.
+    "MD034": false,
+    // The README repeats headings like "sync" as both a table cell and a section.
+    "MD024": { "siblings_only": true }
+  },
+  "ignores": ["node_modules", ".venv", "dist"]
+}

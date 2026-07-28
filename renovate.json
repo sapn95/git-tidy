@@ -1,0 +1,22 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended", ":dependencyDashboard", ":semanticCommits"],
+  "packageRules": [
+    {
+      "description": "Auto-merge low-risk updates (digests, pins, minor, patch)",
+      "matchUpdateTypes": ["digest", "pin", "minor", "patch"],
+      "automerge": true
+    }
+  ],
+  "customManagers": [
+    {
+      "description": "Keep the pinned ruff version in the CI workflow up to date",
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.github/workflows/ci\\.yml$/"],
+      "matchStrings": ["RUFF_VERSION: \"(?<currentValue>[^\"]+)\""],
+      "datasourceTemplate": "pypi",
+      "depNameTemplate": "ruff"
+    }
+  ],
+  "github-actions": { "enabled": true }
+}

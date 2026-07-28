@@ -1,0 +1,173 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.14"
+
+concurrency:
+  # Two tags pushed together would race in the tap job, and the loser publishes a
+  # release whose formula was never updated.
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    name: version matches the tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: the tag, git_tidy.py and pyproject.toml must agree
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          code=$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' git_tidy.py)
+          meta=$(sed -n 's/^version = "\(.*\)"$/\1/p' pyproject.toml)
+          echo "tag=$tag git_tidy.py=$code pyproject=$meta"
+          test "$tag" = "$code" || { echo "git_tidy.py says $code, the tag says $tag"; exit 1; }
+          test "$tag" = "$meta" || { echo "pyproject says $meta, the tag says $tag"; exit 1; }
+
+  linux:
+    name: binary (linux-${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    needs: guard
+    # Compiled inside UBI10, so the resulting ELF links against a base that is
+    # actually supported, rather than whatever the runner image happens to ship.
+    container: registry.access.redhat.com/ubi10/ubi:latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: x86_64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - name: build tools
+        # patchelf is not in UBI10's repos (it lives in EPEL, which has no place
+        # on this base). The PyPI wheel ships a statically linked binary that
+        # Nuitka picks up from PATH, so it is installed with the build below.
+        run: >
+          dnf install -y --setopt=install_weak_deps=0
+          git tar gzip gcc gcc-c++
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v9.0.0
+      - name: static libatomic
+        # uv's standalone CPython carries -l:libatomic.a in its link flags.
+        # Install the real package if this arch has it; if it is unavailable, an
+        # empty archive satisfies the flag — and a symbol that really were needed
+        # would then fail loudly as an undefined reference, not produce a broken
+        # binary.
+        run: |
+          if dnf install -y --setopt=install_weak_deps=0 libatomic-static; then
+            echo "using the packaged static libatomic"
+          else
+            echo "no libatomic-static for this arch; providing an empty archive"
+            : > /tmp/empty.c
+            gcc -c /tmp/empty.c -o /tmp/empty.o
+            ar rcs /usr/lib64/libatomic.a /tmp/empty.o
+          fi
+      - name: compile with Nuitka
+        run: |
+          uv run --python "${PYTHON_VERSION}" --with nuitka --with patchelf \
+            python -m nuitka \
+            --standalone --remove-output --assume-yes-for-downloads \
+            --output-filename=git-tidy --output-dir=dist git_tidy.py
+          ./dist/git_tidy.dist/git-tidy --version
+      - name: package
+        run: |
+          cd dist/git_tidy.dist
+          tar -czf "../git-tidy-linux-${{ matrix.arch }}.tar.gz" .
+          cd ..
+          sha256sum "git-tidy-linux-${{ matrix.arch }}.tar.gz" \
+            > "git-tidy-linux-${{ matrix.arch }}.tar.gz.sha256"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: git-tidy-linux-${{ matrix.arch }}
+          path: dist/git-tidy-linux-${{ matrix.arch }}.tar.gz*
+
+  macos:
+    name: binary (macos-arm64)
+    needs: guard
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v9.0.0
+      - name: compile with Nuitka
+        run: |
+          uv run --python "${PYTHON_VERSION}" --with nuitka python -m nuitka \
+            --standalone --remove-output --assume-yes-for-downloads \
+            --output-filename=git-tidy --output-dir=dist git_tidy.py
+          ./dist/git_tidy.dist/git-tidy --version
+      - name: package
+        run: |
+          cd dist/git_tidy.dist
+          tar -czf ../git-tidy-macos-arm64.tar.gz .
+          cd ..
+          shasum -a 256 git-tidy-macos-arm64.tar.gz > git-tidy-macos-arm64.tar.gz.sha256
+      - uses: actions/upload-artifact@v7
+        with:
+          name: git-tidy-macos-arm64
+          path: dist/git-tidy-macos-arm64.tar.gz*
+
+  publish:
+    name: publish release
+    needs: [linux, macos]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "${GITHUB_REF_NAME}" dist/*
+          --generate-notes --repo "${GITHUB_REPOSITORY}"
+
+  tap:
+    name: update the Homebrew formula
+    needs: publish
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: rewrite Formula/git-tidy.rb with the published checksums
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          sha() { cut -d' ' -f1 < "dist/git-tidy-$1.tar.gz.sha256"; }
+          python3 scripts/update_formula.py "$version" Formula/git-tidy.rb \
+            "macos-arm64=$(sha macos-arm64)" \
+            "linux-arm64=$(sha linux-arm64)" \
+            "linux-x86_64=$(sha linux-x86_64)"
+          git diff --stat
+      - name: commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/git-tidy.rb
+          git commit -m "chore: point the Homebrew formula at ${GITHUB_REF_NAME}" || exit 0
+          git push origin main
