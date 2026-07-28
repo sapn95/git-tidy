@@ -607,6 +607,58 @@ def test_prune_never_touches_the_checked_out_branch(workspace: Path, remote: Pat
     assert gt.prune_branches(repo, "repo", config(), run()) == []
 
 
+def test_a_branch_deleted_by_a_parallel_worker_is_not_an_error(workspace: Path, remote: Path):
+    """Two clones can share one ref store, so the same branch is seen twice.
+
+    Whichever worker gets there second finds it gone. The outcome is the one
+    that was asked for, so it is reported as already deleted, not as a failure.
+    """
+    repo = workspace / "repo"
+    make_gone_branch(repo, remote, "feature")
+    branch = gt.BranchInfo("feature", "origin/feature", "[gone]")
+
+    # Stand in for the other worker: the branch vanishes after it was listed.
+    original = gt.list_branches
+
+    def list_then_vanish(g: gt.Git) -> list[gt.BranchInfo]:
+        git(repo, "branch", "-D", "feature")
+        return [branch]
+
+    gt.list_branches = list_then_vanish
+    try:
+        actions = gt.prune_branches(repo, "repo", config(), run())
+    finally:
+        gt.list_branches = original
+
+    assert len(actions) == 1
+    assert actions[0].skipped and "already deleted" in actions[0].detail
+    assert not actions[0].error
+
+
+def test_a_branch_that_vanishes_just_before_the_delete_is_not_an_error(
+    workspace: Path, remote: Path
+):
+    """The other ordering: it survives the merged check, then disappears."""
+    repo = workspace / "repo"
+    make_gone_branch(repo, remote, "feature")
+    original = gt._unmerged_reason
+
+    def merged_then_vanish(g, branch, trunk, remote_name):
+        verdict = original(g, branch, trunk, remote_name)
+        git(repo, "branch", "-D", branch.name)
+        return verdict
+
+    gt._unmerged_reason = merged_then_vanish
+    try:
+        actions = gt.prune_branches(repo, "repo", config(), run())
+    finally:
+        gt._unmerged_reason = original
+
+    assert len(actions) == 1
+    assert actions[0].skipped and "already deleted" in actions[0].detail
+    assert not actions[0].error
+
+
 def test_prune_dry_run_deletes_nothing(workspace: Path, remote: Path):
     repo = workspace / "repo"
     make_gone_branch(repo, remote, "feature")
