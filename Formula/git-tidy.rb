@@ -9,7 +9,7 @@
 class GitTidy < Formula
   desc "Keep a directory full of git checkouts clean: sync, prune, clean, sweep"
   homepage "https://github.com/sapn95/git-tidy"
-  version "1.0.3"
+  version "1.1.0"
   license "MIT"
 
   on_macos do
@@ -20,19 +20,19 @@ class GitTidy < Formula
     end
 
     on_arm do
-      url "https://github.com/sapn95/git-tidy/releases/download/v1.0.3/git-tidy-macos-arm64.tar.gz"
-      sha256 "1e7c9d3d0eede4d0fb1af393f873e9fccf787a913f0461678998d5db96c57f0f"
+      url "https://github.com/sapn95/git-tidy/releases/download/v1.1.0/git-tidy-macos-arm64.tar.gz"
+      sha256 "d74022b42f14291fcad3cdc3881eb6d8e807b0456f62f131b9a87ed14df62a65"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/sapn95/git-tidy/releases/download/v1.0.3/git-tidy-linux-arm64.tar.gz"
-      sha256 "712a09b7ba5c255eb3fc63bc6f3516953f0c9d36aa9f0ff5df0552f67c40733b"
+      url "https://github.com/sapn95/git-tidy/releases/download/v1.1.0/git-tidy-linux-arm64.tar.gz"
+      sha256 "665cd246c60beda6ca10ce8c4aa9f434de2df6d0f8a50316e7548826bcb4c106"
     end
     on_intel do
-      url "https://github.com/sapn95/git-tidy/releases/download/v1.0.3/git-tidy-linux-x86_64.tar.gz"
-      sha256 "bb03e56d4839e504a48cd529cd85b92f8ed9c7184cd1dcc7086b1799a93b94d6"
+      url "https://github.com/sapn95/git-tidy/releases/download/v1.1.0/git-tidy-linux-x86_64.tar.gz"
+      sha256 "9e592419d5c8aeeb7d89418b9b5951cbcaa07045c980f51339df6384f9f3ef5a"
     end
   end
 
