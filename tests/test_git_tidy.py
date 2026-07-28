@@ -305,18 +305,6 @@ def test_init_refuses_to_overwrite(tmp_path: Path):
     assert gt.cmd_init(target, gt.DRY, force=True, printer=quiet_printer()) == 0
 
 
-def test_init_asks_and_records_the_answers(tmp_path: Path):
-    target = tmp_path / ".git-tidy.yaml"
-    answers = iter(["4", "y", "n", "n", "y", "y", "y"])
-    gt.cmd_init(
-        target, gt.ASK, force=False, printer=quiet_printer(), prompt_input=lambda _: next(answers)
-    )
-    parsed = gt._parse_yaml_subset(target.read_text(encoding="utf-8"), "<init>")
-    assert parsed["jobs"] == 4
-    assert parsed["clean"]["ignored"] is True
-    assert parsed["trash"]["enabled"] is True
-
-
 def quiet_printer() -> gt.Printer:
     return gt.Printer(io.StringIO(), quiet=True, color=False)
 
@@ -1498,3 +1486,112 @@ def test_a_broken_repo_does_not_stop_the_others(workspace: Path, capsys):
     (workspace / "repo" / "__pycache__").mkdir()
     gt.main(["-C", str(workspace), "clean", "--apply"])
     assert not (workspace / "repo" / "__pycache__").exists()
+
+
+# --------------------------------------------------------------------------- #
+# Linked worktrees: siblings sharing one .git
+# --------------------------------------------------------------------------- #
+
+
+def test_a_linked_worktree_is_left_on_its_branch(workspace: Path, tmp_path: Path):
+    """Holding a branch of its own is the entire reason a worktree exists."""
+    repo = workspace / "repo"
+    side = tmp_path / "side"
+    git(repo, "worktree", "add", "-q", "-b", "side", str(side))
+
+    actions = gt.sync_repo(side, "side", config(), run())
+    assert gt.current_branch(gt.Git(side)) == "side"
+    switch = [a for a in actions if a.kind == "switch"]
+    assert switch and switch[0].skipped and "linked worktree" in switch[0].detail
+    assert gt._reason_of(switch[0].detail) is None, "nothing here needs a person"
+
+
+def test_a_linked_worktree_can_still_be_switched_on_request(workspace: Path, tmp_path: Path):
+    repo = workspace / "repo"
+    side = tmp_path / "side"
+    git(repo, "worktree", "add", "-q", "-b", "side", str(side))
+    git(repo, "switch", "-q", "-c", "elsewhere")  # free up main
+
+    gt.sync_repo(side, "side", config(sync={"worktrees": "switch"}), run())
+    assert gt.current_branch(gt.Git(side)) == "main"
+
+
+def test_is_linked_worktree(workspace: Path, tmp_path: Path):
+    repo = workspace / "repo"
+    side = tmp_path / "side"
+    git(repo, "worktree", "add", "-q", "-b", "side", str(side))
+    assert gt.is_linked_worktree(gt.Git(side))
+    assert not gt.is_linked_worktree(gt.Git(repo))
+
+
+def test_siblings_sharing_a_git_dir_are_one_family(workspace: Path, tmp_path: Path):
+    """They share an index and a ref store, so they must not run concurrently."""
+    repo = workspace / "repo"
+    side = tmp_path / "side"
+    git(repo, "worktree", "add", "-q", "-b", "side", str(side))
+    git(workspace, "clone", "-q", str(repo), "unrelated")
+
+    families = gt._families([repo, side, workspace / "unrelated"])
+    assert len(families) == 2
+    assert sorted(len(f) for f in families) == [1, 2]
+
+
+def test_diverged_is_reported_by_default(workspace: Path, remote: Path, tmp_path: Path):
+    git(tmp_path, "clone", "-q", str(remote), "other")
+    commit(tmp_path / "other", "theirs.txt")
+    git(tmp_path / "other", "push", "-q")
+    repo = workspace / "repo"
+    commit(repo, "mine.txt")
+
+    actions = gt.sync_repo(repo, "repo", config(), run())
+    assert any("diverged" in a.detail and a.skipped for a in actions)
+    assert not (repo / "theirs.txt").exists()
+
+
+def test_diverged_can_be_rebased(workspace: Path, remote: Path, tmp_path: Path):
+    git(tmp_path, "clone", "-q", str(remote), "other")
+    commit(tmp_path / "other", "theirs.txt")
+    git(tmp_path / "other", "push", "-q")
+    repo = workspace / "repo"
+    commit(repo, "mine.txt")
+
+    actions = gt.sync_repo(repo, "repo", config(sync={"diverged": "rebase"}), run())
+    assert any(a.kind == "update" and a.applied for a in actions)
+    assert (repo / "theirs.txt").exists(), "their commit arrived"
+    assert (repo / "mine.txt").exists(), "and mine is still on top"
+    assert git(repo, "rev-list", "--count", "HEAD") == "3"
+
+
+def test_a_failed_rebase_leaves_nothing_half_applied(workspace: Path, remote: Path, tmp_path: Path):
+    """Both sides changed the same line, so the replay cannot succeed."""
+    git(tmp_path, "clone", "-q", str(remote), "other")
+    commit(tmp_path / "other", "README.md", "theirs\n")
+    git(tmp_path / "other", "push", "-q")
+    repo = workspace / "repo"
+    commit(repo, "README.md", "mine\n")
+
+    before = git(repo, "rev-parse", "HEAD")
+    actions = gt.sync_repo(repo, "repo", config(sync={"diverged": "rebase"}), run())
+    failed = [a for a in actions if a.error]
+    assert failed and "aborted" in failed[0].error
+    assert git(repo, "rev-parse", "HEAD") == before
+    assert (repo / "README.md").read_text(encoding="utf-8") == "mine\n"
+
+
+def test_init_asks_without_needing_the_ask_flag(tmp_path: Path):
+    """Answering questions is the point of init, not a mode you have to opt into."""
+    target = tmp_path / ".git-tidy.yaml"
+    answers = iter(["4", "y", "n", "n", "y", "n", "y", "30"])
+    gt.cmd_init(
+        target, gt.AUTO, force=False, printer=quiet_printer(), prompt_input=lambda _: next(answers)
+    )
+    parsed = gt._parse_yaml_subset(target.read_text(encoding="utf-8"), "<init>")
+    assert parsed["jobs"] == 4
+    assert parsed["clean"]["ignored"] is True
+    assert parsed["trash"] == {"enabled": True, "min_age_days": 30}
+
+
+def test_init_dry_run_writes_the_plain_template(tmp_path: Path):
+    target = tmp_path / ".git-tidy.yaml"
+    gt.cmd_init(target, gt.DRY, force=False, printer=quiet_printer())
+    assert gt._parse_yaml_subset(target.read_text(encoding="utf-8"), "<init>") is None
