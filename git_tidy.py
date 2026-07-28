@@ -189,6 +189,14 @@ DEFAULTS: dict[str, Any] = {
             "yarn-error.log*",
         ],
         "extra_files": [],
+        "regenerable": [
+            ".terraform",
+            ".terragrunt-cache",
+            ".gradle",
+            ".next",
+            ".nuxt",
+            ".tox",
+        ],
         "dependency_dirs": ["node_modules", ".venv", "venv", "vendor", ".bundle"],
         "dependencies": False,
         "build_dirs": ["dist", "build", "target", "out"],
@@ -269,6 +277,11 @@ COMMENTS: dict[str, str] = {
     "clean.dirs": "Directory names removed wherever they appear, ignored or not.\nGlobs allowed.",
     "clean.extra_dirs": "Appended to dirs instead of replacing it, so one repository\n"
     "can add a name without restating the whole list.",
+    "clean.regenerable": "A directory holding a git repository is normally kept, because a\n"
+    "vendored checkout can be somebody's work. These are the exceptions: caches\n"
+    "whose contents a tool wrote and a tool can write again. `terraform init`\n"
+    "clones every module into .terraform/modules, so without this list a single\n"
+    "`terraform init` makes a gigabyte permanently unreclaimable.",
     "clean.files": "File names removed wherever they appear. Globs allowed.",
     "clean.extra_files": "Appended to files, as extra_dirs is to dirs.",
     "clean.dependency_dirs": "Dependency trees. Cheap to delete, expensive to restore\n"
@@ -1424,7 +1437,16 @@ def clean_ignored(
             actions.append(Action("ignored", scope, relative, "kept by ignored_keep", skipped=True))
             continue
         actions.append(
-            _remove(path, repo, scope, decider, quarantine, is_dir=path.is_dir(), kind="ignored")
+            _remove(
+                path,
+                repo,
+                scope,
+                decider,
+                quarantine,
+                is_dir=path.is_dir(),
+                kind="ignored",
+                protect_nested=not _matches(name, clean["regenerable"]),
+            )
         )
     return actions
 
@@ -1470,7 +1492,17 @@ def clean_tree(
         # Matched directories go whole, so they are not descended into.
         dirnames[:] = descend
         for name in matched:
-            actions.append(_remove(here / name, root, scope, decider, quarantine, is_dir=True))
+            actions.append(
+                _remove(
+                    here / name,
+                    root,
+                    scope,
+                    decider,
+                    quarantine,
+                    is_dir=True,
+                    protect_nested=not _matches(name, clean["regenerable"]),
+                )
+            )
 
         for name in sorted(filenames):
             candidate = here / name
@@ -1504,6 +1536,7 @@ def _remove(
     quarantine: Quarantine | None,
     is_dir: bool,
     kind: str = "remove",
+    protect_nested: bool = True,
 ) -> Action:
     relative = path.relative_to(root).as_posix()
     holds_repo = False
@@ -1512,9 +1545,11 @@ def _remove(
     except OSError:
         size = 0
     action = Action(kind, scope, relative, f"remove {'directory' if is_dir else 'file'}", size=size)
-    if holds_repo:
+    if holds_repo and protect_nested:
         # A vendored or forgotten checkout inside an artefact directory. Deleting
-        # the parent would delete the repository, and nothing here is worth that.
+        # the parent would take the repository with it, and nothing in an
+        # artefact directory is worth that. `clean.regenerable` lists the caches
+        # where the nested repository is itself a tool's clone.
         action.detail = "kept: contains a git repository"
         action.skipped = True
         action.size = 0
@@ -1954,6 +1989,11 @@ def summarise(report: Report, mode: str, printer: Printer) -> None:
         printer.line(
             f"  {'disk':<12} {'would free' if mode == DRY else 'freed'} {human_size(freed)}"
         )
+    # Never let a safety rule quietly shrink the result: a run that held twenty
+    # directories back should say so, rather than read as "that was everything".
+    held = [a for a in report.actions if a.skipped and a.detail.startswith("kept:")]
+    if held:
+        printer.line(f"  {'held back':<12} {plural(len(held), 'item')}, listed above with -")
     if mode == DRY and any(not a.skipped and not a.error for a in report.actions):
         printer.line(
             "\n  This was a dry run. Use --ask to confirm each change, or --apply for all."
@@ -2097,10 +2137,19 @@ def _outside_repos(
     if not candidates:
         return []
     workspace = context.workspace
+    regenerable = cfg["clean"]["regenerable"]
 
     def handle(item: tuple[Path, bool]) -> Action:
         path, is_dir = item
-        return _remove(path, workspace, "workspace", context.decider, quarantine, is_dir)
+        return _remove(
+            path,
+            workspace,
+            "workspace",
+            context.decider,
+            quarantine,
+            is_dir,
+            protect_nested=not _matches(path.name, regenerable),
+        )
 
     return _map_parallel(handle, candidates, context.jobs)
 
