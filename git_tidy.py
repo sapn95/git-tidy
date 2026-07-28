@@ -64,7 +64,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NoReturn
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 CONFIG_NAMES = (".git-tidy.yaml", ".git-tidy.yml")
 QUARANTINE_DIRNAME = ".git-tidy-trash"
@@ -2167,7 +2167,7 @@ DID: tuple[tuple[str, str, str], ...] = (
 )
 
 
-def summarise(report: Report, mode: str, printer: Printer) -> None:
+def summarise(report: Report, mode: str, printer: Printer, forced: bool = False) -> None:
     """A summary a person can act on: what happened, what needs them, what broke."""
     if printer.quiet:
         return
@@ -2185,14 +2185,21 @@ def summarise(report: Report, mode: str, printer: Printer) -> None:
     if freed:
         printer.line(f"  {human_size(freed):>6}  {'to free' if mode == DRY else 'freed'}")
 
-    _summarise_held_back(report, printer)
+    _summarise_held_back(report, printer, forced)
     _summarise_errors(report, printer)
 
     if mode == DRY and any(not a.skipped and not a.error for a in report.actions):
         printer.line("\n  Nothing was changed. --ask to confirm each one, --apply to do all.")
 
 
-def _summarise_held_back(report: Report, printer: Printer) -> None:
+FORCE_CAN_FIX = (
+    "branches with commits not in the trunk",
+    "uncommitted changes — left on their branch",
+    "artefact directories holding a git repository",
+)
+
+
+def _summarise_held_back(report: Report, printer: Printer, forced: bool = False) -> None:
     """Group everything skipped by *why*, because the why is the actionable part."""
     reasons: dict[str, int] = {}
     for action in report.actions:
@@ -2206,7 +2213,13 @@ def _summarise_held_back(report: Report, printer: Printer) -> None:
     printer.line("\n  Held back — these need you:")
     for reason, count in sorted(reasons.items(), key=lambda pair: -pair[1]):
         printer.line(f"  {count:>6}  {reason}")
-    printer.line("           re-run with --force to do them anyway, or -v to see each one")
+    # Only suggest --force where it would actually change something. Offering it
+    # against a branch a worktree holds, or a repository that has diverged, is
+    # advice that cannot work.
+    if not forced and any(reason in FORCE_CAN_FIX for reason in reasons):
+        printer.line("           --force does the ones it safely can; -v shows each one")
+    else:
+        printer.line("           -v shows each one")
 
 
 # Substring seen in a per-item message -> the class of problem it belongs to.
@@ -2836,7 +2849,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         )
     else:
-        summarise(report, args.mode, printer)
+        summarise(report, args.mode, printer, forced=getattr(args, "force", False))
     return 1 if report.errors else 0
 
 
