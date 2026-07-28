@@ -37,11 +37,12 @@ class GitTidy < Formula
   end
 
   def install
+    # Before libexec.install, which would otherwise sweep the man page in with
+    # everything else. git intercepts `git tidy --help` and looks for a man page
+    # rather than passing the flag through, so one has to be where man finds it.
+    man1.install "git-tidy.1" if File.exist?("git-tidy.1")
     libexec.install Dir["*"]
     bin.install_symlink libexec/"git-tidy"
-    # git intercepts `git tidy --help` and looks for a man page rather than
-    # passing the flag through, so one has to exist for that to work.
-    man1.install "#{buildpath}/git-tidy.1" if File.exist?("#{buildpath}/git-tidy.1")
   end
 
   test do
