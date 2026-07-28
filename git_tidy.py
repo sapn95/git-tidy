@@ -1179,13 +1179,26 @@ def _switch(
             [Action("switch", name, branch, f"uncommitted changes on {where}", skipped=True)],
             stop=True,
         )
+    # A branch can only be checked out in one worktree at a time, and a workspace
+    # that keeps .worktrees/ next to the clones hits this constantly. Nothing is
+    # wrong: the branch is simply in use elsewhere, so say so rather than fail.
+    elsewhere = _checked_out_elsewhere(git, branch)
+    if elsewhere:
+        return _Outcome(
+            [Action("switch", name, branch, f"checked out in {elsewhere}", skipped=True)],
+            stop=True,
+        )
+
     action = Action("switch", name, branch, f"switch from {where}")
     if not decider.allow(action):
         return _Outcome([action], stop=True)
     result = git.run("switch", branch, check=False)
-    if result.returncode != 0:
-        # A branch that exists only on the remote has to be created first; a real
-        # conflict still fails, and is reported as such.
+    if result.returncode != 0 and not git.ok(
+        "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"
+    ):
+        # It only exists on the remote so far, so it has to be created. Retrying
+        # when a local branch already exists would replace the real error with
+        # the useless "a branch named 'main' already exists".
         result = git.run("switch", "--create", branch, "--track", target, check=False)
     if result.returncode != 0:
         action.error = last_line(result)
@@ -1193,6 +1206,23 @@ def _switch(
     action.applied = True
     action.detail = f"switched from {where}"
     return _Outcome([action])
+
+
+def _checked_out_elsewhere(git: Git, branch: str) -> str | None:
+    """The other worktree holding `branch`, or None.
+
+    Read from `git worktree list` rather than matched against git's error text,
+    which varies by version and locale.
+    """
+    here = git.out("rev-parse", "--show-toplevel", check=False)
+    where: str | None = None
+    for line in git.out("worktree", "list", "--porcelain", check=False).splitlines():
+        field, _, value = line.partition(" ")
+        if field == "worktree":
+            where = value
+        elif field == "branch" and value == f"refs/heads/{branch}" and where != here:
+            return where
+    return None
 
 
 def _fast_forward(
@@ -1226,6 +1256,11 @@ def _fast_forward(
         return [
             Action("update", name, head, f"diverged: {ahead} ahead, {behind} behind", skipped=True)
         ]
+    if is_dirty(git):
+        # git would refuse anyway, with "Your local changes would be overwritten
+        # by merge". Refusing first turns a failure into a plain statement of
+        # fact, which is what it is.
+        return [Action("update", name, head, f"uncommitted changes, {behind} behind", skipped=True)]
     action = Action("update", name, head, f"fast-forward {plural(behind, 'commit')}")
     if not decider.allow(action):
         return [action]
