@@ -637,6 +637,13 @@ def _scalar(token: str, source: str, number: int) -> Any:
     flow = _flow_collection(token, source, number)
     if flow is not _NOT_FLOW:
         return flow
+    if not token:
+        return None  # an empty scalar is null; indexing it below would not be
+    if token[0] in "\"'" and not (len(token) >= 2 and token[-1] == token[0]):
+        # Refused for the same reason an unbalanced bracket is: read as a plain
+        # scalar, `keep: "docs/*` becomes a pattern that can never match, and
+        # the directory it was written to protect is deleted. PyYAML rejects it.
+        raise Failure(f"{source}:{number}: unterminated quote in {token!r}")
     if len(token) >= 2 and token[0] == token[-1] and token[0] in "\"'":
         body = token[1:-1]
         if token[0] == '"':
@@ -674,6 +681,8 @@ def _flow_collection(token: str, source: str, number: int) -> Any:
 
 def _plain_scalar(token: str, source: str = "<config>", number: int = 0) -> Any:
     """An unquoted token: null, a bool, a number, or the text itself."""
+    if not token:
+        return None  # an empty scalar is null, as it is in _YAML_NULL below
     if token[:2] == "- ":
         # PyYAML reads this as a nested sequence, which nothing here has a use
         # for, and refuses it in a value position. Refusing it too keeps the two
@@ -1366,7 +1375,9 @@ def _sync_from(
             return actions
         head = current_branch(git)
 
-    actions.extend(_fast_forward(git, name, head, branch, target, sync, decider, ignored_keep))
+    actions.extend(
+        _fast_forward(git, name, head, branch, target, sync, decider, ignored_keep, fetch.applied)
+    )
     actions.extend(_sync_submodules(git, name, sync, decider))
     if sync["gc"] and not decider.dry:
         git.run("gc", "--auto", "--quiet", check=False)
@@ -1396,6 +1407,7 @@ def _switch(
         return blocked
 
     action: Action | None = None
+    stashed = False
     if is_dirty(git):
         room = _make_room(git, name, branch, where, policy, sync, decider)
         if isinstance(room, _Outcome):
@@ -1403,9 +1415,9 @@ def _switch(
         # Consent was given for "stash and switch", so that is the action being
         # carried out — and the one the summary should name.
         action = room
-        put_aside = _stash(git, name)
-        if put_aside is not None:
-            return _Outcome([put_aside], stop=True)
+        stashed, problem = _stash(git, name)
+        if problem is not None:
+            return _Outcome([problem], stop=True)
 
     if action is None:
         action = Action("switch", name, branch, f"switch from {where}")
@@ -1420,13 +1432,13 @@ def _switch(
         # the useless "a branch named 'main' already exists".
         result = git.run("switch", "--create", branch, "--track", target, check=False)
     if result.returncode != 0:
-        undone = f" ({_unstash(git)})" if action.kind == "stash+switch" else ""
+        undone = f" ({_unstash(git)})" if stashed else ""
         action.error = f"{last_line(result)}{undone}"
         return _Outcome([action], stop=True)
     action.applied = True
     action.detail = (
         f"stashed and switched from {where}, recover it with git stash pop"
-        if action.kind == "stash+switch"
+        if action.kind == "stash+switch" and stashed
         else f"switched from {where}"
     )
     return _Outcome([action])
@@ -1524,6 +1536,7 @@ def _fast_forward(
     sync: dict[str, Any],
     decider: Decider,
     ignored_keep: Sequence[str] = (),
+    fetched: bool = False,
 ) -> list[Action]:
     if not sync["fast_forward"]:
         return []
@@ -1543,10 +1556,11 @@ def _fast_forward(
         why = f"upstream {upstream} no longer exists" if gone else "cannot compare with upstream"
         return [Action("update", name, head, why, skipped=True)]
     if behind == "0":
-        # In a dry run nothing was fetched, so this is measured against the
-        # remote-tracking ref as it already stood. Saying "already up to date"
-        # would be claiming something this run did not check.
-        when = " as of the last fetch" if decider.dry else ""
+        # Measured against the remote-tracking ref as it already stood, unless
+        # this run refreshed it. A dry run does not fetch, and in --ask the
+        # fetch can be declined — in both cases "up to date" on its own would
+        # be claiming something this run never checked.
+        when = "" if fetched else " as of the last fetch"
         return [Action("update", name, head, f"up to date{when}", skipped=True)]
     if ahead != "0":
         return _diverged(git, name, head, upstream, ahead, behind, sync, decider)
@@ -1578,18 +1592,13 @@ def _fast_forward(
     # not tidied into a stash nobody agreed to.
     if not decider.allow(action):
         return [action]
-    if dirty and (put_aside := _stash(git, name)) is not None:
-        return [put_aside]
+    stashed = False
+    if dirty:
+        stashed, problem = _stash(git, name)
+        if problem is not None:
+            return [problem]
     result = git.run("merge", "--ff-only", "--quiet", upstream, check=False)
-    if result.returncode != 0:
-        undone = f" ({_unstash(git)})" if dirty else ""
-        action.error = f"{last_line(result)}{undone}"
-    else:
-        action.applied = True
-        # The "stashed and" survives into the result: work left in a stash the
-        # user did not ask for must never be reported silently.
-        done = f"fast-forwarded {plural(behind, 'commit')}"
-        action.detail = f"stashed and {done}, recover it with git stash pop" if dirty else done
+    _finish(action, result, git, stashed, f"fast-forwarded {plural(behind, 'commit')}")
     return [action]
 
 
@@ -1607,19 +1616,28 @@ def keeping(actions: list[Action]) -> Iterator[None]:
         raise
 
 
-def _stash(git: Git, name: str) -> Action | None:
+def _stash(git: Git, name: str) -> tuple[bool, Action | None]:
     """Put uncommitted work aside so a switch or fast-forward can proceed.
 
-    Deliberately a stash and not `checkout --force`: the point of --force is to
-    get the move done, not to destroy work that was never committed anywhere.
-    `git stash pop` brings it back.
+    Returns (a stash was created, the failure to report). Deliberately a stash
+    and not `checkout --force`: the point of --force is to get the move done,
+    not to destroy work that was never committed anywhere.
+
+    The first half of that pair matters more than it looks. `git stash push`
+    exits 0 saying "No local changes to save" when there is nothing it can
+    stash, and git reaches that state while `git status` still reports the
+    worktree dirty — a submodule with local edits whose recorded commit has not
+    moved is the ordinary case. Reading exit 0 as "a stash now exists" made
+    _unstash pop whichever stash happened to be on top, which is the user's.
     """
+    before = git.out("rev-parse", "--quiet", "--verify", "refs/stash", check=False)
     result = git.run("stash", "push", "--include-untracked", "-m", f"git-tidy: {name}", check=False)
     if result.returncode != 0:
-        return Action("stash", name, "-", "", error=last_line(result))
-    # Nothing on success: the action this made room for already says "stashed
-    # and switched". Reporting it separately counted the same event twice.
-    return None
+        return False, Action("stash", name, "-", "", error=last_line(result))
+    after = git.out("rev-parse", "--quiet", "--verify", "refs/stash", check=False)
+    # Nothing else on success: the action this made room for says "stashed and
+    # switched" itself. Reporting it separately counted one event twice.
+    return after != before, None
 
 
 def is_linked_worktree(git: Git) -> bool:
@@ -1724,19 +1742,22 @@ def _diverged(
     )
     if not decider.allow(action):
         return [action]
-    if dirty and (put_aside := _stash(git, name)) is not None:
-        return [put_aside]
+    stashed = False
+    if dirty:
+        stashed, problem = _stash(git, name)
+        if problem is not None:
+            return [problem]
     result = git.run("rebase", "--autostash", upstream, check=False)
     if result.returncode != 0:
         # Leave nothing half-applied: a conflicted rebase in 200 repositories is
         # far worse than a report saying it did not happen.
         git.run("rebase", "--abort", check=False)
-        undone = _unstash(git) if dirty else "nothing changed"
+        undone = _unstash(git) if stashed else "nothing changed"
         action.error = f"{last_line(result)} (rebase aborted, {undone})"
     else:
         action.applied = True
         done = f"rebased {plural(ahead, 'commit')} onto {upstream}"
-        action.detail = f"stashed and {done}, recover it with git stash pop" if dirty else done
+        action.detail = f"stashed and {done}, recover it with git stash pop" if stashed else done
     return [action]
 
 
@@ -1768,6 +1789,21 @@ def _uninitialised_submodules(git: Git) -> list[str]:
         for line in out.splitlines()
         if line.startswith("-") and len(line[1:].split()) > 1
     ]
+
+
+def _finish(action: Action, result: Any, git: Git, stashed: bool, done: str) -> None:
+    """Record how a stash-and-move ended, and put the stash back if it failed.
+
+    The "stashed and" only survives into the message when a stash was really
+    made: telling somebody their work is recoverable with `git stash pop` when
+    nothing was stashed sends them to pop whatever else is on the pile.
+    """
+    if result.returncode != 0:
+        undone = f" ({_unstash(git)})" if stashed else ""
+        action.error = f"{last_line(result)}{undone}"
+        return
+    action.applied = True
+    action.detail = f"stashed and {done}, recover it with git stash pop" if stashed else done
 
 
 def _sync_submodules(git: Git, name: str, sync: dict[str, Any], decider: Decider) -> list[Action]:
@@ -2566,9 +2602,13 @@ def restore(quarantine_root: Path, stamp: str | None, decider: Decider) -> list[
                 skipped=True,
             )
         )
-    with keeping(actions):
-        _put_back(manifest, workspace, quarantine_root, chosen, decider, actions)
-    _forget_restored(quarantine_root / chosen, manifest, actions)
+    try:
+        with keeping(actions):
+            _put_back(manifest, workspace, quarantine_root, chosen, decider, actions)
+    finally:
+        # Even on the way out: a manifest that still claims files already back
+        # makes the next restore report them as failures.
+        _forget_restored(quarantine_root / chosen, manifest, actions)
     return actions
 
 
@@ -2856,27 +2896,31 @@ def _sweep(
         )
         if not junk:
             continue
-        if path.is_dir():
-            swept.append(relative)
         if (kept := _holds_a_repository(path, relative)) is not None:
             actions.append(kept)
             continue
         sensitive, why = _credential_check(path, here, sensitive, why)
         use_quarantine = here["quarantine"] or sensitive
         detail = f"sweep: {why}" + (" — sensitive, quarantined" if sensitive else "")
-        actions.append(
-            _sweep_one(
-                path,
-                workspace,
-                relative,
-                detail,
-                why,
-                sensitive,
-                use_quarantine,
-                decider,
-                quarantine,
-            )
+        outcome = _sweep_one(
+            path,
+            workspace,
+            relative,
+            detail,
+            why,
+            sensitive,
+            use_quarantine,
+            decider,
+            quarantine,
         )
+        # Only now: a directory that was kept, declined or failed still holds
+        # its contents, and they must go on being offered.
+        # Not "applied": in a dry run nothing is, and the contents would still
+        # go with it, so suppressing them keeps the prediction honest. What must
+        # not suppress them is a directory that was kept, declined or failed.
+        if path.is_dir() and not outcome.skipped and not outcome.error:
+            swept.append(relative)
+        actions.append(outcome)
 
 
 def _sweep_one(
@@ -3229,7 +3273,9 @@ DID: tuple[tuple[str, str, str], ...] = (
     ("submodules", "submodules updated", "submodules to update"),
     ("branch", "branches deleted", "branches to delete"),
     ("remove", "artefacts removed", "artefacts to remove"),
+    ("remove+quarantined", "artefacts quarantined", "artefacts to quarantine"),
     ("ignored", "ignored paths removed", "ignored paths to remove"),
+    ("ignored+quarantined", "ignored paths quarantined", "ignored paths to quarantine"),
     ("trash", "loose files swept", "loose files to sweep"),
     ("restore", "files restored", "files to restore"),
     ("expire", "quarantines deleted", "quarantines to delete"),
@@ -3243,7 +3289,10 @@ def summarise(report: Report, mode: str, printer: Printer, forced: bool = False)
     done: dict[str, int] = {}
     for action in report.actions:
         if action.applied or (mode == DRY and not action.skipped and not action.error):
-            done[action.kind] = done.get(action.kind, 0) + 1
+            # A quarantined path was moved, not removed, and the disk line below
+            # says exactly that in bytes. Counting it as removed contradicted it.
+            key = f"{action.kind}+quarantined" if action.quarantined else action.kind
+            done[key] = done.get(key, 0) + 1
 
     printer.heading("Summary")
     for kind, did, would in DID:
@@ -3313,6 +3362,9 @@ REASONS: tuple[tuple[str, str], ...] = (
     ("diverged", "diverged from upstream — needs a merge or rebase by hand"),
     ("contains a git repository", "directories holding a git repository"),
     ("in use by the worktree", "branches a worktree still has checked out"),
+    ("uncommitted work in", "submodules with uncommitted work"),
+    ("would be replaced", "a local file the incoming commits would overwrite"),
+    ("kept: contains", "directories holding something that must not go"),
     ("checked out in", "default branch checked out in another worktree"),
     ("ignored_keep", "ignored files kept as local state (.env, *.tfstate, keys)"),
     ("orphaned worktree", "orphaned worktrees — the parent pruned them away"),
@@ -4062,7 +4114,9 @@ def resolve_workspace(raw: str) -> Path:
         )
     # Cleaning $HOME or / would walk the entire machine, and almost certainly is
     # not what was meant.
-    if workspace == Path(workspace.anchor) or workspace == Path.home():
+    # Both sides resolved: a symlinked or automounted home is ordinary, and
+    # comparing a resolved path against an unresolved one let it through.
+    if workspace == Path(workspace.anchor) or workspace == Path.home().resolve():
         raise Failure(
             f"refusing to work on {workspace}: point --workspace at the directory that holds "
             "your checkouts, not at your home or filesystem root"

@@ -10,6 +10,7 @@ imagination tends to be wrong.
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
@@ -3648,3 +3649,174 @@ def test_ask_still_needs_a_terminal_for_the_other_commands(workspace: Path, monk
     monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
     with pytest.raises(gt.Failure, match="needs a terminal"):
         gt.main(["-C", str(workspace), "clean", "--ask"])
+
+
+# --------------------------------------------------------------------------- #
+# Claude review, round three
+# --------------------------------------------------------------------------- #
+
+
+def submodule_repo(workspace: Path, tmp_path: Path) -> Path:
+    """A clone with a submodule whose worktree is dirty but whose gitlink is not.
+
+    git status calls this dirty; git stash finds nothing to save. That is the
+    gap _stash used to fall into.
+    """
+    inner = tmp_path / "inner"
+    inner.mkdir()
+    git(inner, "init", "-q", "-b", "main")
+    commit(inner, "lib.txt", "v1\n")
+    repo = workspace / "repo"
+    git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(inner), "vendor")
+    git(repo, "commit", "-q", "-m", "add submodule")
+    (repo / "vendor" / "lib.txt").write_text("edited\n", encoding="utf-8")
+    return repo
+
+
+def test_stash_reports_whether_it_actually_stashed(workspace: Path, tmp_path: Path):
+    """git stash exits 0 saying "No local changes to save"."""
+    repo = submodule_repo(workspace, tmp_path)
+    assert gt.is_dirty(gt.Git(repo)), "git status calls this dirty"
+
+    stashed, problem = gt._stash(gt.Git(repo), "repo")
+    assert problem is None
+    assert stashed is False, "nothing was saved, so nothing may be claimed"
+
+
+def test_a_failed_move_never_pops_a_stash_it_did_not_make(workspace: Path, tmp_path: Path):
+    """_unstash used to pop whatever was on top — which is the user's."""
+    repo = submodule_repo(workspace, tmp_path)
+    (repo / "mine.txt").write_text("my important wip\n", encoding="utf-8")
+    git(repo, "add", "mine.txt")
+    git(repo, "stash", "push", "-q", "-m", "my important wip")
+    assert "my important wip" in git(repo, "stash", "list")
+
+    git(repo, "switch", "-q", "-c", "side")
+    gt.sync_repo(repo, "repo", gt._merge(gt.DEFAULTS, gt.FORCE_OVERRIDES, "force"), run())
+
+    assert "my important wip" in git(repo, "stash", "list"), "somebody else's stash"
+
+
+def test_a_move_that_stashed_nothing_does_not_say_it_did(workspace: Path, tmp_path: Path):
+    repo = submodule_repo(workspace, tmp_path)
+    git(repo, "switch", "-q", "-c", "side")
+
+    actions = gt.sync_repo(repo, "repo", gt._merge(gt.DEFAULTS, gt.FORCE_OVERRIDES, "force"), run())
+    moved = [a for a in actions if a.applied and "switch" in a.kind]
+    assert moved and "git stash pop" not in moved[0].detail
+
+
+def test_a_kept_directorys_contents_are_still_offered(workspace: Path):
+    """It is not going anywhere, so what is inside it must still be considered."""
+    old = workspace / "oldproj"
+    clone = old / "clone"
+    clone.mkdir(parents=True)
+    git(clone, "init", "-q", "-b", "main")
+    (old / "note.log").write_text("junk", encoding="utf-8")
+    age(old, 30)
+    age(old / "note.log", 30)
+
+    cfg = config(
+        trash={
+            "enabled": True,
+            "scope": "workspace",
+            "dirs": True,
+            "min_age_days": 7,
+            "patterns": ["*.log", "oldproj"],
+        }
+    )
+    actions = gt.sweep_trash(workspace, cfg, run(gt.DRY), _holding(workspace), [])
+    assert any("note.log" in a.target for a in actions), "the file matched the user's own glob"
+    assert any(a.skipped and "git repository" in a.detail for a in actions)
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["exclude: [a, , b]\n", "sync:\n  remote:\n", "exclude: [,]\n"],
+)
+def test_an_empty_scalar_does_not_crash_the_parser(text):
+    """ "" is `in` every string, so the indicator test indexed an empty token."""
+    with contextlib.suppress(gt.Failure):
+        gt._parse_yaml_subset(text, "<t>")  # a Failure is fine; an IndexError is not
+
+
+def test_an_unterminated_quote_is_refused(workspace: Path):
+    """Read as a plain scalar it becomes a pattern that can never match."""
+    with pytest.raises(gt.Failure, match="unterminated quote"):
+        gt._parse_yaml_subset('clean:\n  keep:\n    - "docs/*\n', "<t>")
+
+
+def test_home_is_refused_even_when_it_is_a_symlink(tmp_path: Path, monkeypatch):
+    """Comparing a resolved path against an unresolved one let it through."""
+    real = tmp_path / "realhome"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real, target_is_directory=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: link))
+
+    with pytest.raises(gt.Failure, match="refusing to work on"):
+        gt.resolve_workspace(str(real))
+    with pytest.raises(gt.Failure, match="refusing to work on"):
+        gt.resolve_workspace(str(link))
+
+
+def test_the_summary_does_not_call_a_quarantined_path_removed(workspace: Path, capsys):
+    repo = workspace / "repo"
+    (repo / "__pycache__").mkdir()
+    (repo / "__pycache__" / "deploy.pem").write_text("KEY", encoding="utf-8")
+
+    gt.main(["-C", str(workspace), "clean", "--apply"])
+    out = capsys.readouterr().out
+    assert "artefacts quarantined" in out
+    assert "artefacts removed" not in out
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "uncommitted work in libs/lib",
+        "main tracks .env, which is ignored here and would be replaced",
+        "kept: contains .env",
+        "kept: contains a git repository",
+    ],
+)
+def test_these_messages_have_a_category(detail):
+    assert gt._reason_of(detail) != "other, see the lines marked -"
+
+
+def test_quitting_a_restore_leaves_an_honest_manifest(workspace: Path):
+    """Otherwise the next restore reports a file already back as a failure."""
+    for name in ("one", "two", "three"):
+        (workspace / f"{name}.junk").write_text(name, encoding="utf-8")
+    holding = gt.Quarantine(workspace / gt.QUARANTINE_DIRNAME, workspace, stamp="stamp")
+    for name in ("one", "two", "three"):
+        holding.take(workspace / f"{name}.junk")
+    holding.write_manifest()
+
+    replies = iter(["y", "q"])
+    decider = gt.Decider(gt.ASK, stream=io.StringIO(), prompt_input=lambda _: next(replies))
+    with pytest.raises(gt.Quit):
+        gt.restore(workspace / gt.QUARANTINE_DIRNAME, "stamp", decider)
+
+    left = gt._read_manifest(workspace / gt.QUARANTINE_DIRNAME / "stamp")["entries"]
+    back = [p.name for p in workspace.glob("*.junk")]
+    assert len(back) == 1
+    assert not any(Path(e["from"]).name in back for e in left), "no claim on what is back"
+
+    actions = gt.restore(workspace / gt.QUARANTINE_DIRNAME, "stamp", run())
+    assert not [a for a in actions if a.error], "and the rest restore without a false failure"
+
+
+def test_up_to_date_is_not_asserted_after_a_declined_fetch(
+    workspace: Path, remote: Path, tmp_path: Path
+):
+    """Declining the fetch means this run checked nothing."""
+    git(tmp_path, "clone", "-q", str(remote), "other")
+    commit(tmp_path / "other", "theirs.txt")
+    git(tmp_path / "other", "push", "-q")
+
+    repo = workspace / "repo"
+    decider = gt.Decider(gt.ASK, stream=io.StringIO(), prompt_input=lambda _: "n")
+    actions = gt.sync_repo(repo, "repo", config(), decider)
+    update = [a for a in actions if a.kind == "update"]
+    assert update and "as of the last fetch" in update[0].detail
