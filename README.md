@@ -185,7 +185,10 @@ things, and nothing else:
 What `--force` deliberately cannot do:
 
 - delete a directory with a git repository inside it — a vendored or forgotten
-  checkout holds commits that exist nowhere else, and no flag here may take them
+  checkout holds commits that exist nowhere else. The one exception is
+  `clean.regenerable`, the short list of caches whose nested repository is
+  itself a tool's clone: `terraform init` puts one under `.terraform/modules`
+  for every module, and keeping those would make a gigabyte unreclaimable
 - hard-delete anything matching `trash.sensitive`; a credential is quarantined
   whatever else is set
 - remove a tracked file, follow a symlink, or reach outside the workspace

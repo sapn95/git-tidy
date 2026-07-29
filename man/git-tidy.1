@@ -65,8 +65,9 @@ trunk (still only after a fetch succeeded in the same run), and it stashes
 uncommitted changes so a repository can be switched and fast-forwarded. Nothing
 is discarded \(em the report says which stash holds the work.
 .IP
-It deliberately cannot delete a directory containing a git repository, cannot
-hard-delete anything matching
+It deliberately cannot delete a directory containing a git repository \(em
+except the caches named in \fIclean.regenerable\fR, whose nested repositories
+are a tool's own clones \(em cannot hard-delete anything matching
 .IR trash.sensitive ,
 and cannot remove a tracked file, follow a symlink or reach outside the
 workspace. Pair it with \-\-ask the first time.
