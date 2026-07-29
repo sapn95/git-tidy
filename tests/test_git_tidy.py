@@ -3433,18 +3433,19 @@ def test_an_orphaned_worktree_is_recognised(workspace: Path, tmp_path: Path):
     assert gt.orphaned_worktree(side) is not None
     assert gt.orphaned_worktree(repo) is None
 
-    actions = gt._guarded(
-        lambda r: sync_repo_boom(r),
-        side,
-        gt.Context(
-            workspace,
-            gt.ConfigResolver(workspace),
-            run(gt.DRY),
-            quiet_printer(),
-            [side],
-            _holding(workspace),
-        ),
+    context = gt.Context(
+        workspace,
+        gt.ConfigResolver(workspace),
+        run(gt.DRY),
+        quiet_printer(),
+        [side],
+        _holding(workspace),
     )
+    # Only the step that reports orphans does; the others stay silent so one
+    # broken directory is not counted once per step.
+    assert gt._guarded(sync_repo_boom, side, context) == []
+    context.report_orphans = True
+    actions = gt._guarded(sync_repo_boom, side, context)
     assert actions and actions[0].skipped
     assert "orphaned worktree" in actions[0].detail
     assert gt._reason_of(actions[0].detail) == ("orphaned worktrees — the parent pruned them away")
@@ -4421,3 +4422,128 @@ def test_restore_list_honours_json(workspace: Path, capsys):
     gt.main(["-C", str(workspace), "restore", "--list", "--json"])
     payload = json.loads(capsys.readouterr().out)
     assert payload["quarantines"] == [{"stamp": "stamp", "entries": 1, "complete": True}]
+
+
+# --------------------------------------------------------------------------- #
+# Claude review, round seven
+# --------------------------------------------------------------------------- #
+
+
+def test_a_directory_named_like_a_credential_is_quarantined(workspace: Path):
+    """A file called api-token.pyc was; a directory called tokens/ was not."""
+    repo = workspace / "repo"
+    (repo / ".gitignore").write_text("creds/\ntokens/\n", encoding="utf-8")
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-q", "-m", "ignore")
+    for name in ("creds", "tokens"):
+        (repo / name).mkdir()
+        (repo / name / "data").write_text("the only copy", encoding="utf-8")
+    holding = gt.Quarantine(workspace / gt.QUARANTINE_DIRNAME, workspace, stamp="stamp")
+
+    gt.clean_ignored(
+        repo, "repo", config(clean={"ignored": True}), run(), None, gt.Git(repo), holding
+    )
+    for name in ("creds", "tokens"):
+        kept = holding.dir / gt.CONTENT_DIRNAME / "repo" / name / "data"
+        assert kept.read_text(encoding="utf-8") == "the only copy", name
+
+
+def test_a_merge_in_progress_is_never_stashed(workspace: Path, tmp_path: Path):
+    """A stash carries the content and not the parentage, and clears MERGE_HEAD."""
+    repo = workspace / "repo"
+    commit(repo, "base.txt", "base\n")
+    git(repo, "switch", "-q", "-c", "topic")
+    commit(repo, "topic.txt", "topic\n")
+    git(repo, "switch", "-q", "main")
+    commit(repo, "other.txt", "other\n")
+    git(repo, "merge", "--no-ff", "--no-commit", "topic")
+    assert (repo / ".git" / "MERGE_HEAD").is_file()
+
+    stashed, problem = gt._stash(gt.Git(repo), "repo")
+    assert stashed is False
+    assert problem is not None and "merge is in progress" in problem.error
+    assert (repo / ".git" / "MERGE_HEAD").is_file(), "still there to finish or abort"
+
+
+def test_doctor_uses_the_configured_remote_and_trunk(workspace: Path, remote: Path):
+    """It was building its own sync config and discarding the real one."""
+    repo = workspace / "repo"
+    git(repo, "switch", "-q", "-c", "develop")
+    git(repo, "push", "-q", "-u", "origin", "develop")
+    git(repo, "switch", "-q", "-c", "feature")
+    git(repo, "push", "-q", "-u", "origin", "feature")
+    commit(repo, "only-here.txt")
+    git(remote, "branch", "-D", "feature")
+    git(repo, "fetch", "-q", "--prune", "origin")
+
+    cfg = config(sync={"default_branch": "develop"})
+    actions = gt.doctor_repo(repo, "repo", cfg)
+    assert any("not pushed" in a.detail for a in actions)
+
+
+def test_an_orphaned_worktree_is_counted_once(workspace: Path, capsys):
+    repo = workspace / "repo"
+    side = workspace / "side"
+    git(repo, "worktree", "add", "-q", "-b", "side", str(side))
+    shutil.rmtree(repo / ".git" / "worktrees" / "side")
+
+    gt.main(["-C", str(workspace), "run"])
+    out = capsys.readouterr().out
+    assert "1  orphaned worktrees" in out
+    assert "4  orphaned worktrees" not in out
+
+
+def test_submodule_update_says_nothing_when_there_is_nothing_to_do(workspace: Path, tmp_path: Path):
+    """`git submodule update` exits 0 whether or not it moved anything."""
+    inner = tmp_path / "inner"
+    inner.mkdir()
+    git(inner, "init", "-q", "-b", "main")
+    commit(inner, "lib.txt")
+    repo = workspace / "repo"
+    git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(inner), "vendor")
+    git(repo, "commit", "-q", "-m", "add submodule")
+
+    cfg = config(sync={"submodules": "update"})["sync"]
+    assert gt._sync_submodules(gt.Git(repo), "repo", cfg, run(gt.DRY)) == []
+    assert gt._sync_submodules(gt.Git(repo), "repo", cfg, run()) == []
+
+
+def test_a_deeper_config_can_switch_a_step_on(workspace: Path, capsys):
+    """It could turn one off but never on, while config said it was on."""
+    loose = workspace / "proj"
+    loose.mkdir()
+    junk = loose / "zzzxxxvvvbbb.log"
+    junk.write_text("x", encoding="utf-8")
+    age(junk, 30)
+    (loose / ".git-tidy.yaml").write_text(
+        "trash:\n  enabled: true\n  scope: workspace\n", encoding="utf-8"
+    )
+
+    gt.main(["-C", str(workspace), "trash", "--apply"])
+    assert not junk.exists(), "the deeper config asked for it"
+
+
+@pytest.mark.parametrize("value", ["2024-1-2", "2024-01-2", "1999-1-1", "2024-01-02Tfoo"])
+def test_a_date_shaped_string_matches_pyyaml(value):
+    """An over-eager rule refused what PyYAML reads as an ordinary string."""
+    yaml = pytest.importorskip("yaml")
+    text = f"exclude:\n  - {value}\n"
+    try:
+        mine = gt._parse_yaml_subset(text, "<t>")
+    except gt.Failure:
+        mine = "REJECTED"
+    assert repr(mine) == repr(yaml.safe_load(text))
+
+
+def test_init_writes_by_default_and_prints_under_dry_run(tmp_path: Path, capsys, monkeypatch):
+    """-n was never passed, and it said "run without -n"."""
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    target = tmp_path / ".git-tidy.yaml"
+
+    gt.main(["-C", str(tmp_path), "init", "--path", str(tmp_path)])
+    assert target.is_file(), "no flag means write it"
+
+    target.unlink()
+    gt.main(["-C", str(tmp_path), "init", "-n", "--path", str(tmp_path)])
+    assert not target.exists(), "-n means print it"
+    assert "git-tidy configuration" in capsys.readouterr().out
