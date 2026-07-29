@@ -159,9 +159,20 @@ def test_yaml_apostrophe_does_not_swallow_a_comment():
     assert gt._parse_yaml_subset("a: it's fine  # note\n", "<test>") == {"a": "it's fine"}
 
 
-def test_yaml_empty_list_value_is_a_list_not_none():
-    """`dirs:` with nothing after it must not leave None where a list is iterated."""
-    merged = gt._merge(gt.DEFAULTS, {"clean": {"dirs": None}}, "test")
+@pytest.mark.parametrize("key", ["ignored_keep", "keep", "dirs", "regenerable"])
+def test_a_list_setting_with_nothing_after_the_colon_is_refused(key: str):
+    """It used to mean "empty", and emptying ignored_keep makes .env deletable.
+
+    `git-tidy init` writes commented-out list headers, so uncommenting one line
+    and not the entries under it is a single keystroke — and it read as an
+    instruction to protect nothing.
+    """
+    with pytest.raises(gt.Failure, match="nothing after the colon"):
+        gt._merge(gt.DEFAULTS, {"clean": {key: None}}, "test")
+
+
+def test_an_explicitly_empty_list_is_still_allowed():
+    merged = gt._merge(gt.DEFAULTS, {"clean": {"dirs": []}}, "test")
     assert merged["clean"]["dirs"] == []
     assert gt.clean_patterns(merged["clean"]) == ([], list(gt.DEFAULTS["clean"]["files"]))
 
@@ -4240,17 +4251,43 @@ def test_local_state_is_never_deleted_by_the_pattern_walk(workspace: Path):
     assert (kept / "id_rsa").is_file()
 
 
-def test_a_default_run_does_not_hard_delete_terraform_state(workspace: Path):
-    """.terraform is in the default clean.dirs, with no config file at all."""
+def test_a_regenerable_cache_is_reclaimed_not_moved(workspace: Path):
+    """The whole point of the tool is the space, and .terraform is regenerable.
+
+    Every .terraform holds a terraform.tfstate — the backend pointer, which
+    `terraform init` writes again in seconds, not the state itself. Treating it
+    as irreplaceable turned every cache into a rename into a directory in the
+    same workspace, so a run that reported 40 GB reclaimed freed nothing.
+    """
     repo = workspace / "repo"
     (repo / ".terraform").mkdir()
     (repo / ".terraform" / "terraform.tfstate").write_text("state", encoding="utf-8")
 
     gt.main(["-C", str(workspace), "clean", "--apply"])
-    found = list(
-        (workspace / gt.QUARANTINE_DIRNAME).glob("*/files/repo/.terraform/terraform.tfstate")
-    )
+    assert not (repo / ".terraform").exists()
+    assert not list((workspace / gt.QUARANTINE_DIRNAME).glob("*/files/repo/.terraform/*"))
+
+
+def test_a_tfstate_outside_a_regenerable_cache_is_still_quarantined(workspace: Path):
+    """htmlcov is disposable, but it is not something a tool rebuilds state into."""
+    repo = workspace / "repo"
+    (repo / "htmlcov").mkdir()
+    (repo / "htmlcov" / "terraform.tfstate").write_text("state", encoding="utf-8")
+
+    gt.main(["-C", str(workspace), "clean", "--apply"])
+    found = list((workspace / gt.QUARANTINE_DIRNAME).glob("*/files/repo/htmlcov/terraform.tfstate"))
     assert found and found[0].read_text(encoding="utf-8") == "state"
+
+
+def test_a_private_key_is_never_hard_deleted_even_inside_a_regenerable_cache(workspace: Path):
+    """trash.sensitive holds everywhere: nothing rebuilds a private key."""
+    repo = workspace / "repo"
+    (repo / ".terraform").mkdir()
+    (repo / ".terraform" / "id_rsa").write_text("PRIVATE", encoding="utf-8")
+
+    gt.main(["-C", str(workspace), "clean", "--apply"])
+    found = list((workspace / gt.QUARANTINE_DIRNAME).glob("*/files/repo/.terraform/id_rsa"))
+    assert found and found[0].read_text(encoding="utf-8") == "PRIVATE"
 
 
 def test_a_switch_sees_an_env_inside_an_ignored_directory(workspace: Path):
@@ -4639,3 +4676,207 @@ def test_jobs_zero_means_the_same_on_the_command_line(workspace: Path):
     assert gt.main(["-C", str(workspace), "-j", "0", "doctor"]) == 0
     with pytest.raises(gt.Failure, match="cannot be negative"):
         gt.main(["-C", str(workspace), "-j", "-2", "doctor"])
+
+
+# --------------------------------------------------------------------------- #
+# The fallback parser against PyYAML, systematically
+# --------------------------------------------------------------------------- #
+
+AMBIGUOUS = [
+    "jobs: -\n",
+    "clean:\n  enabled: a: b\n",
+    "outer:\n  inner:\n    deep: -\n",
+    "exclude: [#notacomment]\n",
+    "exclude:\n  - -\n",
+    "a: 2024-01-02T03:04:05Z\n",
+]
+
+
+@pytest.mark.parametrize("text", AMBIGUOUS)
+def test_the_fallback_parser_refuses_what_pyyaml_refuses(text: str):
+    """Being *looser* than PyYAML is the same defect as being tighter.
+
+    Most of these are a ScannerError or ParserError in PyYAML and were quietly
+    read as a string here, so the file meant one thing from a checkout and
+    another from a shipped build, which has no PyYAML in it. The timestamp is
+    not an error for PyYAML but a datetime, which is not a valid value for any
+    setting: refusing it with a sentence beats a schema error further on.
+    """
+    with pytest.raises(gt.Failure):
+        gt._parse_yaml_subset(text, "<t>")
+
+
+DIFFERENTIAL = [
+    "exclude:\n  - https://internal/mirror\n",
+    "exclude:\n  - a:b\n",
+    "exclude:\n  - a # trailing\n",
+    "exclude:\n  - 'a: b'\n",
+    'exclude:\n  - "a: b"\n',
+    "clean:\n  keep:\n    - 'C:/build/*'\n",
+    "clean:\n  keep:\n  - flush\n  - style\n",
+    "jobs: 007\n",
+    "a: 2024-1-2\nb: 12:30\nc: 1:2:3\n",
+    "a: .inf\nb: -.Inf\nc: 1E-3\nd: .5\n",
+    "a: yes\nb: no\nc: on\nd: off\ne: n\nf: y\n",
+    "a: ~\nb: null\nc: NULL\nd:\n",
+    "map:\n  key with spaces: 1\n",
+    "top: 1\nnested:\n    deep: 2\n",
+    "trash:\n  keep:\n    - README*\n    - '*.md'\n",
+    "jobs: 4\n\n# comment\nexclude:\n  - a\n",
+    "clean:\n  enabled: true\n  keep: []\n",
+    "exclude: [a, b]\nkeep: {a: 1}\n",
+]
+
+
+@pytest.mark.parametrize("text", DIFFERENTIAL)
+def test_whole_documents_parse_the_same_as_pyyaml(text: str):
+    """A value that means two things depending on the environment is a bug.
+
+    The shipped binaries carry no PyYAML, so every one of these is a case of
+    "loads from a checkout, fails on every build" if the two ever disagree.
+    """
+    yaml = pytest.importorskip("yaml")
+    assert gt._parse_yaml_subset(text, "<t>") == yaml.safe_load(text), text
+
+
+# --------------------------------------------------------------------------- #
+# Claude review, round nine
+# --------------------------------------------------------------------------- #
+
+
+def test_a_tag_named_like_a_branch_does_not_hide_unpushed_commits(workspace: Path):
+    """git resolves a bare name as a tag first, so every rev-walk read the tag."""
+    repo = workspace / "repo"
+    git(repo, "switch", "-q", "-c", "feature")
+    commit(repo, "only-here.txt")
+    git(repo, "switch", "-q", "main")
+    git(repo, "tag", "feature", "main")  # the tag now shadows the branch
+
+    reported = [a for a in gt.doctor_repo(repo, "repo", config()) if a.target == "feature"]
+    assert reported and "not pushed" in reported[0].detail
+
+
+def test_a_tag_named_like_a_branch_does_not_break_prune(workspace: Path, remote: Path):
+    repo = workspace / "repo"
+    git(repo, "switch", "-q", "-c", "feature")
+    git(repo, "push", "-q", "-u", "origin", "feature")
+    commit(repo, "only-here.txt")
+    git(repo, "switch", "-q", "main")
+    git(repo, "tag", "feature", "main")
+    git(remote, "branch", "-D", "feature")
+    git(repo, "fetch", "-q", "--prune", "origin")
+
+    kept = [a for a in gt.prune_branches(repo, "repo", config(), run()) if a.target == "feature"]
+    assert kept and "not in" in kept[0].detail, kept
+    assert git(repo, "branch", "--list", "feature").strip()
+
+
+def test_a_bisect_in_progress_survives_sync(workspace: Path):
+    """Switching away resets HEAD, and `git bisect reset` is the only way back."""
+    repo = workspace / "repo"
+    for number in range(5):
+        commit(repo, f"c{number}.txt")
+    oldest = git(repo, "rev-parse", "HEAD~4").strip()
+    git(repo, "bisect", "start")
+    git(repo, "bisect", "bad")
+    git(repo, "bisect", "good", oldest)
+    assert git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip() == "HEAD", "detached"
+
+    before = git(repo, "rev-parse", "HEAD").strip()
+    actions = gt.sync_repo(repo, "repo", config(sync={"switch": "always"}), run())
+    assert any("in progress" in a.detail for a in actions), actions
+    assert git(repo, "rev-parse", "HEAD").strip() == before
+    assert (repo / ".git" / "BISECT_LOG").exists()
+
+
+def test_an_unreadable_subtree_does_not_read_as_an_empty_one(workspace: Path):
+    """os.walk swallows PermissionError, so the guards answered "nothing here"."""
+    repo = workspace / "repo"
+    hidden = repo / "htmlcov" / "keep"
+    hidden.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(hidden / "vendored")], check=True)
+    hidden.chmod(0o000)
+    try:
+        assert gt.main(["-C", str(workspace), "clean", "--apply"]) == 0
+        assert (repo / "htmlcov").exists(), "a repository may be buried in there"
+    finally:
+        hidden.chmod(0o755)
+
+
+@pytest.mark.parametrize(
+    "text", ["clean:\n  ignored:true\n", "jobs:2\n", "trash:\n  enabled:true\n"]
+)
+def test_a_colon_with_no_space_is_refused(text: str):
+    """PyYAML reads it as a plain scalar, so it was fatal from a checkout only."""
+    with pytest.raises(gt.Failure, match="needs a space"):
+        gt._parse_yaml_subset(text, "<t>")
+
+
+@pytest.mark.parametrize(
+    ("quoted", "want"),
+    [('"a\\tb"', "a\tb"), ('"a\\nb"', "a\nb"), ('"\\u00e9"', "é"), ('"a\\\\b"', "a\\b")],
+)
+def test_double_quoted_escapes_resolve_as_pyyaml_resolves_them(quoted: str, want: str):
+    """Left literal, "a\\tb" was a five-character glob that matched nothing."""
+    assert gt._parse_yaml_subset(f"clean:\n  keep:\n    - {quoted}\n", "<t>") == {
+        "clean": {"keep": [want]}
+    }
+
+
+def test_an_unknown_escape_is_refused_rather_than_guessed():
+    with pytest.raises(gt.Failure, match="unknown escape"):
+        gt._parse_yaml_subset('clean:\n  keep:\n    - "x\\q"\n', "<t>")
+
+
+@pytest.mark.parametrize(
+    ("argv", "want"),
+    [
+        (["-C/x/notes", "init"], False),
+        (["-C", "/x/notes", "init"], False),
+        (["-j4", "clean"], False),
+        (["-n", "clean"], True),
+        (["-qn", "clean"], True),
+        (["-nq", "clean"], True),
+        (["--dry-run", "clean"], True),
+    ],
+)
+def test_only_a_real_flag_counts_as_a_dry_run(argv: list[str], want: bool):
+    """A short option's attached value is not a cluster of flags."""
+    assert gt._asked_for_dry_run(argv) is want
+
+
+def test_a_deeper_config_can_widen_the_trash_scope(workspace: Path):
+    """`git-tidy config sub` said scope: workspace while the run swept nothing."""
+    sub = workspace / "sub"
+    sub.mkdir()
+    old = sub / "junk.tmp"
+    old.write_text("x", encoding="utf-8")
+    os.utime(old, (0, 0))
+    (workspace / ".git-tidy.yaml").write_text(
+        "trash:\n  enabled: true\n  scope: root\n", encoding="utf-8"
+    )
+    (sub / ".git-tidy.yaml").write_text("trash:\n  scope: workspace\n", encoding="utf-8")
+
+    gt.main(["-C", str(workspace), "trash", "--apply"])
+    assert not old.exists(), "the deepest config wins, as the README says"
+
+
+def expire_now(root: Path, only: str | None = None) -> list[gt.Action]:
+    return gt.expire_quarantines(root, gt.DEFAULTS["trash"]["retention_days"], run(), only)
+
+
+def test_expire_says_so_when_a_named_quarantine_is_too_young(tmp_path: Path):
+    root = tmp_path / gt.QUARANTINE_DIRNAME
+    (root / "20260101T000000Z").mkdir(parents=True)
+    (root / "20260101T000000Z" / gt.MANIFEST_NAME).write_text("{}", encoding="utf-8")
+
+    actions = expire_now(root, only="20260101T000000Z")
+    assert actions and actions[0].skipped and "not yet" in actions[0].detail
+    assert gt._reason_of(actions[0].detail) != "other, see the lines marked -"
+
+
+def test_expire_refuses_a_stamp_that_is_not_there(tmp_path: Path):
+    root = tmp_path / gt.QUARANTINE_DIRNAME
+    root.mkdir()
+    with pytest.raises(gt.Failure, match="no quarantine 'NOPE'"):
+        expire_now(root, only="NOPE")
