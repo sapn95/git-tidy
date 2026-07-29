@@ -230,7 +230,17 @@ DEFAULTS: dict[str, Any] = {
         "scope": "root",
         "patterns": [],
         "heuristics": ["mash", "empty", "temp"],
-        "sensitive": ["*.pw", "*.secret", "*.pem", "*.key", "*creds*", "*token*", "*password*"],
+        "sensitive": [
+            "*.pw",
+            "*.secret",
+            "*.pem",
+            "*.key",
+            "*.p12",
+            "id_rsa*",
+            "*creds*",
+            "*token*",
+            "*password*",
+        ],
         "min_age_days": 7,
         "keep": ["README*", "LICENSE*", "*.md", ".*"],
         "dirs": False,
@@ -282,8 +292,9 @@ COMMENTS: dict[str, str] = {
     "sync.worktrees": "What to do with a linked worktree (one made by `git worktree add`).\n"
     "skip:   leave it on its branch — holding a branch of its own is the entire\n"
     "        reason it exists, and git allows one worktree per branch anyway\n"
-    "switch: treat it like any other checkout, which will fail for whichever\n"
-    "        worktree does not get the default branch first",
+    "switch: treat it like any other checkout. git allows one worktree per\n"
+    "        branch, so whichever one does not get the default branch first is\n"
+    "        reported as already checked out elsewhere, and left alone",
     "sync.diverged": "A branch with local commits *and* commits upstream.\n"
     "report: say so and change nothing\n"
     "rebase: replay the local commits on top of the upstream ones. The originals\n"
@@ -482,9 +493,18 @@ def _parse_mapping(lines: list[_Line], index: int, indent: int, source: str) -> 
         line = lines[index]
         if line.text.startswith("- "):
             raise Failure(f"{source}:{line.number}: a list item where a key was expected")
-        key, sep, rest = line.text.partition(":")
+        # YAML starts a mapping on ": " or on a colon at end of line — not on any
+        # colon. `ignored:true` is a plain scalar to PyYAML, so a config written
+        # that way was a fatal error from a checkout and a working instruction to
+        # delete things from every shipped binary, which carries no PyYAML.
+        key, sep, rest = line.text.partition(": ")
+        if not sep and line.text.endswith(":"):
+            key, sep, rest = line.text[:-1], ":", ""
         if not sep:
-            raise Failure(f"{source}:{line.number}: expected 'key: value'")
+            raise Failure(
+                f"{source}:{line.number}: expected 'key: value' — a colon needs a space "
+                f"after it, or nothing at all"
+            )
         key, rest = key.strip(), rest.strip()
         index += 1
         if rest:
@@ -620,7 +640,7 @@ _YAML_FLOAT = re.compile(
 # Characters PyYAML refuses to start a plain scalar with. Accepting them here
 # would mean `keep: *.pem` works without PyYAML and fails with it — and a glob is
 # the most natural thing anyone writes in this config.
-_YAML_INDICATORS = "*&!|>%@`,]}"
+_YAML_INDICATORS = "*&!|>%@`,]}#"
 # YAML 1.1 resolves these to a date or a datetime, which is never a valid value
 # for any setting here — but PyYAML does it and this parser did not.
 # Copied from PyYAML's resolver rather than approximated: an over-eager version
@@ -684,10 +704,66 @@ def _scalar(token: str, source: str, number: int) -> Any:
     if len(token) >= 2 and token[0] == token[-1] and token[0] in "\"'":
         body = token[1:-1]
         if token[0] == '"':
-            return body.replace('\\"', '"').replace("\\\\", "\\")
+            return _unescape(body, source, number)
         # In a single-quoted YAML scalar '' is a literal apostrophe.
         return body.replace("''", "'")
     return _plain_scalar(token, source, number)
+
+
+# The escapes PyYAML's safe loader understands in a double-quoted scalar. Left
+# literal, "a\tb" was a five-character glob here and a four-character one with
+# PyYAML installed — silent either way, and the pattern simply stopped matching.
+_ESCAPES = {
+    "0": "\0",
+    "a": "\a",
+    "b": "\b",
+    "t": "\t",
+    "\t": "\t",
+    "n": "\n",
+    "v": "\v",
+    "f": "\f",
+    "r": "\r",
+    "e": "\x1b",
+    " ": " ",
+    '"': '"',
+    "/": "/",
+    "\\": "\\",
+    "N": "\x85",
+    "_": "\xa0",
+    "L": "\u2028",
+    "P": "\u2029",
+}
+_ESCAPE_HEX = {"x": 2, "u": 4, "U": 8}
+
+
+def _unescape(body: str, source: str, number: int) -> str:
+    """Resolve the backslash escapes of a double-quoted YAML scalar."""
+    out: list[str] = []
+    index = 0
+    while index < len(body):
+        char = body[index]
+        if char != "\\":
+            out.append(char)
+            index += 1
+            continue
+        if index + 1 >= len(body):
+            raise Failure(f"{source}:{number}: a double-quoted value ends in a backslash")
+        marker = body[index + 1]
+        if marker in _ESCAPE_HEX:
+            width = _ESCAPE_HEX[marker]
+            digits = body[index + 2 : index + 2 + width]
+            if len(digits) != width or any(d not in "0123456789abcdefABCDEF" for d in digits):
+                raise Failure(f"{source}:{number}: \\{marker} needs {width} hex digits after it")
+            out.append(chr(int(digits, 16)))
+            index += 2 + width
+            continue
+        if marker not in _ESCAPES:
+            # PyYAML refuses these, and guessing would make the same file mean
+            # two things depending on whether PyYAML happens to be installed.
+            raise Failure(f"{source}:{number}: unknown escape '\\{marker}' in a quoted value")
+        out.append(_ESCAPES[marker])
+        index += 2
+    return "".join(out)
 
 
 # A sentinel, because None is itself a perfectly good parsed value.
@@ -720,13 +796,22 @@ def _plain_scalar(token: str, source: str = "<config>", number: int = 0) -> Any:
     """An unquoted token: null, a bool, a number, or the text itself."""
     if not token:
         return None  # an empty scalar is null, as it is in _YAML_NULL below
-    if token[:2] == "- ":
+    if token.startswith("-") and token[1:2] in ("", " "):
         # PyYAML reads this as a nested sequence, which nothing here has a use
         # for, and refuses it in a value position. Refusing it too keeps the two
         # parsers from disagreeing about what the config says.
         raise Failure(
-            f"{source}:{number}: a value cannot start with '- '; quote it, or put the "
-            "list on its own lines"
+            f"{source}:{number}: a value cannot start with '-' on its own; quote it, "
+            "or put the list on its own lines"
+        )
+    if ": " in token:
+        # `enabled: a: b` is a ScannerError in PyYAML and was a string here, so
+        # the same file meant two different things depending on whether PyYAML
+        # happened to be installed. This parser's whole stance is to refuse what
+        # it cannot read rather than guess, so it refuses.
+        raise Failure(
+            f"{source}:{number}: {token!r} has a second ': ' in it; quote the value "
+            "if the colon is part of it"
         )
     if token[:1] in _YAML_INDICATORS:
         raise Failure(
@@ -838,10 +923,17 @@ def _merge(base: dict[str, Any], overlay: dict[str, Any], where: str) -> dict[st
                 raise Failure(f"{where}: {key!r} takes a block of settings, not a single value")
             result[key] = _merge(base[key], value, f"{where}: {key}")
         elif isinstance(base[key], list):
-            # `dirs:` with nothing after it parses to None, and means "empty",
-            # not "crash the first time something iterates it".
             if value is None:
-                result[key] = []
+                # `ignored_keep:` with nothing after it used to mean "empty", and
+                # emptying that list is how .env and *.tfstate become deletable.
+                # The file `git-tidy init` writes is full of commented-out list
+                # headers, so uncommenting one line and not the entries under it
+                # is a single keystroke away — and it read as a deliberate
+                # instruction to protect nothing. `[]` still says that, out loud.
+                raise Failure(
+                    f"{where}: {key!r} has nothing after the colon. Write the entries "
+                    f"under it, or `{key}: []` if you really mean an empty list"
+                )
             elif not isinstance(value, list):
                 raise Failure(f"{where}: {key!r} takes a list")
             else:
@@ -1541,6 +1633,16 @@ def _cannot_switch(
         raise Failure(f"sync.worktrees must be skip or switch, not {sync['worktrees']!r}")
     if policy not in ("always", "clean-only", "never"):
         raise Failure(f"sync.switch must be always, clean-only or never, not {policy!r}")
+    busy = _operation_in_progress(git)
+    if busy:
+        # Switching away resets HEAD, and neither a bisect nor an unfinished
+        # merge survives that: `git bisect reset` is then the only way back, and
+        # the commit it was reset from is not written down anywhere. _stash
+        # already refused for this reason, but a *clean* repository mid-bisect
+        # never reached it — it was simply switched off its detached HEAD.
+        return _Outcome(
+            [Action("sync", name, where, f"{busy} is in progress, left alone", skipped=True)]
+        )
     if sync["worktrees"] == "skip" and is_linked_worktree(git):
         # Nothing is wrong here: this checkout exists to hold its own branch.
         return _Outcome(
@@ -1830,11 +1932,17 @@ def _would_clobber_ignored(git: Git, branch: str, protect: Sequence[str]) -> str
     a local .env or *.tfstate, which is what ignored_keep names. Only those are
     checked — asking about every ignored file would mean walking node_modules.
     """
+    # refs/heads/ when it names a local branch, so a tag of the same name cannot
+    # stand in for it; `branch` is also called with a remote-tracking ref such as
+    # origin/main, which has no refs/heads/ entry, so that falls through as given.
+    ref = f"refs/heads/{branch}"
+    if not git.ok("show-ref", "--verify", "--quiet", ref):
+        ref = branch
     for relative in ignored_paths(git, collapse="never"):
         name = Path(relative).name
         if not (_matches(name, protect) or any(fnmatch.fnmatch(relative, p) for p in protect)):
             continue
-        if git.ok("cat-file", "-e", f"{branch}:{relative}"):
+        if git.ok("cat-file", "-e", f"{ref}:{relative}"):
             return relative
     return None
 
@@ -2227,17 +2335,23 @@ def _unmerged_reason(git: Git, branch: BranchInfo, trunk: str | None, remote: st
     """
     if trunk is None:
         return "kept: cannot check merged, no trunk found"
-    trunk_ref = f"{remote}/{trunk}"
-    if not git.ok("show-ref", "--verify", "--quiet", f"refs/remotes/{trunk_ref}"):
-        trunk_ref = trunk
-        if not git.ok("show-ref", "--verify", "--quiet", f"refs/heads/{trunk_ref}"):
+    shown = f"{remote}/{trunk}"
+    trunk_ref = f"refs/remotes/{shown}"
+    if not git.ok("show-ref", "--verify", "--quiet", trunk_ref):
+        shown, trunk_ref = trunk, f"refs/heads/{trunk}"
+        if not git.ok("show-ref", "--verify", "--quiet", trunk_ref):
             return f"kept: no {trunk} to compare against"
-    if git.ok("merge-base", "--is-ancestor", branch.name, trunk_ref):
+    # refs/heads/, because git resolves a bare name as a tag first: a tag called
+    # `feature` made every one of these walk the tag instead of the branch, and
+    # doctor then reported nothing at all about the branch's unpushed commits.
+    # current_branch and list_branches already knew this; the walks did not.
+    head = f"refs/heads/{branch.name}"
+    if git.ok("merge-base", "--is-ancestor", head, trunk_ref):
         return None
-    unpushed = git.out("rev-list", "--count", f"{trunk_ref}..{branch.name}", check=False)
+    unpushed = git.out("rev-list", "--count", f"{trunk_ref}..{head}", check=False)
     if not unpushed and not git.ok("show-ref", "--verify", "--quiet", f"refs/heads/{branch.name}"):
         return VANISHED
-    return f"kept: {plural(unpushed, 'commit') if unpushed else 'some commits'} not in {trunk_ref}"
+    return f"kept: {plural(unpushed, 'commit') if unpushed else 'some commits'} not in {shown}"
 
 
 # --------------------------------------------------------------------------- #
@@ -2249,8 +2363,26 @@ def directory_size(path: Path) -> int:
     return _measure(path)[0]
 
 
+class _Unreadable:
+    """Records a subtree os.walk could not read, instead of walking past it.
+
+    os.walk's default is to swallow the error and yield nothing for that
+    directory, so a subtree nobody can list looks exactly like an empty one:
+    size 0, no .git in it, no protected file in it. Every guard that asks "is
+    there a repository in here?" then answers no, and the directory is removed —
+    or, with quarantine on, renamed, which needs no read access at all and so
+    succeeds. The answer has to be "I cannot tell", which is not the same as no.
+    """
+
+    def __init__(self) -> None:
+        self.hit = False
+
+    def __call__(self, _: OSError) -> None:
+        self.hit = True
+
+
 def _measure(path: Path) -> tuple[int, bool]:
-    """Total size under `path`, and whether a git repository is buried in it.
+    """Total size under `path`, and whether it may hold a git repository.
 
     Both come from the same walk, because the second question has to be asked
     before deleting a directory wholesale and the first is needed for the report
@@ -2259,7 +2391,8 @@ def _measure(path: Path) -> tuple[int, bool]:
     """
     total = 0
     holds_repo = False
-    for dirpath, dirnames, filenames in os.walk(path, followlinks=False):
+    unreadable = _Unreadable()
+    for dirpath, dirnames, filenames in os.walk(path, followlinks=False, onerror=unreadable):
         here = Path(dirpath)
         if ".git" in dirnames or ".git" in filenames or holds_git_data(here):
             holds_repo = True
@@ -2271,7 +2404,7 @@ def _measure(path: Path) -> tuple[int, bool]:
             except OSError:
                 continue
         dirnames[:] = [d for d in dirnames if not (here / d).is_symlink()]
-    return total, holds_repo
+    return total, holds_repo or unreadable.hit
 
 
 def tracked_paths(git: Git) -> set[str]:
@@ -2446,8 +2579,10 @@ def _remove_ignored(
                 quarantine,
                 is_dir=path.is_dir(),
                 kind="ignored",
-                protect_nested=not _matches(name, clean["regenerable"]),
-                sensitive=_never_delete_outright(cfg),
+                protect_nested=(guarded := not _matches(name, clean["regenerable"])),
+                sensitive=outright_guard(
+                    cfg["trash"]["sensitive"], clean["ignored_keep"], not guarded
+                ),
                 holding=holding,
             )
         )
@@ -2460,9 +2595,14 @@ def _holds_protected(
 
     Patterns are tested against the name *and* against the path relative to the
     repository, so `build/config/*.pem` protects as surely as `*.pem` does.
+
+    A subtree that cannot be read is reported as a match: not being able to look
+    is not the same as having looked and found nothing, and this decides whether
+    something is moved or deleted outright.
     """
     root = base or directory
-    for dirpath, dirnames, filenames in os.walk(directory, followlinks=False):
+    unreadable = _Unreadable()
+    for dirpath, dirnames, filenames in os.walk(directory, followlinks=False, onerror=unreadable):
         here = Path(dirpath)
         for entry in (*dirnames, *filenames):
             candidate = here / entry
@@ -2472,7 +2612,7 @@ def _holds_protected(
         # Pruned only after their names have been considered: a symlink whose
         # own name is protected still protects its parent from removal.
         dirnames[:] = [d for d in dirnames if not (here / d).is_symlink()]
-    return None
+    return "something here that cannot be read" if unreadable.hit else None
 
 
 def clean_tree(
@@ -2485,6 +2625,7 @@ def clean_tree(
     stay_inside: bool = True,
     already: set[str] | None = None,
     sensitive: Sequence[str] = (),
+    local_state: Sequence[str] = (),
     holding: Quarantine | None = None,
 ) -> list[Action]:
     """Remove artefact directories and files under `root`.
@@ -2508,6 +2649,7 @@ def clean_tree(
         stay_inside=stay_inside,
         already=already or set(),
         sensitive=sensitive,
+        local_state=local_state,
         holding=holding,
     )
     actions: list[Action] = []
@@ -2535,8 +2677,10 @@ class _Sweep:
     stay_inside: bool
     already: set[str]
     # Consulted only when quarantine is off: a directory holding one of these is
-    # moved rather than deleted.
+    # moved rather than deleted. Split because clean.ignored_keep does not apply
+    # inside a path the user listed in clean.regenerable — see outright_guard.
     sensitive: Sequence[str] = ()
+    local_state: Sequence[str] = ()
     holding: Quarantine | None = None
 
 
@@ -2558,8 +2702,8 @@ def _walk_and_remove(plan: _Sweep, actions: list[Action]) -> None:
                     plan.decider,
                     plan.quarantine,
                     is_dir=True,
-                    protect_nested=not _matches(name, plan.clean["regenerable"]),
-                    sensitive=plan.sensitive,
+                    protect_nested=(guarded := not _matches(name, plan.clean["regenerable"])),
+                    sensitive=outright_guard(plan.sensitive, plan.local_state, not guarded),
                     holding=plan.holding,
                 )
             )
@@ -2574,7 +2718,7 @@ def _walk_and_remove(plan: _Sweep, actions: list[Action]) -> None:
                         plan.decider,
                         plan.quarantine,
                         is_dir=False,
-                        sensitive=plan.sensitive,
+                        sensitive=outright_guard(plan.sensitive, plan.local_state, False),
                         holding=plan.holding,
                     )
                 )
@@ -2984,9 +3128,31 @@ def _within(path: Path, root: Path) -> bool:
 def expire_quarantines(
     quarantine_root: Path, days: int, decider: Decider, only: str | None = None
 ) -> list[Action]:
-    """Delete quarantines past their retention, or just the one named."""
+    """Delete quarantines past their retention, or just the one named.
+
+    A named stamp still has to be past its retention — `--expire` is the age
+    rule, and naming one narrows it rather than overriding it. Saying so matters:
+    both the too-young case and the misspelt-stamp case used to print an empty
+    summary and exit 0, so the quarantine looked expired when it was still there.
+    """
     if not quarantine_root.is_dir():
+        if only is not None:
+            raise Failure(f"no quarantine at {quarantine_root}")
         return []
+    if only is not None:
+        named = quarantine_root / only
+        if not named.is_dir():
+            raise Failure(f"no quarantine {only!r} in {quarantine_root}")
+        if named.stat().st_mtime > time.time() - days * 86400:
+            return [
+                Action(
+                    "expire",
+                    "quarantine",
+                    only,
+                    f"kept: not yet {plural(days, 'day')} old",
+                    skipped=True,
+                )
+            ]
     cutoff = time.time() - days * 86400
     actions: list[Action] = []
     with keeping(actions):
@@ -3109,11 +3275,13 @@ def sweep_trash(
     deeper = _anywhere_enabled(workspace, resolver, "trash")
     if not trash["enabled"] and not deeper:
         return []
-    if deeper and not trash["enabled"]:
+    if trash["scope"] == "root" and (deeper or _anywhere_wide(workspace, resolver)):
         # The root's scope decides which candidates are generated at all, so a
-        # deeper config that switches trash on would never be reached under the
-        # default "root". Widen the search and let _sweepable, which resolves per
-        # path, decide what may actually be swept.
+        # deeper config is unreachable under the default "root" — whether it
+        # switches trash on or only widens its own scope. `git-tidy config sub`
+        # answered "scope: workspace" while the run swept nothing there, which is
+        # the opposite of "the deepest one wins". Widen the search and let
+        # _sweepable, which resolves per path, decide what may actually be swept.
         trash = {**trash, "scope": "workspace"}
     if trash["scope"] not in ("root", "workspace"):
         raise Failure(f"trash.scope must be root or workspace, not {trash['scope']!r}")
@@ -3295,6 +3463,20 @@ def _sweepable(path: Path, trash: dict[str, Any], workspace: Path) -> bool:
     return not (trash["scope"] == "root" and path.parent != workspace)
 
 
+def _anywhere_wide(workspace: Path, resolver: ConfigResolver | None) -> bool:
+    """Whether any config below the root asks for trash.scope: workspace."""
+    if resolver is None:
+        return False
+    for dirpath, dirnames, filenames in os.walk(workspace, followlinks=False):
+        here = Path(dirpath)
+        dirnames[:] = [d for d in dirnames if d not in (".git", QUARANTINE_DIRNAME)]
+        if any(name in filenames for name in CONFIG_NAMES) and (
+            resolver.for_path(here)["trash"]["scope"] == "workspace"
+        ):
+            return True
+    return False
+
+
 def _anywhere_enabled(workspace: Path, resolver: ConfigResolver | None, section: str) -> bool:
     """Whether any config in the tree turns this step on.
 
@@ -3436,10 +3618,11 @@ def _check_unpushed(git: Git, name: str, sync: dict[str, Any]) -> list[Action]:
             # commits exist nowhere else. Measure against the trunk instead.
             if trunk is None:
                 continue
-            against = f"{sync['remote']}/{trunk}"
-            if not git.ok("show-ref", "--verify", "--quiet", f"refs/remotes/{against}"):
-                against = trunk
-        ahead = git.out("rev-list", "--count", f"{against}..{branch.name}", check=False)
+            against = f"refs/remotes/{sync['remote']}/{trunk}"
+            if not git.ok("show-ref", "--verify", "--quiet", against):
+                against = f"refs/heads/{trunk}"
+        # refs/heads/, so a tag of the same name cannot stand in for the branch.
+        ahead = git.out("rev-list", "--count", f"{against}..refs/heads/{branch.name}", check=False)
         if ahead and ahead != "0":
             found.append(
                 Action(
@@ -3459,12 +3642,12 @@ def _never_pushed(
     """A local-only branch, and how much of it exists nowhere else."""
     if trunk is None or branch.name == trunk:
         return []
-    against = f"{sync['remote']}/{trunk}"
-    if not git.ok("show-ref", "--verify", "--quiet", f"refs/remotes/{against}"):
-        against = trunk
-        if not git.ok("show-ref", "--verify", "--quiet", f"refs/heads/{against}"):
+    against = f"refs/remotes/{sync['remote']}/{trunk}"
+    if not git.ok("show-ref", "--verify", "--quiet", against):
+        against = f"refs/heads/{trunk}"
+        if not git.ok("show-ref", "--verify", "--quiet", against):
             return []
-    ahead = git.out("rev-list", "--count", f"{against}..{branch.name}", check=False)
+    ahead = git.out("rev-list", "--count", f"{against}..refs/heads/{branch.name}", check=False)
     if not ahead or ahead == "0":
         return []
     return [
@@ -3541,7 +3724,7 @@ class Printer:
         # Grouped by outcome as well as by kind: a batch that quarantined some
         # paths and deleted others must not be summarised with whichever verb
         # happened to come first.
-        rolled: dict[tuple[str, str, bool, bool], list[Action]] = {}
+        rolled: dict[tuple[str, str, bool, bool, str], list[Action]] = {}
         for action in actions:
             if self.verbose or action.kind not in ROLLED_UP or action.error:
                 self.action(action)
@@ -3747,6 +3930,8 @@ REASONS: tuple[tuple[str, str], ...] = (
     ("a dependency tree", "dependency trees — clean.dependencies is off"),
     ("build output", "build output — clean.builds is off"),
     ("orphaned worktree", "orphaned worktrees — the parent pruned them away"),
+    ("not yet", "quarantines not yet past trash.retention_days"),
+    ("is in progress", "a merge, rebase, cherry-pick or bisect is unfinished"),
     ("no upstream", "on a local-only branch, never pushed"),
     ("no such remote", "the configured remote is not there"),
     ("no remote", "no remote configured"),
@@ -3983,6 +4168,24 @@ def cmd_clean(context: Context, report: Report) -> None:
         context.printer.batch(loose)
 
 
+def outright_guard(
+    sensitive: Sequence[str], local_state: Sequence[str], regenerable: bool
+) -> list[str]:
+    """The patterns that turn a deletion into a move, for one particular path.
+
+    Split because the two halves answer different questions. trash.sensitive is
+    "could this be the only copy of a credential?" and holds everywhere.
+    clean.ignored_keep is "is this local state a tool would not rebuild?" — and
+    inside something the user listed in clean.regenerable the answer is no by
+    definition. Every .terraform holds a terraform.tfstate (the backend pointer,
+    which `terraform init` writes again in seconds) and every .venv holds a
+    certifi/cacert.pem, so applying both lists everywhere quietly turned nearly
+    every cache into a rename into .git-tidy-trash/ in the same workspace —
+    which reclaims nothing, while the README opens by promising 40 GB back.
+    """
+    return list(sensitive) if regenerable else [*sensitive, *local_state]
+
+
 def _never_delete_outright(cfg: dict[str, Any]) -> list[str]:
     """Names that are moved rather than deleted, wherever they turn up.
 
@@ -4024,7 +4227,8 @@ def _clean_repo(
         git,
         holding,
         already=already,
-        sensitive=_never_delete_outright(cfg),
+        sensitive=cfg["trash"]["sensitive"],
+        local_state=cfg["clean"]["ignored_keep"],
         holding=context.quarantine,
     )
 
@@ -4057,8 +4261,10 @@ def _outside_repos(
             context.decider,
             quarantine if here_cfg["quarantine"] else None,
             is_dir,
-            protect_nested=not _matches(path.name, here_cfg["regenerable"]),
-            sensitive=here_cfg["never_delete_outright"],
+            protect_nested=(guarded := not _matches(path.name, here_cfg["regenerable"])),
+            sensitive=outright_guard(
+                here_cfg["sensitive_names"], here_cfg["ignored_keep"], not guarded
+            ),
             holding=quarantine,
         )
 
@@ -4105,6 +4311,7 @@ def _loose_artefacts(
         here_cfg = {
             **governing["clean"],
             "never_delete_outright": _never_delete_outright(governing),
+            "sensitive_names": governing["trash"]["sensitive"],
         }
         if not here_cfg["enabled"]:
             # Nothing from *this* directory, but the walk goes on: a deeper
@@ -4128,6 +4335,7 @@ def _loose_artefacts(
                 own = {
                     **governing_own["clean"],
                     "never_delete_outright": _never_delete_outright(governing_own),
+                    "sensitive_names": governing_own["trash"]["sensitive"],
                 }
                 own_dirs, _ = clean_patterns(own)
                 if (
@@ -4473,14 +4681,32 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _says_dry_run(word: str) -> bool:
-    """Whether one argv word asks for a dry run, clustered short flags included.
+# Short options that swallow the rest of the word as their value, so `-C/tmp`
+# and `-j4` are one argv word each and nothing after the letter is a flag.
+_TAKES_A_VALUE = "Cj"
 
-    `-qn` is the same request as `-q -n`, and comparing whole words missed it.
+
+def _asked_for_dry_run(given: Sequence[str]) -> bool:
+    """Whether argv asks for a dry run, clustered short flags included.
+
+    `-qn` is the same request as `-q -n`, so whole-word comparison missed it —
+    but scanning every word for an "n" then read `-C/tmp/notes` as a dry run and
+    printed advice about a flag nobody passed. Only letters that are really
+    flags count, and a short option's attached value is not one of them.
     """
-    if word == "--dry-run":
-        return True
-    return word.startswith("-") and not word.startswith("--") and "n" in word[1:]
+    for word in given:
+        if word == "--dry-run":
+            return True
+        if word == "--":
+            break
+        if not word.startswith("-") or word.startswith("--") or word == "-":
+            continue
+        for position, letter in enumerate(word[1:], start=1):
+            if letter == "n":
+                return True
+            if letter in _TAKES_A_VALUE and position < len(word) - 1:
+                break  # the rest of the word is that option's value
+    return False
 
 
 def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
@@ -4489,7 +4715,7 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     # -n and "no mode flag at all" both resolve to DRY, and init has to tell
     # them apart: with no flag it writes the file, with -n it prints it.
     given = sys.argv[1:] if argv is None else list(argv)
-    args.explicit_dry = any(_says_dry_run(word) for word in given)
+    args.explicit_dry = _asked_for_dry_run(given)
     for name in ("include", "exclude"):
         extra = getattr(args, f"{name}_after", None)
         if extra:
@@ -4698,8 +4924,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         report.add(Action("error", "-", "-", "", error=str(exc)))
         printer.line(f"\n  stopped: {exc}")
 
-    with contextlib.suppress(BrokenPipeError):
-        pass
     manifest = quarantine.write_manifest()
     if manifest and not args.json:
         # loud(): -q means "only the summary", and where the files went is part

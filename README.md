@@ -107,17 +107,29 @@ Two mechanisms, and the first is usually all you need:
 - **`clean.ignored`** — remove everything `.gitignore` already calls disposable,
   the same set as `git clean -Xd`. Off by default, because "ignored" also covers
   local-only files that are ignored *on purpose*: `.env`, `*.tfstate`, `*.pem`.
-  Those are listed in `clean.ignored_keep` and are never removed.
+  Those are listed in `clean.ignored_keep` and are never removed — and a
+  directory holding one is moved to quarantine rather than deleted, so the file
+  survives even when its parent goes.
+
+  With one exception, and it is the one that decides whether the tool reclaims
+  anything at all: inside a path listed in `clean.regenerable` (`.terraform`,
+  `.gradle`, `.next` …) `ignored_keep` does not apply, because those are caches
+  a tool rebuilds. Every `.terraform` holds a `terraform.tfstate` — the backend
+  pointer, not your state — and every `.venv` holds a `certifi/cacert.pem`, so
+  honouring the list there would turn practically every cache into a rename
+  into `.git-tidy-trash/` in the same workspace and free nothing.
+  `trash.sensitive` still holds there: nothing rebuilds a private key.
 - **`clean.dirs` / `clean.files`** — names removed wherever they appear, ignored
   or not: `.terraform`, `.terragrunt-cache`, `__pycache__`, `.pytest_cache`,
   `.scannerwork`, `*.pyc`, `.coverage`, and so on.
 
-Dependency trees (`node_modules`, `.venv`, `vendor`) and build directories
-(`dist`, `build`, `target`) are **off by default** — including under
-`clean.ignored`, which would otherwise take them, since `.gitignore` covers them
-in practically every repository. They are — the first are expensive to
-restore without a network, and the second are also perfectly ordinary source
-directory names. Turn them on with `clean.dependencies` and `clean.builds`.
+Dependency trees (`node_modules`, `.venv`, `venv`, `vendor`, `.bundle`) and
+build directories (`dist`, `build`, `target`, `out`) are **off by default** —
+including under `clean.ignored`, which would otherwise take them, since
+`.gitignore` covers them in practically every repository. Dependency trees are
+expensive to restore without a network, and every one of those build directory
+names is also a perfectly ordinary source directory name. Turn them on with
+`clean.dependencies` and `clean.builds`.
 
 Inside a repository, a **tracked file is never deleted**, however much it looks
 like an artefact — unless `clean.tracked: true` says so, which is off by default
@@ -190,7 +202,8 @@ What `--force` deliberately cannot do:
   itself a tool's clone: `terraform init` puts one under `.terraform/modules`
   for every module, and keeping those would make a gigabyte unreclaimable
 - hard-delete anything matching `trash.sensitive`; a credential is quarantined
-  whatever else is set
+  whatever else is set, wherever it turns up — including inside a cache that is
+  otherwise deleted outright
 - remove a tracked file, follow a symlink, or reach outside the workspace
 
 Pair it with `--ask` the first time, so you see what it selects before it acts.
