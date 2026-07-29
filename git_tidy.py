@@ -551,9 +551,67 @@ def _split_flow(body: str, source: str, number: int) -> list[str]:
     return [p.strip() for p in parts]
 
 
-_BOOL_TRUE = {"true", "yes", "on"}
-_BOOL_FALSE = {"false", "no", "off"}
-_NULL = {"", "null", "~"}
+# YAML 1.1 resolution, as PyYAML's safe loader implements it. Copied deliberately
+# rather than approximated: this parser only stands in when PyYAML is absent, and
+# a config that means one thing with it installed and another without would make
+# behaviour depend on the environment rather than on what was written.
+_YAML_BOOL_TRUE = frozenset(["yes", "Yes", "YES", "true", "True", "TRUE", "on", "On", "ON"])
+_YAML_BOOL_FALSE = frozenset(["no", "No", "NO", "false", "False", "FALSE", "off", "Off", "OFF"])
+_YAML_NULL = frozenset(["~", "null", "Null", "NULL", ""])
+_YAML_INT = re.compile(
+    r"""^(?:[-+]?0b[01_]+
+        |[-+]?0[0-7_]+
+        |[-+]?(?:0|[1-9][0-9_]*)
+        |[-+]?0x[0-9a-fA-F_]+
+        |[-+]?[1-9][0-9_]*(?::[0-5]?[0-9])+)$""",
+    re.VERBOSE,
+)
+_YAML_FLOAT = re.compile(
+    r"""^(?:[-+]?[0-9][0-9_]*\.[0-9_]*(?:[eE][-+][0-9]+)?
+        |\.[0-9_]+(?:[eE][-+][0-9]+)?
+        |[-+]?[0-9][0-9_]*(?::[0-5]?[0-9])+\.[0-9_]*
+        |[-+]?\.(?:inf|Inf|INF)
+        |\.(?:nan|NaN|NAN))$""",
+    re.VERBOSE,
+)
+# Characters PyYAML refuses to start a plain scalar with. Accepting them here
+# would mean `keep: *.pem` works without PyYAML and fails with it — and a glob is
+# the most natural thing anyone writes in this config.
+_YAML_INDICATORS = "*!|>%@`,]}"
+
+
+def _yaml_int(token: str) -> int:
+    body = token.replace("_", "")
+    sign = -1 if body.startswith("-") else 1
+    body = body.lstrip("+-")
+    if ":" in body:  # sexagesimal, which YAML 1.1 still has
+        value = 0
+        for part in body.split(":"):
+            value = value * 60 + int(part)
+        return sign * value
+    if body[:2].lower() == "0b":
+        return sign * int(body[2:], 2)
+    if body[:2].lower() == "0x":
+        return sign * int(body[2:], 16)
+    if body.startswith("0") and len(body) > 1:
+        return sign * int(body, 8)
+    return sign * int(body)
+
+
+def _yaml_float(token: str) -> float:
+    body = token.replace("_", "")
+    if body.lstrip("+-").lower() == ".inf":
+        return float("-inf") if body.startswith("-") else float("inf")
+    if body.lower() == ".nan":
+        return float("nan")
+    if ":" in body:
+        sign = -1 if body.startswith("-") else 1
+        whole, _, fraction = body.lstrip("+-").partition(".")
+        value = 0.0
+        for part in whole.split(":"):
+            value = value * 60 + float(part)
+        return sign * (value + (float("0." + fraction) if fraction else 0.0))
+    return float(body)
 
 
 def _scalar(token: str, source: str, number: int) -> Any:
@@ -568,7 +626,7 @@ def _scalar(token: str, source: str, number: int) -> Any:
             return body.replace('\\"', '"').replace("\\\\", "\\")
         # In a single-quoted YAML scalar '' is a literal apostrophe.
         return body.replace("''", "'")
-    return _plain_scalar(token)
+    return _plain_scalar(token, source, number)
 
 
 # A sentinel, because None is itself a perfectly good parsed value.
@@ -597,20 +655,31 @@ def _flow_collection(token: str, source: str, number: int) -> Any:
     return _NOT_FLOW
 
 
-def _plain_scalar(token: str) -> Any:
+def _plain_scalar(token: str, source: str = "<config>", number: int = 0) -> Any:
     """An unquoted token: null, a bool, a number, or the text itself."""
-    lowered = token.lower()
-    if lowered in _NULL:
+    if token[:2] == "- ":
+        # PyYAML reads this as a nested sequence, which nothing here has a use
+        # for, and refuses it in a value position. Refusing it too keeps the two
+        # parsers from disagreeing about what the config says.
+        raise Failure(
+            f"{source}:{number}: a value cannot start with '- '; quote it, or put the "
+            "list on its own lines"
+        )
+    if token[:1] in _YAML_INDICATORS:
+        raise Failure(
+            f"{source}:{number}: a value starting with {token[0]!r} means something "
+            f'special in YAML; quote it, as "{token}"'
+        )
+    if token in _YAML_NULL:
         return None
-    if lowered in _BOOL_TRUE:
+    if token in _YAML_BOOL_TRUE:
         return True
-    if lowered in _BOOL_FALSE:
+    if token in _YAML_BOOL_FALSE:
         return False
-    for convert in (lambda t: int(t, 10), float):
-        try:
-            return convert(token)
-        except ValueError:
-            continue
+    if _YAML_INT.match(token):
+        return _yaml_int(token)
+    if _YAML_FLOAT.match(token):
+        return _yaml_float(token)
     return token
 
 
@@ -626,7 +695,7 @@ def dump_scalar(value: Any) -> str:
     if isinstance(value, (int, float)):
         return str(value)
     text = str(value)
-    ambiguous = text.lower() in _BOOL_TRUE | _BOOL_FALSE | _NULL
+    ambiguous = text in _YAML_BOOL_TRUE | _YAML_BOOL_FALSE | _YAML_NULL
     numeric = _looks_numeric(text)
     if ambiguous or numeric or _NEEDS_QUOTES.search(text):
         return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
@@ -1978,6 +2047,27 @@ def clean_ignored(
     clean = cfg["clean"]
     protect = [*clean["ignored_keep"], *clean["keep"]]
     actions: list[Action] = []
+    # Its own guard: the caller's list does not have these until this returns,
+    # so a Quit raised in here would take them with it.
+    with keeping(actions):
+        _remove_ignored(
+            repo, scope, cfg, clean, protect, decider, quarantine, git, holding, actions
+        )
+    return actions
+
+
+def _remove_ignored(
+    repo: Path,
+    scope: str,
+    cfg: dict[str, Any],
+    clean: dict[str, Any],
+    protect: Sequence[str],
+    decider: Decider,
+    quarantine: Quarantine | None,
+    git: Git,
+    holding: Quarantine | None,
+    actions: list[Action],
+) -> None:
     for relative in ignored_paths(git):
         # git should never hand back the repository root, but a "" or "." here
         # would resolve to the repo itself and take everything with it.
@@ -2012,7 +2102,6 @@ def clean_ignored(
                 holding=holding,
             )
         )
-    return actions
 
 
 def _holds_protected(
@@ -2514,6 +2603,18 @@ def expire_quarantines(quarantine_root: Path, days: int, decider: Decider) -> li
         return []
     cutoff = time.time() - days * 86400
     actions: list[Action] = []
+    with keeping(actions):
+        _expire(quarantine_root, cutoff, days, decider, actions)
+    return actions
+
+
+def _expire(
+    quarantine_root: Path,
+    cutoff: float,
+    days: int,
+    decider: Decider,
+    actions: list[Action],
+) -> None:
     for entry in sorted(quarantine_root.iterdir()):
         try:
             if not entry.is_dir() or entry.stat().st_mtime > cutoff:
@@ -2650,7 +2751,7 @@ def _sweep(
         # difference is the same file on macOS and Windows.
         if relative in tracked or relative.lower() in tracked:
             continue
-        if any(relative.startswith(f"{parent}/") for parent in swept):
+        if _inside_a_swept_directory(relative, swept):
             continue
         # Deepest wins here too, and for a directory the config that governs it
         # is its own: it is the thing about to be swept.
@@ -2671,34 +2772,63 @@ def _sweep(
             continue
         if path.is_dir():
             swept.append(relative)
+        if (kept := _holds_a_repository(path, relative)) is not None:
+            actions.append(kept)
+            continue
         sensitive, why = _credential_check(path, here, sensitive, why)
         use_quarantine = here["quarantine"] or sensitive
         detail = f"sweep: {why}" + (" — sensitive, quarantined" if sensitive else "")
-        action = Action("trash", "workspace", relative, detail, quarantined=use_quarantine)
-        try:
-            action.size = directory_size(path) if path.is_dir() else path.stat().st_size
-        except OSError:
-            action.size = 0
-        if not decider.allow(action):
-            actions.append(action)
-            continue
-        try:
-            _guard(path, workspace)
-            if use_quarantine:
-                quarantine.take(path)
-            elif path.is_dir():
-                shutil.rmtree(path)
-            else:
-                path.unlink()
-            action.applied = True
-            # Keep the "sensitive" marker in the finished message too: seeing
-            # which credentials moved is the whole point of the report.
-            action.detail = ("quarantined: " if use_quarantine else "deleted: ") + why
-            if sensitive:
-                action.detail += " — sensitive, kept in quarantine"
-        except (OSError, Failure) as exc:
-            action.error = str(exc)
-        actions.append(action)
+        actions.append(
+            _sweep_one(
+                path,
+                workspace,
+                relative,
+                detail,
+                why,
+                sensitive,
+                use_quarantine,
+                decider,
+                quarantine,
+            )
+        )
+
+
+def _sweep_one(
+    path: Path,
+    workspace: Path,
+    relative: str,
+    detail: str,
+    why: str,
+    sensitive: bool,
+    use_quarantine: bool,
+    decider: Decider,
+    quarantine: Quarantine,
+) -> Action:
+    """Move or delete one swept path, and say which of the two it was."""
+    action = Action("trash", "workspace", relative, detail, quarantined=use_quarantine)
+    try:
+        action.size = directory_size(path) if path.is_dir() else path.stat().st_size
+    except OSError:
+        action.size = 0
+    if not decider.allow(action):
+        return action
+    try:
+        _guard(path, workspace)
+        if use_quarantine:
+            quarantine.take(path)
+        elif path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+        action.applied = True
+        # Keep the "sensitive" marker in the finished message too: seeing which
+        # credentials moved is the whole point of the report.
+        action.detail = ("quarantined: " if use_quarantine else "deleted: ") + why
+        if sensitive:
+            action.detail += " — sensitive, kept in quarantine"
+    except (OSError, Failure) as exc:
+        action.error = str(exc)
+    return action
 
 
 def tracked_from_outside(workspace: Path, timeout: int = 300) -> set[str]:
@@ -2717,6 +2847,23 @@ def tracked_from_outside(workspace: Path, timeout: int = 300) -> set[str]:
         for entry in tracked_paths(Git(outer, timeout=timeout))
         if entry.startswith(f"{prefix}/")
     }
+
+
+def _inside_a_swept_directory(relative: str, swept: Sequence[str]) -> bool:
+    """A directory going as a whole takes its contents with it."""
+    return any(relative.startswith(f"{parent}/") for parent in swept)
+
+
+def _holds_a_repository(path: Path, relative: str) -> Action | None:
+    """Refuse to sweep a directory with a git repository buried in it.
+
+    clean has refused this from the start; trash did not, and a forgotten clone
+    under a `project.old/` directory is exactly what the rule is for. Sweeping
+    it would take its unpushed commits with it.
+    """
+    if not path.is_dir() or not _measure(path)[1]:
+        return None
+    return Action("trash", "workspace", relative, "kept: contains a git repository", skipped=True)
 
 
 def _credential_check(
@@ -3262,30 +3409,11 @@ def cmd_clean(context: Context, report: Report) -> None:
         cfg = context.config_for(repo)
         if not cfg["clean"]["enabled"]:
             return []
-        holding = context.quarantine if cfg["clean"]["quarantine"] else None
-        git = Git(repo, timeout=int(cfg["sync"]["timeout"]))
-        name = context.name_of(repo)
         actions: list[Action] = []
-        # Ignored paths first: it removes whole directories in one step, which
-        # leaves the pattern walk below far less ground to cover.
-        already: set[str] = set()
-        if cfg["clean"]["ignored"]:
-            ignored = clean_ignored(
-                repo, name, cfg, context.decider, holding, git, context.quarantine
-            )
-            actions += ignored
-            already = {a.target for a in ignored}
-        actions += clean_tree(
-            repo,
-            name,
-            cfg,
-            context.decider,
-            git,
-            holding,
-            already=already,
-            sensitive=cfg["trash"]["sensitive"],
-            holding=context.quarantine,
-        )
+        # `actions` accumulates across both mechanisms, and clean_tree guards
+        # only its own list, so the guard belongs around the pair of them.
+        with keeping(actions):
+            _clean_repo(repo, context.name_of(repo), cfg, context, actions)
         return actions
 
     _in_parallel(context, work, report)
@@ -3297,6 +3425,36 @@ def cmd_clean(context: Context, report: Report) -> None:
         loose = _outside_repos(context, root_cfg, context.quarantine)
         report.extend(loose)
         context.printer.batch(loose)
+
+
+def _clean_repo(
+    repo: Path,
+    name: str,
+    cfg: dict[str, Any],
+    context: Context,
+    actions: list[Action],
+) -> None:
+    """Both cleaning mechanisms for one repository, accumulating in place."""
+    holding = context.quarantine if cfg["clean"]["quarantine"] else None
+    git = Git(repo, timeout=int(cfg["sync"]["timeout"]))
+    # Ignored paths first: it removes whole directories in one step, which
+    # leaves the pattern walk below far less ground to cover.
+    already: set[str] = set()
+    if cfg["clean"]["ignored"]:
+        ignored = clean_ignored(repo, name, cfg, context.decider, holding, git, context.quarantine)
+        actions += ignored
+        already = {a.target for a in ignored}
+    actions += clean_tree(
+        repo,
+        name,
+        cfg,
+        context.decider,
+        git,
+        holding,
+        already=already,
+        sensitive=cfg["trash"]["sensitive"],
+        holding=context.quarantine,
+    )
 
 
 def _outside_repos(
@@ -3314,6 +3472,8 @@ def _outside_repos(
         return []
     workspace = context.workspace
 
+    done: list[Action] = []
+
     def handle(item: tuple[Path, bool, dict[str, Any]]) -> Action:
         path, is_dir, here_cfg = item
         # Both the quarantine decision and the regenerable list come from the
@@ -3330,7 +3490,10 @@ def _outside_repos(
             holding=quarantine,
         )
 
-    return _map_parallel(handle, candidates, context.jobs)
+    # Guarded like every other step that accumulates: answering 'q' must not
+    # un-report the deletions that already happened.
+    with keeping(done):
+        return _map_parallel(handle, candidates, context.jobs, done)
 
 
 def enclosing_repo(workspace: Path) -> Path | None:
@@ -3420,12 +3583,26 @@ def _loose_artefacts(
             yield candidate, False, here_cfg
 
 
-def _map_parallel(work: Callable[[Any], Action], items: Sequence[Any], jobs: int) -> list[Action]:
-    """Apply `work` to every item, in order, across `jobs` threads."""
+def _map_parallel(
+    work: Callable[[Any], Action],
+    items: Sequence[Any],
+    jobs: int,
+    done: list[Action] | None = None,
+) -> list[Action]:
+    """Apply `work` to every item, in order, across `jobs` threads.
+
+    Results land in `done` as they arrive, so a Quit raised part way through
+    still has the finished ones to hand back.
+    """
+    collected = done if done is not None else []
     if jobs <= 1 or len(items) == 1:
-        return [work(item) for item in items]
+        for item in items:
+            collected.append(work(item))
+        return list(collected)
     with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
-        return list(pool.map(work, items))
+        for action in pool.map(work, items):
+            collected.append(action)
+    return list(collected)
 
 
 def cmd_trash(context: Context, report: Report) -> None:
@@ -3845,6 +4022,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         for action in quit_now.done:
             printer.action(action)
         printer.line("\n  stopped at your request; everything already done is kept")
+    except Failure as exc:
+        # The steps that already ran have changed the disk. Letting this out of
+        # main would lose the report and the quarantine manifest with it, so
+        # there would be no record of what happened and no stamp to restore.
+        interrupted = True
+        report.add(Action("error", "-", "-", "", error=str(exc)))
+        printer.line(f"\n  stopped: {exc}")
 
     manifest = quarantine.write_manifest()
     if manifest and not args.json:
