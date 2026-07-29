@@ -4179,3 +4179,30 @@ def test_config_can_be_asked_from_inside_a_repository(workspace: Path, capsys):
 def test_a_home_that_does_not_exist_is_a_message_not_a_traceback():
     with pytest.raises(gt.Failure, match="cannot work out what"):
         gt.resolve_workspace("~nosuchuser-git-tidy/git")
+
+
+@pytest.mark.parametrize(
+    "message,expected",
+    [
+        # Each of these matches more than one needle in REASONS, so the answer
+        # depends on the order of the table. One of them was wrong for three
+        # rounds; this pins the rest.
+        ("declined: switch from detached HEAD", "declined at the prompt"),
+        ("declined: remove directory", "declined at the prompt"),
+        (
+            "detached HEAD at abc1234, on no branch — switching would leave those "
+            "commits reachable only through the reflog",
+            "commits on a detached HEAD and no branch",
+        ),
+        ("detached at abc1234", "detached HEAD"),
+        ("kept: contains a git repository", "directories holding a git repository"),
+        ("kept: contains .env", "directories holding something that must not go"),
+        (
+            "orphaned worktree: /nowhere no longer exists, so git cannot work here.",
+            "orphaned worktrees — the parent pruned them away",
+        ),
+        ("upstream origin/x no longer exists", "on a branch whose upstream was deleted"),
+    ],
+)
+def test_an_ambiguous_message_resolves_to_the_right_category(message, expected):
+    assert gt._reason_of(message) == expected
