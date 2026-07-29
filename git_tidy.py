@@ -344,7 +344,8 @@ COMMENTS: dict[str, str] = {
     "heuristics below say.",
     "trash.heuristics": "mash:  keyboard-mash filenames (asdkjfhaksdjf.txt, lalalala.log)\n"
     "empty: zero-byte files\n"
-    "temp:  editor and OS leftovers (*~, *.swp, *.orig, *.rej, *.bak)",
+    "temp:  *~ *.swp *.swo *.orig *.rej *.bak *.tmp *.old — note the last two:\n"
+    "       a project.old/ somebody parked is swept whole, to quarantine.",
     "trash.sensitive": "Reported as sensitive and always quarantined rather than\n"
     "deleted, even with quarantine off, because a token may be the only copy.",
     "trash.min_age_days": "Nothing younger than this is touched, so today's scratch\n"
@@ -430,6 +431,10 @@ def _strip_comment(line: str) -> str:
 
 
 def _tokenize(text: str, source: str) -> list[_Line]:
+    # PyYAML strips this; an editor on Windows writes it. Without this the first
+    # key becomes "\ufeffjobs" and the whole config is refused — but only where
+    # PyYAML is absent, which is every shipped binary.
+    text = text.lstrip("\ufeff")
     lines: list[_Line] = []
     for number, raw in enumerate(text.splitlines(), start=1):
         if "\t" in raw[: len(raw) - len(raw.lstrip())]:
@@ -1310,8 +1315,15 @@ def is_dirty(git: Git) -> bool:
 
 
 def current_branch(git: Git) -> str:
-    """The checked-out branch, or "" when HEAD is detached."""
-    return git.out("symbolic-ref", "--quiet", "--short", "HEAD", check=False)
+    """The checked-out branch, or "" when HEAD is detached.
+
+    Not --short: once a tag of the same name exists, git disambiguates by
+    shortening refs/heads/main to "heads/main" rather than "main". Everything
+    downstream then compares, switches and deletes the wrong name — and the
+    repository silently stops being fast-forwarded.
+    """
+    ref = git.out("symbolic-ref", "--quiet", "HEAD", check=False)
+    return ref[len("refs/heads/") :] if ref.startswith("refs/heads/") else ""
 
 
 def sync_repo(path: Path, name: str, cfg: dict[str, Any], decider: Decider) -> list[Action]:
@@ -1762,6 +1774,9 @@ def _diverged(
     else:
         action.applied = True
         done = f"rebased {plural(ahead, 'commit')} onto {upstream}"
+        if not stashed:
+            # As in _switch and _finish: the kind is what the summary counts.
+            action.kind = action.kind.removeprefix("stash+")
         action.detail = f"stashed and {done}, recover it with git stash pop" if stashed else done
     return [action]
 
@@ -1884,7 +1899,9 @@ class BranchInfo:
 
 
 def list_branches(git: Git) -> list[BranchInfo]:
-    fmt = "%(refname:short)%09%(upstream:short)%09%(upstream:track)"
+    # %(refname), not %(refname:short): see current_branch on what a tag of the
+    # same name does to the short form.
+    fmt = "%(refname)%09%(upstream:short)%09%(upstream:track)"
     out = git.out("for-each-ref", f"--format={fmt}", "refs/heads", check=False)
     branches: list[BranchInfo] = []
     for line in out.splitlines():
@@ -1892,6 +1909,7 @@ def list_branches(git: Git) -> list[BranchInfo]:
         # them entirely rather than padding with tabs.
         name, _, rest = line.partition("\t")
         upstream, _, track = rest.partition("\t")
+        name = name[len("refs/heads/") :] if name.startswith("refs/heads/") else name
         if name:
             branches.append(BranchInfo(name, upstream, track))
     return branches
@@ -2150,6 +2168,13 @@ def clean_ignored(
     """Remove everything the repo's own .gitignore already calls disposable."""
     clean = cfg["clean"]
     protect = [*clean["ignored_keep"], *clean["keep"]]
+    # .gitignore covers node_modules and dist in practically every repository,
+    # so without this clean.ignored alone emptied the very lists that
+    # clean.dependencies and clean.builds exist to keep switched off.
+    if not clean["dependencies"]:
+        protect = [*protect, *clean["dependency_dirs"]]
+    if not clean["builds"]:
+        protect = [*protect, *clean["build_dirs"]]
     actions: list[Action] = []
     # Its own guard: the caller's list does not have these until this returns,
     # so a Quit raised in here would take them with it.
@@ -2632,7 +2657,10 @@ def _forget_restored(directory: Path, manifest: dict[str, Any], actions: Sequenc
     if not restored:
         return
     left = [entry for entry in manifest["entries"] if entry["from"] not in restored]
-    if left:
+    # Records the journal could not read are not in `entries`, but the files
+    # they describe are still under files/. Removing the directory would delete
+    # exactly what was just reported as left in the quarantine.
+    if left or manifest.get("unreadable"):
         payload = {**manifest, "entries": left}
         payload.pop("unreadable", None)
         scratch = directory / f"{MANIFEST_NAME}.partial"
@@ -3238,6 +3266,14 @@ class Printer:
                 )
             )
 
+    def loud(self) -> Printer:
+        """The same printer with quiet lifted, for output -q still owes."""
+        if not self.quiet:
+            return self
+        twin = Printer(self.stream, quiet=False, color=self.color, verbose=self.verbose)
+        twin._lock = self._lock
+        return twin
+
     def paint(self, text: str, code: str) -> str:
         return f"\033[{code}m{text}\033[0m" if self.color else text
 
@@ -3286,15 +3322,22 @@ DID: tuple[tuple[str, str, str], ...] = (
     ("ignored", "ignored paths removed", "ignored paths to remove"),
     ("ignored+quarantined", "ignored paths quarantined", "ignored paths to quarantine"),
     ("trash", "loose files swept", "loose files to sweep"),
+    # trash.quarantine defaults to true, so this is the ordinary case, not the
+    # exception — without it a default sweep produced no count at all.
+    ("trash+quarantined", "loose files quarantined", "loose files to quarantine"),
     ("restore", "files restored", "files to restore"),
     ("expire", "quarantines deleted", "quarantines to delete"),
 )
 
 
 def summarise(report: Report, mode: str, printer: Printer, forced: bool = False) -> None:
-    """A summary a person can act on: what happened, what needs them, what broke."""
-    if printer.quiet:
-        return
+    """A summary a person can act on: what happened, what needs them, what broke.
+
+    Printed even under -q. That flag says "only print the summary"; suppressing
+    this as well left `git-tidy trash --apply -q` moving files and emitting
+    nothing at all.
+    """
+    printer = printer.loud()
     done: dict[str, int] = {}
     for action in report.actions:
         if action.applied or (mode == DRY and not action.skipped and not action.error):
@@ -3349,7 +3392,9 @@ def _summarise_held_back(report: Report, printer: Printer, forced: bool = False)
     # against a branch a worktree holds, or a repository that has diverged, is
     # advice that cannot work.
     if not forced and any(reason in FORCE_CAN_FIX for reason in reasons):
-        printer.line("           --force does the ones it safely can; -v shows each one")
+        # `run`, not the bare subcommand: --force only reaches unmerged branches
+        # after a fetch in the same run, and prune does not fetch.
+        printer.line("           `run --force` does the ones it safely can; -v shows each one")
     else:
         printer.line("           -v shows each one")
 
@@ -3374,6 +3419,10 @@ REASONS: tuple[tuple[str, str], ...] = (
     ("uncommitted work in", "submodules with uncommitted work"),
     ("would be replaced", "a local file the incoming commits would overwrite"),
     ("kept: contains", "directories holding something that must not go"),
+    ("cannot check merged", "branches with no trunk to compare against"),
+    ("to compare against", "branches with no trunk to compare against"),
+    ("not a quarantine", "directories under the quarantine that are not ours"),
+    ("unreadable", "quarantine records that could not be read"),
     ("checked out in", "default branch checked out in another worktree"),
     ("ignored_keep", "ignored files kept as local state (.env, *.tfstate, keys)"),
     ("orphaned worktree", "orphaned worktrees — the parent pruned them away"),
