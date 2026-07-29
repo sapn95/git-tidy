@@ -53,6 +53,11 @@ Fetches, then **fast-forwards only**. A repo that has diverged from its upstream
 is reported and left alone — no merge, no rebase, no `--force-with-lease`, no
 surprises in the reflog.
 
+The one exception is opt-in and off by default: `sync.diverged: rebase` replays
+the local commits on top of the upstream ones. It aborts and reports if that
+conflicts, rather than leaving a half-applied rebase behind, but it does rewrite
+commit ids — the originals stay reachable through the reflog.
+
 The default branch is whatever the remote's own `HEAD` points at, not a hardcoded
 `main`. A repo whose worktree has uncommitted changes stays on its branch.
 
@@ -266,7 +271,8 @@ git tidy run --apply
 ## Safety
 
 - Dry run by default. `--apply` is always explicit.
-- Fast-forward only. Never merges, rebases or force-pushes.
+- Fast-forward only by default. Never merges, never force-pushes. Rebases only
+  where `sync.diverged: rebase` explicitly asks for it.
 - A branch with unpushed commits is reported, never deleted.
 - Tracked files are never removed by `clean`.
 - Symlinks are never followed; nothing outside the workspace is ever touched.
