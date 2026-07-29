@@ -3029,7 +3029,6 @@ def _expire(
                 action.applied = True
                 action.detail = "deleted"
         actions.append(action)
-    return actions
 
 
 # --------------------------------------------------------------------------- #
