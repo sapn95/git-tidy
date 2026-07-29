@@ -3357,3 +3357,32 @@ def test_a_forced_prune_without_a_fetch_says_what_to_do(workspace: Path, remote:
     assert gt._reason_of(actions[0].detail) == (
         "unmerged branches waiting on a fetch — use `run --force`"
     )
+
+
+def test_a_local_only_branch_is_named_not_binned_as_other(workspace: Path):
+    """A branch that was never pushed is a state, not a mystery."""
+    repo = workspace / "repo"
+    git(repo, "switch", "-q", "-c", "scratch")
+    actions = gt.sync_repo(repo, "repo", config(sync={"switch": "never"}), run())
+    update = [a for a in actions if a.detail == "no upstream"]
+    assert update
+    assert gt._reason_of(update[0].detail) == "on a local-only branch, never pushed"
+
+
+def test_every_message_the_tool_produces_has_a_category():
+    """Anything that lands in "other" is a message nobody can act on."""
+    uncategorised = [
+        detail
+        for detail in (
+            "no upstream",
+            "no remote configured",
+            "already up to date",
+            "cannot compare with upstream",
+            "kept: contains a git repository",
+            "kept by ignored_keep",
+            "linked worktree, left on side",
+            "detached at abc1234",
+        )
+        if gt._reason_of(detail) == "other, see the lines marked -"
+    ]
+    assert uncategorised == []
