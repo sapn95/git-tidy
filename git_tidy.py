@@ -436,14 +436,26 @@ def _tokenize(text: str, source: str) -> list[_Line]:
     # PyYAML is absent, which is every shipped binary.
     text = text.lstrip("\ufeff")
     lines: list[_Line] = []
+    ended = False
     for number, raw in enumerate(text.splitlines(), start=1):
         if "\t" in raw[: len(raw) - len(raw.lstrip())]:
             raise Failure(f"{source}:{number}: tabs cannot be used for YAML indentation")
         content = _strip_comment(raw)
         if not content.strip():
             continue
-        if content.lstrip().startswith(("---", "...")):
+        if content.lstrip().startswith("..."):
+            ended = True
             continue
+        if content.lstrip().startswith("---"):
+            if lines or ended:
+                # A second document. PyYAML refuses one outright; merging them
+                # here silently dropped whichever key came first.
+                raise Failure(
+                    f"{source}:{number}: more than one YAML document; this reads only one"
+                )
+            continue
+        if ended:
+            raise Failure(f"{source}:{number}: content after the end of the document")
         lines.append(_Line(len(content) - len(content.lstrip()), content.strip(), number))
     return lines
 
@@ -600,6 +612,11 @@ _YAML_FLOAT = re.compile(
 # would mean `keep: *.pem` works without PyYAML and fails with it — and a glob is
 # the most natural thing anyone writes in this config.
 _YAML_INDICATORS = "*&!|>%@`,]}"
+# YAML 1.1 resolves these to a date or a datetime, which is never a valid value
+# for any setting here — but PyYAML does it and this parser did not.
+_YAML_TIMESTAMP = re.compile(
+    r"^\d{4}-\d{1,2}-\d{1,2}(?:[Tt ][^\s]*)?(?:\s+[-+]?\d{1,2}(?::\d{2})?)?$"
+)
 
 
 def _yaml_int(token: str) -> int:
@@ -711,6 +728,12 @@ def _plain_scalar(token: str, source: str = "<config>", number: int = 0) -> Any:
         return _yaml_int(token)
     if _YAML_FLOAT.match(token):
         return _yaml_float(token)
+    if _YAML_TIMESTAMP.match(token):
+        # PyYAML resolves this to a date, which _merge then refuses because it
+        # is not text. Refusing it here keeps both paths saying the same thing.
+        raise Failure(
+            f"{source}:{number}: {token!r} reads as a date; quote it if it is meant as text"
+        )
     return token
 
 
@@ -1355,10 +1378,16 @@ def sync_repo(path: Path, name: str, cfg: dict[str, Any], decider: Decider) -> l
         return [Action("sync", name, remote, "no such remote", skipped=True)]
 
     fetch = Action("fetch", name, remote, "fetch")
-    with keeping(actions):
-        return _sync_from(
+    # A configuration value is only validated once the code reaches it, which is
+    # after the fetch. Losing the fetch on the way out would report nothing for
+    # a run that pruned remote-tracking refs.
+    with reporting(actions):
+        # Accumulates into `actions`, so there is something to report even when
+        # a later configuration value turns out to be invalid.
+        actions[:] = _sync_from(
             git, name, sync, remote, fetch, actions, decider, cfg["clean"]["ignored_keep"]
         )
+    return actions
 
 
 def _sync_from(
@@ -1430,7 +1459,7 @@ def _switch(
 ) -> _Outcome:
     policy = sync["switch"]
     where = head or "detached HEAD"
-    blocked = _cannot_switch(git, name, branch, where, policy, sync, cfg_ignored_keep)
+    blocked = _cannot_switch(git, name, branch, where, policy, sync, cfg_ignored_keep, target)
     if blocked is not None:
         return blocked
 
@@ -1485,6 +1514,7 @@ def _cannot_switch(
     policy: str,
     sync: dict[str, Any],
     ignored_keep: Sequence[str] = (),
+    target: str = "",
 ) -> _Outcome | None:
     """The reasons a switch is not going to happen, before any work is done.
 
@@ -1527,7 +1557,11 @@ def _cannot_switch(
             ],
             stop=True,
         )
-    clobbered = _would_clobber_ignored(git, branch, ignored_keep)
+    # target, not branch: when the trunk exists only as origin/main the switch
+    # creates it from there, and `cat-file -e main:...` would fail with "invalid
+    # object name" and wave the overwrite through.
+    local = git.ok("show-ref", "--verify", "--quiet", f"refs/heads/{branch}")
+    clobbered = _would_clobber_ignored(git, branch if local else target, ignored_keep)
     if clobbered is not None:
         return _Outcome(
             [
@@ -1672,6 +1706,23 @@ def _fast_forward(
 
 
 @contextlib.contextmanager
+def reporting(actions: list[Action]) -> Iterator[None]:
+    """Like keeping(), but for a Failure as well as a Quit.
+
+    A step that has already changed something and then hits a bad config value
+    must still report what it did.
+    """
+    try:
+        yield
+    except Quit as quit_now:
+        quit_now.done.extend(actions)
+        raise
+    except Failure as exc:
+        actions.append(Action("error", "-", "-", "", error=str(exc)))
+        return
+
+
+@contextlib.contextmanager
 def keeping(actions: list[Action]) -> Iterator[None]:
     """Hand what has been done so far to a Quit on its way out.
 
@@ -1728,7 +1779,7 @@ def _would_clobber_ignored(git: Git, branch: str, protect: Sequence[str]) -> str
     a local .env or *.tfstate, which is what ignored_keep names. Only those are
     checked — asking about every ignored file would mean walking node_modules.
     """
-    for relative in ignored_paths(git):
+    for relative in ignored_paths(git, collapse="never"):
         name = Path(relative).name
         if not (_matches(name, protect) or any(fnmatch.fnmatch(relative, p) for p in protect)):
             continue
@@ -2179,13 +2230,13 @@ def tracked_paths(git: Git) -> set[str]:
     return paths | {entry.lower() for entry in paths}
 
 
-def ignored_paths(git: Git) -> list[str]:
+def ignored_paths(git: Git, collapse: str = "some") -> list[str]:
     """What `git clean -Xd` would remove: everything .gitignore calls disposable.
 
     --directory collapses a wholly ignored directory into one entry, so a
     node_modules with 40,000 files inside comes back as a single path.
     """
-    result = git.run(
+    collapsed = git.run(
         "ls-files",
         "--others",
         "--ignored",
@@ -2195,7 +2246,26 @@ def ignored_paths(git: Git) -> list[str]:
         "-z",
         check=False,
     )
-    return [entry.rstrip("/") for entry in result.stdout.split("\0") if entry]
+    whole = [entry.rstrip("/") for entry in collapsed.stdout.split("\0") if entry]
+    if collapse == "only":
+        return whole
+    # --directory stops git descending into a directory it has already called
+    # untracked, so an ignored file inside an *untracked* one is never listed —
+    # which both broke the `git clean -Xd` parity this claims and hid files the
+    # switch guard needs to see. The uncollapsed list fills those in; the
+    # collapsed one is still used for the wholesale removals, so a node_modules
+    # with forty thousand files stays one entry.
+    every = git.run("ls-files", "--others", "--ignored", "--exclude-standard", "-z", check=False)
+    listed = [entry for entry in every.stdout.split("\0") if entry]
+    if collapse == "never":
+        # Every path in its own right: the switch guard has to see the .env
+        # inside a wholly ignored config/, which the collapsed form hides — and
+        # the .env at the root, which the collapsed form lists but this must not
+        # therefore skip.
+        return listed
+    inside = [entry for entry in listed if entry not in whole]
+    covered = tuple(f"{one}/" for one in whole)
+    return whole + [entry for entry in inside if not entry.startswith(covered)]
 
 
 def clean_patterns(clean: dict[str, Any]) -> tuple[list[str], list[str]]:
@@ -2206,6 +2276,30 @@ def clean_patterns(clean: dict[str, Any]) -> tuple[list[str], list[str]]:
         dirs += clean["build_dirs"]
     files = [*clean["files"], *clean["extra_files"]]
     return dirs, files
+
+
+def protection_rules(clean: dict[str, Any]) -> list[tuple[Sequence[str], str]]:
+    """Every rule that keeps a path, with the name of the rule that did it.
+
+    Shared by both removal paths. Keeping them apart is how clean.dirs came to
+    delete a terraform.tfstate that clean.ignored had refused in the same run —
+    one consulted ignored_keep and the other did not.
+
+    Each rule keeps its own name: pointing somebody at clean.ignored_keep for
+    something node_modules kept sends them to a list it is not in. .gitignore
+    covers node_modules and dist in practically every repository, so without the
+    last two clean.ignored alone emptied the very lists that clean.dependencies
+    and clean.builds exist to keep switched off.
+    """
+    rules: list[tuple[Sequence[str], str]] = [
+        (clean["ignored_keep"], "kept by ignored_keep"),
+        (clean["keep"], "kept by clean.keep"),
+    ]
+    if not clean["dependencies"]:
+        rules.append((clean["dependency_dirs"], "kept: a dependency tree, clean.dependencies"))
+    if not clean["builds"]:
+        rules.append((clean["build_dirs"], "kept: build output, clean.builds"))
+    return rules
 
 
 def clean_ignored(
@@ -2219,19 +2313,7 @@ def clean_ignored(
 ) -> list[Action]:
     """Remove everything the repo's own .gitignore already calls disposable."""
     clean = cfg["clean"]
-    # Each rule keeps its own name: pointing somebody at clean.ignored_keep for
-    # something node_modules kept sends them to a list it is not in.
-    # .gitignore covers node_modules and dist in practically every repository,
-    # so without the last two clean.ignored alone emptied the very lists that
-    # clean.dependencies and clean.builds exist to keep switched off.
-    rules: list[tuple[Sequence[str], str]] = [
-        (clean["ignored_keep"], "kept by ignored_keep"),
-        (clean["keep"], "kept by clean.keep"),
-    ]
-    if not clean["dependencies"]:
-        rules.append((clean["dependency_dirs"], "kept: a dependency tree, clean.dependencies"))
-    if not clean["builds"]:
-        rules.append((clean["build_dirs"], "kept: build output, clean.builds"))
+    rules = protection_rules(clean)
     actions: list[Action] = []
     # Its own guard: the caller's list does not have these until this returns,
     # so a Quit raised in here would take them with it.
@@ -2291,7 +2373,7 @@ def _remove_ignored(
                 is_dir=path.is_dir(),
                 kind="ignored",
                 protect_nested=not _matches(name, clean["regenerable"]),
-                sensitive=cfg["trash"]["sensitive"],
+                sensitive=_never_delete_outright(cfg),
                 holding=holding,
             )
         )
@@ -3228,10 +3310,29 @@ def _check_credentials(git: Git, name: str, remotes: Sequence[str]) -> list[Acti
 
 def _check_unpushed(git: Git, name: str) -> list[Action]:
     found: list[Action] = []
+    trunk = default_branch(
+        git,
+        {
+            "default_branch": "auto",
+            "remote": "origin",
+            "default_branch_candidates": ["main", "master"],
+        },
+        readonly=True,
+    )
     for branch in list_branches(git):
         if not branch.upstream:
             continue
-        ahead = git.out("rev-list", "--count", f"{branch.upstream}..{branch.name}", check=False)
+        against = branch.upstream
+        if branch.gone:
+            # The upstream ref is gone, so rev-list against it exits 128 and the
+            # count came back empty — silently dropping the one case where those
+            # commits exist nowhere else. Measure against the trunk instead.
+            if trunk is None:
+                continue
+            against = f"origin/{trunk}"
+            if not git.ok("show-ref", "--verify", "--quiet", f"refs/remotes/{against}"):
+                against = trunk
+        ahead = git.out("rev-list", "--count", f"{against}..{branch.name}", check=False)
         if ahead and ahead != "0":
             found.append(
                 Action(
@@ -3328,7 +3429,9 @@ class Printer:
                 self.action(group[0])
                 continue
             size = sum(a.size for a in group)
-            verb = group[0].detail.split(":")[0] if skipped else _past_tense(group[0])
+            # The group key already holds the reason; using it means two groups
+            # never print the same word for different causes.
+            verb = (_reason or group[0].detail.split(":")[0]) if skipped else _past_tense(group[0])
             self.action(
                 Action(
                     kind,
@@ -3493,6 +3596,7 @@ REASONS: tuple[tuple[str, str], ...] = (
     ("uncommitted changes", "uncommitted changes — left on their branch"),
     ("needs a fetch in this run", "unmerged branches waiting on a fetch — use `run --force`"),
     ("not in origin", "branches with commits not in the trunk"),
+    ("commit not in", "branches with commits not in the trunk"),
     ("commits not in", "branches with commits not in the trunk"),
     ("diverged", "diverged from upstream — needs a merge or rebase by hand"),
     ("contains a git repository", "directories holding a git repository"),
@@ -3738,6 +3842,19 @@ def cmd_clean(context: Context, report: Report) -> None:
         context.printer.batch(loose)
 
 
+def _never_delete_outright(cfg: dict[str, Any]) -> list[str]:
+    """Names that are moved rather than deleted, wherever they turn up.
+
+    trash.sensitive and clean.ignored_keep both name things that may be the only
+    copy — a token, a .env, a terraform.tfstate, an id_rsa. clean.ignored
+    refused a directory holding one; the pattern walk deleted the same directory
+    minutes later, because only the first list was consulted. Quarantining is
+    the better answer than refusing: the space is still reclaimed and nothing is
+    lost.
+    """
+    return [*cfg["trash"]["sensitive"], *cfg["clean"]["ignored_keep"]]
+
+
 def _clean_repo(
     repo: Path,
     name: str,
@@ -3766,7 +3883,7 @@ def _clean_repo(
         git,
         holding,
         already=already,
-        sensitive=cfg["trash"]["sensitive"],
+        sensitive=_never_delete_outright(cfg),
         holding=context.quarantine,
     )
 
@@ -3800,7 +3917,7 @@ def _outside_repos(
             quarantine if here_cfg["quarantine"] else None,
             is_dir,
             protect_nested=not _matches(path.name, here_cfg["regenerable"]),
-            sensitive=here_cfg["sensitive_here"],
+            sensitive=here_cfg["never_delete_outright"],
             holding=quarantine,
         )
 
@@ -3844,7 +3961,10 @@ def _loose_artefacts(
             dirnames[:] = []
             continue
         governing = context.config_for(here)
-        here_cfg = {**governing["clean"], "sensitive_here": governing["trash"]["sensitive"]}
+        here_cfg = {
+            **governing["clean"],
+            "never_delete_outright": _never_delete_outright(governing),
+        }
         if not here_cfg["enabled"]:
             dirnames[:] = []
             continue
@@ -3864,7 +3984,7 @@ def _loose_artefacts(
                 governing_own = context.config_for(candidate)
                 own = {
                     **governing_own["clean"],
-                    "sensitive_here": governing_own["trash"]["sensitive"],
+                    "never_delete_outright": _never_delete_outright(governing_own),
                 }
                 own_dirs, _ = clean_patterns(own)
                 if (
@@ -3875,7 +3995,8 @@ def _loose_artefacts(
                     # Its own config decides whether it is an artefact at all,
                     # not only whether it is protected.
                     continue
-                if _holds_protected(candidate, own["keep"], base=context.workspace):
+                own_protect = [p for patterns, _ in protection_rules(own) for p in patterns]
+                if _holds_protected(candidate, own_protect, base=context.workspace):
                     # Something inside is kept, so walk in rather than take it all.
                     descend.append(name)
                     continue
@@ -3988,6 +4109,7 @@ def _interview(printer: Printer, prompt_input: Callable[[str], str] | None) -> d
     """The handful of questions whose answers actually differ between people."""
     chosen: dict[str, Any] = {}
     jobs = _number("Workers? 0 = one per CPU core", str(DEFAULTS["jobs"]), prompt_input)
+    worker_count(jobs)  # refuse here rather than on every later run
     if jobs != DEFAULTS["jobs"]:
         chosen["jobs"] = jobs
     if ask_yes_no("Delete everything .gitignore covers?", False, prompt_input):
@@ -4032,8 +4154,15 @@ def cmd_init(
         printer.line(f"Writing {target}. Enter accepts the default in brackets.\n")
         chosen = _interview(printer, prompt_input)
 
+    body = render_config(chosen, INIT_HEADER)
+    if mode == DRY and not interactive:
+        # -n means change nothing, here as everywhere else. Printing it is still
+        # useful: `git-tidy init -n > .git-tidy.yaml` is a reasonable thing to do.
+        printer.loud().line(body.rstrip())
+        printer.loud().line(f"\n  Not written. Run without -n, or redirect this into {target}.")
+        return 0
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(render_config(chosen, INIT_HEADER), encoding="utf-8")
+    target.write_text(body, encoding="utf-8")
     # Reading it straight back catches a template that this tool's own parser
     # cannot load, which would otherwise only surface on the next run.
     _merge(DEFAULTS, read_config_file(target), str(target))
@@ -4359,7 +4488,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         target = _expand(args.path) if args.path else workspace
         # A path outside -C would silently get none of its own .git-tidy.yaml
         # files, which is the opposite of what this command is for.
-        if target != workspace and workspace not in target.parents:
+        # Also when no path was given: -C defaults to cwd, and inside a checkout
+        # that root has none of the configs above it.
+        if args.path is None or (target != workspace and workspace not in target.parents):
             resolver = ConfigResolver(_workspace_of(target), overrides_from(args))
         print(json.dumps(resolver.for_path(target), indent=2, sort_keys=True))
         return 0
@@ -4400,10 +4531,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         report.add(Action("error", "-", "-", "", error=str(exc)))
         printer.line(f"\n  stopped: {exc}")
 
+    with contextlib.suppress(BrokenPipeError):
+        pass
     manifest = quarantine.write_manifest()
     if manifest and not args.json:
-        printer.line(f"\n  Quarantined files are under {quarantine.dir}")
-        printer.line(f"  Undo with: git-tidy -C {workspace} restore {quarantine.stamp} --apply")
+        # loud(): -q means "only the summary", and where the files went is part
+        # of it — the run moved them and this is the only way back.
+        printer.loud().line(f"\n  Quarantined files are under {quarantine.dir}")
+        printer.loud().line(
+            f"  Undo with: git-tidy -C {workspace} restore {quarantine.stamp} --apply"
+        )
 
     if args.json:
         print(
@@ -4425,6 +4562,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 1 if report.errors or interrupted else 0
 
 
+def _list_quarantines(root: Path) -> list[dict[str, Any]]:
+    """What is in the quarantine, for both the text listing and --json."""
+    if not root.is_dir():
+        return []
+    found: list[dict[str, Any]] = []
+    for entry in sorted(root.iterdir()):
+        complete = (entry / MANIFEST_NAME).is_file()
+        if not complete and not (entry / JOURNAL_NAME).is_file():
+            continue
+        with contextlib.suppress(Failure, OSError, json.JSONDecodeError):
+            found.append(
+                {
+                    "stamp": entry.name,
+                    "entries": len(_read_manifest(entry)["entries"]),
+                    "complete": complete,
+                }
+            )
+    return found
+
+
 def _restore_command(
     args: argparse.Namespace,
     cfg: dict[str, Any],
@@ -4433,18 +4590,18 @@ def _restore_command(
     printer: Printer,
 ) -> int:
     if args.list:
-        if not quarantine_root.is_dir():
-            printer.line("no quarantines")
+        listed = _list_quarantines(quarantine_root)
+        if args.json:
+            print(json.dumps({"version": __version__, "quarantines": listed}, indent=2))
             return 0
-        for entry in sorted(quarantine_root.iterdir()):
-            if not (entry / MANIFEST_NAME).is_file() and not (entry / JOURNAL_NAME).is_file():
-                continue
-            data = _read_manifest(entry)
-            # A sweep that was killed has only its journal, and is still listed:
-            # it is restorable, so hiding it would be the wrong kind of tidy.
-            unfinished = "" if (entry / MANIFEST_NAME).is_file() else "  (unfinished)"
-            printer.line(f"  {entry.name}  {plural(len(data['entries']), 'entry')}{unfinished}")
+        if not listed:
+            printer.loud().line("no quarantines")
+            return 0
+        for one in listed:
+            unfinished = "" if one["complete"] else "  (unfinished)"
+            printer.loud().line(f"  {one['stamp']}  {plural(one['entries'], 'entry')}{unfinished}")
         return 0
+
     interrupted = False
     try:
         actions = (
@@ -4482,6 +4639,12 @@ def entrypoint() -> NoReturn:
     except Failure as exc:
         print(f"git-tidy: {exc}", file=sys.stderr)
         sys.exit(2)
+    except BrokenPipeError:
+        # `| head` closes stdout while the run is still printing. Nothing is
+        # wrong with the run itself, so it must not end in a traceback — and the
+        # manifest is written before this is reached.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(0)
     except KeyboardInterrupt:  # pragma: no cover - interactive only
         print("\ngit-tidy: interrupted", file=sys.stderr)
         sys.exit(130)
