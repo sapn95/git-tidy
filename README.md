@@ -160,6 +160,29 @@ Changes nothing. Reports:
 `--ask` runs single-threaded so the prompts do not interleave; the other two use
 all cores.
 
+### `--force`
+
+A separate flag, and the only one in this tool that can lose work. It does two
+things, and nothing else:
+
+- **`branches.require_merged: false`** — deletes a branch whose upstream is gone
+  even when its commits are not in the trunk. Still refuses unless a fetch
+  succeeded in the same run, so the `[gone]` mark it acts on was observed now
+  rather than cached from some earlier day.
+- **`sync.switch: always` and `sync.stash: true`** — switches and fast-forwards
+  a repository with uncommitted changes, putting them in a stash first. Nothing
+  is discarded; the report tells you which stash and how to get it back.
+
+What `--force` deliberately cannot do:
+
+- delete a directory with a git repository inside it — a vendored or forgotten
+  checkout holds commits that exist nowhere else, and no flag here may take them
+- hard-delete anything matching `trash.sensitive`; a credential is quarantined
+  whatever else is set
+- remove a tracked file, follow a symlink, or reach outside the workspace
+
+Pair it with `--ask` the first time, so you see what it selects before it acts.
+
 ## Speed
 
 Everything here waits on either the network or the disk, so the work is spread
