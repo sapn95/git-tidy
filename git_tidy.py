@@ -614,8 +614,14 @@ _YAML_FLOAT = re.compile(
 _YAML_INDICATORS = "*&!|>%@`,]}"
 # YAML 1.1 resolves these to a date or a datetime, which is never a valid value
 # for any setting here — but PyYAML does it and this parser did not.
+# Copied from PyYAML's resolver rather than approximated: an over-eager version
+# refused `2024-1-2`, which PyYAML reads as an ordinary string, so a config
+# loaded from a checkout and failed on every shipped build.
 _YAML_TIMESTAMP = re.compile(
-    r"^\d{4}-\d{1,2}-\d{1,2}(?:[Tt ][^\s]*)?(?:\s+[-+]?\d{1,2}(?::\d{2})?)?$"
+    r"""^(?:\d{4}-\d\d-\d\d
+        |\d{4}-\d\d?-\d\d?(?:[Tt]|[ \t]+)\d\d?:\d\d:\d\d(?:\.\d*)?
+           (?:[ \t]*(?:Z|[-+]\d\d?(?::\d\d)?))?)$""",
+    re.VERBOSE,
 )
 
 
@@ -1736,6 +1742,33 @@ def keeping(actions: list[Action]) -> Iterator[None]:
         raise
 
 
+IN_PROGRESS = {
+    "MERGE_HEAD": "a merge",
+    "CHERRY_PICK_HEAD": "a cherry-pick",
+    "REVERT_HEAD": "a revert",
+    "BISECT_LOG": "a bisect",
+}
+
+
+def _operation_in_progress(git: Git) -> str:
+    """Whatever git is half way through, or "" when it is not.
+
+    `git stash push` resets to HEAD, which clears MERGE_HEAD along with it — and
+    an uncommitted merge writes no reflog entry, so afterwards nothing in the
+    repository records which commit was being merged. The stash holds the
+    content but not the parentage, and `git stash pop` then restores it as
+    ordinary work: following the advice this tool prints would produce a commit
+    with the wrong parents.
+    """
+    git_dir = git.out("rev-parse", "--absolute-git-dir", check=False)
+    if not git_dir:
+        return ""
+    return next(
+        (what for marker, what in IN_PROGRESS.items() if (Path(git_dir) / marker).exists()),
+        "",
+    )
+
+
 def _stash(git: Git, name: str) -> tuple[bool, Action | None]:
     """Put uncommitted work aside so a switch or fast-forward can proceed.
 
@@ -1750,6 +1783,15 @@ def _stash(git: Git, name: str) -> tuple[bool, Action | None]:
     moved is the ordinary case. Reading exit 0 as "a stash now exists" made
     _unstash pop whichever stash happened to be on top, which is the user's.
     """
+    busy = _operation_in_progress(git)
+    if busy:
+        return False, Action(
+            "stash",
+            name,
+            "-",
+            "",
+            error=f"{busy} is in progress; finish or abort it first (a stash would lose it)",
+        )
     before = git.out("rev-parse", "--quiet", "--verify", "refs/stash", check=False)
     result = git.run("stash", "push", "--include-untracked", "-m", f"git-tidy: {name}", check=False)
     if result.returncode != 0:
@@ -1904,6 +1946,16 @@ def _dirty_submodules(git: Git) -> list[str]:
     return dirty
 
 
+def _moved_submodules(git: Git) -> list[str]:
+    """Submodules checked out at something other than the recorded commit."""
+    out = git.out("submodule", "status", "--recursive", check=False)
+    return [
+        line[1:].split()[1]
+        for line in out.splitlines()
+        if line.startswith("+") and len(line[1:].split()) > 1
+    ]
+
+
 def _uninitialised_submodules(git: Git) -> list[str]:
     """Submodule paths git has not checked out yet, marked with a leading '-'."""
     out = git.out("submodule", "status", "--recursive", check=False)
@@ -1953,10 +2005,13 @@ def _sync_submodules(git: Git, name: str, sync: dict[str, Any], decider: Decider
                 skipped=True,
             )
         ]
-    missing = _uninitialised_submodules(git) if mode == "init" else []
-    if mode == "init" and not missing:
-        # Nothing to initialise, so there is nothing to report — least of all in
-        # a dry run, which would be promising work that will not happen.
+    missing = _uninitialised_submodules(git)
+    moved = _moved_submodules(git) if mode == "update" else []
+    if not missing and not moved:
+        # Nothing to do, so nothing to report — least of all in a dry run, which
+        # would be promising work that will not happen. `git submodule update`
+        # exits 0 whether or not it moved anything, so this is the only way to
+        # tell.
         return []
     action = Action("submodules", name, mode, "update submodules")
     if not decider.allow(action):
@@ -2589,11 +2644,13 @@ def _remove(
     action.quarantined = quarantine is not None
     because = ""
     if quarantine is None and holding is not None and sensitive:
-        buried = (
-            _holds_protected(path, sensitive)
-            if is_dir
-            else (path.name if _matches(path.name, sensitive) else None)
-        )
+        # The name first, for a directory as much as for a file: _holds_protected
+        # walks the children and never looks at the root, so a directory called
+        # credentials/ or tokens/ was hard-deleted while a file called
+        # api-token.pyc beside it was correctly quarantined.
+        buried = path.name if _matches(path.name, sensitive) else None
+        if buried is None and is_dir:
+            buried = _holds_protected(path, sensitive)
         if buried is not None:
             # The promise trash makes, kept here too: something that may be the
             # only copy of a credential is moved, never deleted outright — even
@@ -3031,8 +3088,15 @@ def sweep_trash(
     resolver: ConfigResolver | None = None,
 ) -> list[Action]:
     trash = cfg["trash"]
-    if not trash["enabled"]:
+    deeper = _anywhere_enabled(workspace, resolver, "trash")
+    if not trash["enabled"] and not deeper:
         return []
+    if deeper and not trash["enabled"]:
+        # The root's scope decides which candidates are generated at all, so a
+        # deeper config that switches trash on would never be reached under the
+        # default "root". Widen the search and let _sweepable, which resolves per
+        # path, decide what may actually be swept.
+        trash = {**trash, "scope": "workspace"}
     if trash["scope"] not in ("root", "workspace"):
         raise Failure(f"trash.scope must be root or workspace, not {trash['scope']!r}")
     now = time.time()
@@ -3058,7 +3122,7 @@ def _sweep(
     # A directory that is going as a whole takes its contents with it. Reporting
     # those separately would inflate a dry run against the apply that follows it.
     swept: list[str] = []
-    for path in _trash_candidates(workspace, trash, repo_set):
+    for path in _trash_candidates(workspace, trash, repo_set, resolver):
         relative = path.relative_to(workspace).as_posix()
         # tracked holds both spellings; see tracked_paths. A case-only
         # difference is the same file on macOS and Windows.
@@ -3213,7 +3277,33 @@ def _sweepable(path: Path, trash: dict[str, Any], workspace: Path) -> bool:
     return not (trash["scope"] == "root" and path.parent != workspace)
 
 
-def _trash_candidates(workspace: Path, trash: dict[str, Any], repos: set[Path]) -> Iterator[Path]:
+def _anywhere_enabled(workspace: Path, resolver: ConfigResolver | None, section: str) -> bool:
+    """Whether any config in the tree turns this step on.
+
+    Candidates are generated from the workspace root, so a deeper config could
+    turn a step off but never on: `git-tidy config ./proj` said enabled, and the
+    run said "trash is off". The deeper answer still decides what happens to
+    each path; this only decides whether to go looking.
+    """
+    if resolver is None:
+        return False
+    for dirpath, dirnames, filenames in os.walk(workspace, followlinks=False):
+        here = Path(dirpath)
+        dirnames[:] = [d for d in dirnames if d not in (".git", QUARANTINE_DIRNAME)]
+        if (
+            any(name in filenames for name in CONFIG_NAMES)
+            and (resolver.for_path(here)[section]["enabled"])
+        ):
+            return True
+    return False
+
+
+def _trash_candidates(
+    workspace: Path,
+    trash: dict[str, Any],
+    repos: set[Path],
+    resolver: ConfigResolver | None = None,
+) -> Iterator[Path]:
     if trash["scope"] == "root":
         for entry in sorted(workspace.iterdir()):
             if entry.name == QUARANTINE_DIRNAME or entry.is_symlink():
@@ -3229,6 +3319,8 @@ def _trash_candidates(workspace: Path, trash: dict[str, Any], repos: set[Path]) 
         if here.resolve() in repos or ".git" in here.parts:
             dirnames[:] = []
             continue
+        # Deepest wins for what is *offered*, not only for what is swept.
+        trash = resolver.for_path(here)["trash"] if resolver is not None else trash
         keep_walking = [
             d
             for d in sorted(dirnames)
@@ -3286,7 +3378,7 @@ def doctor_repo(path: Path, name: str, cfg: dict[str, Any]) -> list[Action]:
     if checks["credentials_in_url"]:
         actions += _check_credentials(git, name, remotes)
     if checks["unpushed"]:
-        actions += _check_unpushed(git, name)
+        actions += _check_unpushed(git, name, cfg["sync"])
     return actions
 
 
@@ -3308,17 +3400,9 @@ def _check_credentials(git: Git, name: str, remotes: Sequence[str]) -> list[Acti
     return found
 
 
-def _check_unpushed(git: Git, name: str) -> list[Action]:
+def _check_unpushed(git: Git, name: str, sync: dict[str, Any]) -> list[Action]:
     found: list[Action] = []
-    trunk = default_branch(
-        git,
-        {
-            "default_branch": "auto",
-            "remote": "origin",
-            "default_branch_candidates": ["main", "master"],
-        },
-        readonly=True,
-    )
+    trunk = default_branch(git, sync, readonly=True)
     for branch in list_branches(git):
         if not branch.upstream:
             continue
@@ -3329,7 +3413,7 @@ def _check_unpushed(git: Git, name: str) -> list[Action]:
             # commits exist nowhere else. Measure against the trunk instead.
             if trunk is None:
                 continue
-            against = f"origin/{trunk}"
+            against = f"{sync['remote']}/{trunk}"
             if not git.ok("show-ref", "--verify", "--quiet", f"refs/remotes/{against}"):
                 against = trunk
         ahead = git.out("rev-list", "--count", f"{against}..{branch.name}", check=False)
@@ -3671,6 +3755,10 @@ class Context:
     # flag for the whole run would let a repository that never fetched inherit
     # another one's freshness.
     fetched: set[Path] = field(default_factory=set)
+    # True only for the step that should report an orphaned worktree. Every step
+    # sees the same broken directory, and four identical lines for one of them
+    # made five orphans read as twenty.
+    report_orphans: bool = False
 
     def name_of(self, repo: Path) -> str:
         return repo.relative_to(self.workspace).as_posix()
@@ -3749,6 +3837,10 @@ def _guarded(work: Callable[[Path], list[Action]], repo: Path, context: Context)
     """One repo's failure must not take the other two hundred down with it."""
     gone = orphaned_worktree(repo)
     if gone is not None:
+        if not context.report_orphans:
+            # Every step calls this, and four identical lines for one directory
+            # made five orphans read as twenty. doctor is where it belongs.
+            return []
         return [
             Action(
                 "sync",
@@ -3835,7 +3927,9 @@ def cmd_clean(context: Context, report: Report) -> None:
 
     # Everything outside a repository: loose caches, stray dist/ directories and
     # the __pycache__ of scripts that were never committed anywhere.
-    if root_cfg["clean"]["enabled"]:
+    if root_cfg["clean"]["enabled"] or _anywhere_enabled(
+        context.workspace, context.resolver, "clean"
+    ):
         context.printer.heading("Artefacts outside repositories")
         loose = _outside_repos(context, root_cfg, context.quarantine)
         report.extend(loose)
@@ -4054,7 +4148,9 @@ def _map_parallel(
 def cmd_trash(context: Context, report: Report) -> None:
     cfg = context.config_for(context.workspace)
     context.printer.heading("Trash")
-    if not cfg["trash"]["enabled"]:
+    if not cfg["trash"]["enabled"] and not _anywhere_enabled(
+        context.workspace, context.resolver, "trash"
+    ):
         context.printer.line("  trash is off; set trash.enabled: true to sweep loose files")
         return
     swept = sweep_trash(
@@ -4071,6 +4167,7 @@ def cmd_trash(context: Context, report: Report) -> None:
 
 def cmd_doctor(context: Context, report: Report) -> None:
     context.printer.heading("Doctor")
+    context.report_orphans = True
 
     def work(repo: Path) -> list[Action]:
         cfg = context.config_for(repo)
@@ -4136,6 +4233,7 @@ def cmd_init(
     force: bool,
     printer: Printer,
     prompt_input: Callable[[str], str] | None = None,
+    explicit_dry: bool = False,
 ) -> int:
     """Write a config file, asking about the choices that actually vary."""
     if target.exists() and not force:
@@ -4155,7 +4253,7 @@ def cmd_init(
         chosen = _interview(printer, prompt_input)
 
     body = render_config(chosen, INIT_HEADER)
-    if mode == DRY and not interactive:
+    if explicit_dry and not interactive:
         # -n means change nothing, here as everywhere else. Printing it is still
         # useful: `git-tidy init -n > .git-tidy.yaml` is a reasonable thing to do.
         printer.loud().line(body.rstrip())
@@ -4214,6 +4312,9 @@ def add_common_options(parser: argparse.ArgumentParser, after_command: bool) -> 
         help="print what would happen and change nothing (the default)",
         **hide,
     )
+    # Recorded separately because -n and "no flag at all" both mean DRY, and
+    # init has to tell them apart: the default writes, -n prints.
+
     mode.add_argument(
         "-i",
         "--ask",
@@ -4323,6 +4424,10 @@ def build_parser() -> argparse.ArgumentParser:
 def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     """Parse, then fold the after-the-subcommand copies of --include/--exclude in."""
     args = build_parser().parse_args(argv)
+    # -n and "no mode flag at all" both resolve to DRY, and init has to tell
+    # them apart: with no flag it writes the file, with -n it prints it.
+    given = sys.argv[1:] if argv is None else list(argv)
+    args.explicit_dry = any(flag in given for flag in ("-n", "--dry-run"))
     for name in ("include", "exclude"):
         extra = getattr(args, f"{name}_after", None)
         if extra:
@@ -4472,7 +4577,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.global_config
             else _expand(args.path or args.workspace) / CONFIG_NAMES[0]
         )
-        return cmd_init(target, args.mode, args.force, printer)
+        return cmd_init(target, args.mode, args.force, printer, explicit_dry=args.explicit_dry)
 
     # config neither reads a workspace nor writes one: it answers a question
     # about a path, and the most natural place to ask it is inside a checkout.

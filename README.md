@@ -308,7 +308,8 @@ git tidy run --apply
 - Dry run by default. `--apply` is always explicit.
 - Fast-forward only by default. Never merges, never force-pushes. Rebases only
   where `sync.diverged: rebase` explicitly asks for it.
-- A branch with unpushed commits is reported, never deleted.
+- A branch with unpushed commits is reported, never deleted — unless `--force`
+  or `branches.require_merged: false` asks, which is what that flag is for.
 - Tracked files are never removed by `clean`, unless `clean.tracked: true`
   explicitly asks — it is off by default and the one setting `clean` has that
   can touch committed content.
