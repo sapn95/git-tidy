@@ -1,4 +1,4 @@
-.TH GIT-TIDY 1 "2026" "git-tidy" "Git Extensions"
+.TH GIT-TIDY 1 "2026-07-29" "git-tidy" "Git Extensions"
 .SH NAME
 git-tidy \- keep a directory full of git checkouts clean
 .SH SYNOPSIS
@@ -24,7 +24,8 @@ their commits are contained in the default branch. Unpushed work is reported.
 .B clean
 Remove build output and caches. With \fBclean.ignored\fR, everything
 .B .gitignore
-already calls disposable. A tracked file is never deleted, unless \fIclean.tracked\fR says so.
+already calls disposable. A tracked file is never deleted, unless
+\fIclean.tracked\fR says so.
 .TP
 .B trash
 Sweep loose junk in the workspace into a timestamped quarantine with a
@@ -38,13 +39,31 @@ unpushed commits, repositories with no remote. Changes nothing.
 sync, prune, clean, trash and doctor, in that order.
 .TP
 .B init
-Write a commented configuration file, globally or for one directory.
+Write a commented configuration file:
+.B \-\-global
+for
+.IR ~/.config/git\-tidy/config.yaml ,
+.B \-\-path
+.I DIR
+for a
+.I .git\-tidy.yaml
+in one directory. Asks a short set of questions when there is somebody to ask;
+.B \-q
+writes the plain template instead, and
+.B \-n
+prints it without writing.
 .TP
 .B config
 Print the effective configuration for any path.
 .TP
 .B restore
-Put quarantined files back.
+Put quarantined files back. Takes a timestamp to restore just one sweep,
+.B \-\-list
+to see what is held and stop, and
+.B \-\-expire
+to delete the quarantines older than \fItrash.retention_days\fR \(em the only
+part of restore that removes anything. Nothing is ever restored over a file
+that is already there.
 .SH MODES
 .TP
 .BR \-n ", " \-\-dry\-run
@@ -83,6 +102,22 @@ Limit which repositories are touched. Repeatable.
 .TP
 .B \-\-json
 Print the report as JSON.
+.TP
+.BR \-v ", " \-\-verbose
+Print every path, rather than one line per repository. This is what the
+"\-v shows each one" in the summary refers to.
+.TP
+.BR \-q ", " \-\-quiet
+Print the summary and nothing else.
+.TP
+.B \-\-no\-color
+Never colour the output. Colour is off anyway when stdout is not a terminal,
+or when
+.I NO_COLOR
+is set.
+.TP
+.B \-\-version
+Print the version and exit.
 .SH FILES
 .TP
 .I ~/.config/git-tidy/config.yaml
