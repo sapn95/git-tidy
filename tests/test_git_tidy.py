@@ -13,6 +13,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -943,8 +944,10 @@ def test_same_relative_path_in_two_repos_does_not_collide_in_quarantine(workspac
         gt.clean_tree(workspace / name, name, config(), run(), gt.Git(workspace / name), holding)
     holding.write_manifest()
 
-    assert (holding.dir / "repo" / "__pycache__" / "m.pyc").read_text(encoding="utf-8") == "first"
-    assert (holding.dir / "second" / "__pycache__" / "m.pyc").read_text(
+    assert (holding.dir / gt.CONTENT_DIRNAME / "repo" / "__pycache__" / "m.pyc").read_text(
+        encoding="utf-8"
+    ) == "first"
+    assert (holding.dir / gt.CONTENT_DIRNAME / "second" / "__pycache__" / "m.pyc").read_text(
         encoding="utf-8"
     ) == "second"
 
@@ -983,8 +986,11 @@ def test_a_branch_checked_out_in_another_worktree_is_reported_not_lost(
     actions = gt.prune_branches(repo, "repo", config(), run())
     assert "feature" in git(repo, "branch", "--format=%(refname:short)").split()
     held = [a for a in actions if a.target == "feature"]
-    assert held and held[0].skipped and "checked out in" in held[0].detail
+    assert held and held[0].skipped and "worktree" in held[0].detail
     assert not any(a.error for a in actions)
+    # Not the default-branch category: a branch reaching here is [gone] or
+    # local-only, so it is never the trunk.
+    assert gt._reason_of(held[0].detail) == "branches a worktree still has checked out"
 
 
 def test_force_does_not_help_a_branch_a_worktree_holds(
@@ -1173,7 +1179,7 @@ def test_trash_sweeps_junk_into_quarantine(workspace: Path):
     actions = gt.sweep_trash(workspace, cfg, run(), holding, [])
     assert not junk.exists()
     assert actions and actions[0].applied
-    assert (workspace / gt.QUARANTINE_DIRNAME / "stamp" / junk.name).is_file()
+    assert (workspace / gt.QUARANTINE_DIRNAME / "stamp" / gt.CONTENT_DIRNAME / junk.name).is_file()
 
 
 def test_trash_leaves_young_files_alone(workspace: Path):
@@ -1193,7 +1199,9 @@ def test_trash_always_quarantines_a_sensitive_file(workspace: Path):
 
     actions = gt.sweep_trash(workspace, cfg, run(), holding, [])
     assert actions[0].applied and "sensitive" in actions[0].detail
-    assert (holding.dir / "splunk_token.pw").is_file(), "a token must never be hard-deleted"
+    assert (holding.dir / gt.CONTENT_DIRNAME / "splunk_token.pw").is_file(), (
+        "a token must never be hard-deleted"
+    )
 
 
 def test_trash_keeps_readmes(workspace: Path):
@@ -2115,7 +2123,9 @@ def test_a_quarantine_name_collision_keeps_both_files(workspace: Path):
         holding.take(workspace / "a" / "m.pyc")
 
     kept = sorted(
-        p.read_text(encoding="utf-8") for p in (holding.dir / "a").iterdir() if p.is_file()
+        p.read_text(encoding="utf-8")
+        for p in (holding.dir / gt.CONTENT_DIRNAME / "a").iterdir()
+        if p.is_file()
     )
     assert kept == ["first", "second", "third"], "no sweep overwrote another"
 
@@ -2314,7 +2324,7 @@ def test_a_quarantined_artefact_is_not_reported_as_removed(workspace: Path):
     actions = gt.clean_tree(repo, "repo", cfg, run(), gt.Git(repo), holding)
     assert actions[0].applied and actions[0].detail == "quarantined"
     assert actions[0].quarantined
-    assert (holding.dir / "repo" / "__pycache__").exists()
+    assert (holding.dir / gt.CONTENT_DIRNAME / "repo" / "__pycache__").exists()
 
 
 # --------------------------------------------------------------------------- #
@@ -2334,9 +2344,13 @@ def test_a_loose_directory_can_ask_for_its_own_quarantine(workspace: Path):
     gt.main(["-C", str(workspace), "clean", "--apply"])
     assert not (careful / "__pycache__").exists()
     assert not (plain / "__pycache__").exists()
-    quarantined = list((workspace / gt.QUARANTINE_DIRNAME).glob("*/careful/__pycache__/m.pyc"))
+    quarantined = list(
+        (workspace / gt.QUARANTINE_DIRNAME).glob("*/files/careful/__pycache__/m.pyc")
+    )
     assert quarantined, "the deeper config asked for this one to be recoverable"
-    assert not list((workspace / gt.QUARANTINE_DIRNAME).glob("*/plain/*")), "and only that one"
+    assert not list((workspace / gt.QUARANTINE_DIRNAME).glob("*/files/plain/*")), (
+        "and only that one"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -2676,7 +2690,7 @@ def test_a_credential_inside_a_disposable_directory_is_moved_not_deleted(workspa
         holding=holding,
     )
     assert not cache.exists()
-    assert (holding.dir / "repo" / ".terraform" / "client.pem").is_file()
+    assert (holding.dir / gt.CONTENT_DIRNAME / "repo" / ".terraform" / "client.pem").is_file()
     assert any("contains" in a.detail and a.quarantined for a in actions)
 
 
@@ -2789,7 +2803,9 @@ def test_an_ignored_credential_file_is_quarantined_not_deleted(workspace: Path):
     actions = gt.clean_ignored(repo, "repo", config(), run(), None, gt.Git(repo), holding)
     assert not (repo / "api-token.txt").exists()
     assert not (repo / "notes.txt").exists()
-    assert (holding.dir / "repo" / "api-token.txt").read_text(encoding="utf-8") == "the only copy"
+    assert (holding.dir / gt.CONTENT_DIRNAME / "repo" / "api-token.txt").read_text(
+        encoding="utf-8"
+    ) == "the only copy"
     assert any(a.quarantined and "api-token" in a.target for a in actions)
 
 
@@ -2816,7 +2832,9 @@ def test_a_credential_matched_by_a_file_pattern_is_quarantined(workspace: Path):
         holding=holding,
     )
     assert not (repo / "module.pyc").exists()
-    assert (holding.dir / "repo" / "api-token.pyc").read_text(encoding="utf-8") == "the only copy"
+    assert (holding.dir / gt.CONTENT_DIRNAME / "repo" / "api-token.pyc").read_text(
+        encoding="utf-8"
+    ) == "the only copy"
 
 
 def test_a_loose_credential_is_quarantined_too(workspace: Path):
@@ -2825,7 +2843,7 @@ def test_a_loose_credential_is_quarantined_too(workspace: Path):
     (loose / "api-token.pyc").write_text("the only copy", encoding="utf-8")
 
     gt.main(["-C", str(workspace), "clean", "--apply"])
-    found = list((workspace / gt.QUARANTINE_DIRNAME).glob("*/loose/api-token.pyc"))
+    found = list((workspace / gt.QUARANTINE_DIRNAME).glob("*/files/loose/api-token.pyc"))
     assert found and found[0].read_text(encoding="utf-8") == "the only copy"
 
 
@@ -2935,7 +2953,7 @@ def test_a_swept_directory_holding_a_credential_is_quarantined(workspace: Path):
     )
     actions = gt.sweep_trash(workspace, cfg, run(), holding, [])
     assert not junk.exists()
-    assert (holding.dir / "loose" / "lalalalala" / "id_rsa.pem").is_file()
+    assert (holding.dir / gt.CONTENT_DIRNAME / "loose" / "lalalalala" / "id_rsa.pem").is_file()
     assert actions and "contains" in actions[0].detail
 
 
@@ -2952,7 +2970,7 @@ def test_a_deeper_sensitive_list_protects_a_loose_credential(workspace: Path):
     (loose / ".git-tidy.yaml").write_text('trash:\n  sensitive: ["vault*"]\n', encoding="utf-8")
 
     gt.main(["-C", str(workspace), "clean", "--apply"])
-    found = list((workspace / gt.QUARANTINE_DIRNAME).glob("*/loose/vault.pyc"))
+    found = list((workspace / gt.QUARANTINE_DIRNAME).glob("*/files/loose/vault.pyc"))
     assert found and found[0].read_text(encoding="utf-8") == "the only copy"
 
 
@@ -3386,3 +3404,226 @@ def test_every_message_the_tool_produces_has_a_category():
         if gt._reason_of(detail) == "other, see the lines marked -"
     ]
     assert uncategorised == []
+
+
+def test_an_orphaned_worktree_is_recognised(workspace: Path, tmp_path: Path):
+    """`git worktree prune` leaves the files and takes the admin directory.
+
+    Every git command in what is left fails with "not a git repository: (null)",
+    which is git's answer, not one a person can do anything with.
+    """
+    repo = workspace / "repo"
+    side = workspace / "side"
+    git(repo, "worktree", "add", "-q", "-b", "side", str(side))
+    # The parent forgets about it, as `git worktree prune` would after the
+    # directory had been moved away and back.
+    shutil.rmtree(repo / ".git" / "worktrees" / "side")
+
+    assert gt.orphaned_worktree(side) is not None
+    assert gt.orphaned_worktree(repo) is None
+
+    actions = gt._guarded(
+        lambda r: sync_repo_boom(r),
+        side,
+        gt.Context(
+            workspace,
+            gt.ConfigResolver(workspace),
+            run(gt.DRY),
+            quiet_printer(),
+            [side],
+            _holding(workspace),
+        ),
+    )
+    assert actions and actions[0].skipped
+    assert "orphaned worktree" in actions[0].detail
+    assert gt._reason_of(actions[0].detail) == ("orphaned worktrees — the parent pruned them away")
+
+
+def sync_repo_boom(_repo: Path) -> list[gt.Action]:
+    raise AssertionError("an orphaned worktree must not reach the work function")
+
+
+def test_a_healthy_worktree_is_not_mistaken_for_an_orphan(workspace: Path):
+    repo = workspace / "repo"
+    side = workspace / "side"
+    git(repo, "worktree", "add", "-q", "-b", "side", str(side))
+    assert gt.orphaned_worktree(side) is None
+
+
+# --------------------------------------------------------------------------- #
+# Claude review, round two
+# --------------------------------------------------------------------------- #
+
+
+def test_the_quarantine_does_not_land_on_its_own_bookkeeping(workspace: Path):
+    """A file called manifest.json used to be overwritten by git-tidy's own."""
+    precious = workspace / "manifest.json"
+    precious.write_text("IMPORTANT USER DATA", encoding="utf-8")
+    (workspace / "journal.jsonl").write_text("also mine", encoding="utf-8")
+    for path in (precious, workspace / "journal.jsonl"):
+        age(path, 30)
+    (workspace / ".git-tidy.yaml").write_text(
+        'trash:\n  enabled: true\n  patterns: ["*.json", "*.jsonl"]\n  min_age_days: 7\n',
+        encoding="utf-8",
+    )
+
+    gt.main(["-C", str(workspace), "trash", "--apply"])
+    stamps = list((workspace / gt.QUARANTINE_DIRNAME).iterdir())
+    assert len(stamps) == 1
+    kept = stamps[0] / gt.CONTENT_DIRNAME / "manifest.json"
+    assert kept.read_text(encoding="utf-8") == "IMPORTANT USER DATA"
+    assert (stamps[0] / gt.CONTENT_DIRNAME / "journal.jsonl").read_text(
+        encoding="utf-8"
+    ) == "also mine"
+
+    gt.main(["-C", str(workspace), "restore", "--apply"])
+    assert precious.read_text(encoding="utf-8") == "IMPORTANT USER DATA"
+
+
+def test_an_ancestor_and_what_lives_in_it_both_restore(workspace: Path):
+    """Restoring a descendant first re-creates its parent and blocks the ancestor."""
+    junk = workspace / "old.bak"
+    (junk / ".terraform").mkdir(parents=True)
+    (junk / ".terraform" / "creds.pem").write_text("KEY", encoding="utf-8")
+    (junk / "notes.txt").write_text("notes", encoding="utf-8")
+    age(junk, 30)
+    (workspace / ".git-tidy.yaml").write_text(
+        "trash:\n  enabled: true\n  scope: workspace\n  dirs: true\n  min_age_days: 7\n",
+        encoding="utf-8",
+    )
+
+    gt.main(["-C", str(workspace), "run", "--apply"])
+    assert gt.main(["-C", str(workspace), "restore", "--apply"]) == 0
+    assert (junk / "notes.txt").read_text(encoding="utf-8") == "notes"
+    assert (junk / ".terraform" / "creds.pem").read_text(encoding="utf-8") == "KEY"
+
+
+def test_an_unreadable_manifest_falls_back_to_the_journal(workspace: Path, capsys):
+    """This is the crash the journal exists to survive."""
+    repo = workspace / "repo"
+    (repo / "__pycache__").mkdir()
+    (repo / "__pycache__" / "m.pyc").write_text("x", encoding="utf-8")
+    holding = gt.Quarantine(workspace / gt.QUARANTINE_DIRNAME, workspace, stamp="stamp")
+    gt.clean_tree(repo, "repo", config(), run(), gt.Git(repo), holding)
+    holding.write_manifest()
+    (workspace / gt.QUARANTINE_DIRNAME / "stamp" / gt.MANIFEST_NAME).write_text(
+        "{ broken json", encoding="utf-8"
+    )
+
+    gt.main(["-C", str(workspace), "restore", "--list"])
+    assert "stamp" in capsys.readouterr().out
+    actions = gt.restore(workspace / gt.QUARANTINE_DIRNAME, "stamp", run())
+    assert [a for a in actions if a.applied]
+    assert (repo / "__pycache__" / "m.pyc").is_file()
+
+
+def test_a_loose_dependency_tree_is_left_alone(workspace: Path):
+    """The rule the in-repository walk has always applied, outside one too."""
+    loose = workspace / "scratch"
+    (loose / "node_modules" / "pkg" / "dist").mkdir(parents=True)
+    (loose / "node_modules" / "pkg" / "dist" / "bundle.js").write_text("x", encoding="utf-8")
+    (loose / ".venv" / "lib" / "__pycache__").mkdir(parents=True)
+    (loose / ".venv" / "lib" / "__pycache__" / "a.pyc").write_text("x", encoding="utf-8")
+    (workspace / ".git-tidy.yaml").write_text("clean:\n  builds: true\n", encoding="utf-8")
+
+    gt.main(["-C", str(workspace), "clean", "--apply"])
+    assert (loose / "node_modules" / "pkg" / "dist" / "bundle.js").is_file()
+    assert (loose / ".venv" / "lib" / "__pycache__" / "a.pyc").is_file()
+
+
+def test_trash_never_offers_a_symlink(workspace: Path):
+    """Its size is its target's, and _guard refuses to follow it anyway."""
+    real = workspace / "realdir"
+    real.mkdir()
+    (real / "blob").write_bytes(b"0" * 4096)
+    link = workspace / "stuff.bak"
+    link.symlink_to(real, target_is_directory=True)
+
+    cfg = config(trash={"enabled": True, "scope": "workspace", "dirs": True, "min_age_days": 0})
+    actions = gt.sweep_trash(workspace, cfg, run(gt.DRY), _holding(workspace), [])
+    assert not [a for a in actions if "stuff.bak" in a.target]
+    assert link.is_symlink() and (real / "blob").is_file()
+
+
+def test_a_block_sequence_at_the_parent_column_parses():
+    """The style yaml.dump() emits, and the commonest way anyone writes a list."""
+    yaml = pytest.importorskip("yaml")
+    text = 'exclude:\n- "archive/*"\njobs: 2\n'
+    assert gt._parse_yaml_subset(text, "<t>") == yaml.safe_load(text)
+    nested = "clean:\n  keep:\n  - a\n  - b\n"
+    assert gt._parse_yaml_subset(nested, "<t>") == yaml.safe_load(nested)
+
+
+def test_an_anchor_is_refused_rather_than_misread():
+    """Without this it became the literal string '&upstream origin'."""
+    with pytest.raises(gt.Failure, match="quote it"):
+        gt._parse_yaml_subset("sync:\n  remote: &upstream origin\n", "<t>")
+
+
+def test_expire_honours_the_stamp_it_was_given(workspace: Path):
+    root = workspace / gt.QUARANTINE_DIRNAME
+    long_ago = time.time() - 60 * 86400
+    for name in ("20250101T000000Z", "20250202T000000Z"):
+        stamp = root / name
+        stamp.mkdir(parents=True)
+        (stamp / gt.MANIFEST_NAME).write_text('{"entries": []}', encoding="utf-8")
+        os.utime(stamp, (long_ago, long_ago))
+
+    gt.main(["-C", str(workspace), "restore", "--expire", "20250101T000000Z", "--apply"])
+    assert not (root / "20250101T000000Z").exists()
+    assert (root / "20250202T000000Z").exists(), "only the one that was named"
+
+
+def test_a_pruned_upstream_is_named_from_the_ref(workspace: Path, remote: Path):
+    """rev-parse echoes the literal '@{upstream}' once the ref is pruned."""
+    repo = workspace / "repo"
+    git(repo, "switch", "-q", "-c", "feature")
+    git(repo, "push", "-q", "-u", "origin", "feature")
+    git(remote, "branch", "-D", "feature")
+    git(repo, "fetch", "-q", "--prune", "origin")
+
+    actions = gt.sync_repo(repo, "repo", config(sync={"switch": "never"}), run())
+    update = [a for a in actions if a.kind == "update"]
+    assert update and "@{upstream}" not in update[0].detail
+    assert "origin/feature" in update[0].detail
+
+
+def test_config_answers_for_a_path_outside_the_workspace(tmp_path: Path, capsys):
+    """The command exists to explain why a rule applied; it must use that tree."""
+    elsewhere = tmp_path / "other"
+    (elsewhere / "repo").mkdir(parents=True)
+    (elsewhere / ".git-tidy.yaml").write_text("clean:\n  ignored: true\n", encoding="utf-8")
+    here = tmp_path / "here"
+    here.mkdir()
+
+    gt.main(["-C", str(here), "config", str(elsewhere / "repo")])
+    assert json.loads(capsys.readouterr().out)["clean"]["ignored"] is True
+
+
+def test_a_rolled_up_batch_keeps_each_reason(workspace: Path):
+    """Five paths skipped for four reasons must not all take the first one's."""
+    stream = io.StringIO()
+    printer = gt.Printer(stream, quiet=False, color=False)
+    printer.batch(
+        [
+            gt.Action("ignored", "repo", "a", "kept by ignored_keep", skipped=True),
+            gt.Action("ignored", "repo", "b", "declined: remove file", skipped=True),
+            gt.Action("ignored", "repo", "c", "declined: remove file", skipped=True),
+        ]
+    )
+    out = stream.getvalue()
+    assert "kept by ignored_keep" in out
+    assert "declined" in out
+    assert "2 paths" in out, "the two declined ones are one group"
+
+
+def test_a_rolled_up_dry_run_says_quarantine_when_it_means_it(workspace: Path):
+    stream = io.StringIO()
+    printer = gt.Printer(stream, quiet=False, color=False)
+    printer.batch(
+        [
+            gt.Action("remove", "repo", "a", "would quarantine directory", quarantined=True),
+            gt.Action("remove", "repo", "b", "would quarantine directory", quarantined=True),
+        ]
+    )
+    assert "would quarantine" in stream.getvalue()

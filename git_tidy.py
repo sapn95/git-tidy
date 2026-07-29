@@ -70,6 +70,10 @@ __version__ = "2.0.1"
 CONFIG_NAMES = (".git-tidy.yaml", ".git-tidy.yml")
 QUARANTINE_DIRNAME = ".git-tidy-trash"
 MANIFEST_NAME = "manifest.json"
+# Swept content lives under here, not directly in the stamp directory: a file
+# of the user's called manifest.json would otherwise land on git-tidy's own and
+# be overwritten by it.
+CONTENT_DIRNAME = "files"
 # Appended to as files move, and folded into the manifest at the end. It is what
 # survives a run that was killed part way through.
 JOURNAL_NAME = "journal.jsonl"
@@ -470,7 +474,17 @@ def _parse_mapping(lines: list[_Line], index: int, indent: int, source: str) -> 
             result[_scalar(key, source, line.number)] = _scalar(rest, source, line.number)
             continue
         # An empty value means either a nested block on the following lines, or
-        # genuinely nothing.
+        # genuinely nothing. A block sequence is allowed to sit at the parent
+        # key's own column — that is the style yaml.dump() emits, and the
+        # commonest way anyone writes a list by hand.
+        if (
+            index < len(lines)
+            and lines[index].indent == indent
+            and (lines[index].text.startswith("- ") or lines[index].text == "-")
+        ):
+            child, index = _parse_sequence(lines, index, indent, source)
+            result[_scalar(key, source, line.number)] = child
+            continue
         if index < len(lines) and lines[index].indent > indent:
             child, index = _parse_block(lines, index, lines[index].indent, source)
             result[_scalar(key, source, line.number)] = child
@@ -484,7 +498,10 @@ def _parse_sequence(lines: list[_Line], index: int, indent: int, source: str) ->
     while index < len(lines) and lines[index].indent == indent:
         line = lines[index]
         if not (line.text.startswith("- ") or line.text == "-"):
-            raise Failure(f"{source}:{line.number}: expected a '- ' list item")
+            # The sequence ends here. At the parent key's own column the next
+            # mapping key sits at this same indent, so stopping is what YAML
+            # means — refusing would reject `exclude:` / `- a` / `jobs: 2`.
+            break
         item = line.text[1:].lstrip()
         # The column the item's content starts at, so `- key: value` can be
         # re-read as a mapping that later lines at the same column extend.
@@ -577,7 +594,7 @@ _YAML_FLOAT = re.compile(
 # Characters PyYAML refuses to start a plain scalar with. Accepting them here
 # would mean `keep: *.pem` works without PyYAML and fails with it — and a glob is
 # the most natural thing anyone writes in this config.
-_YAML_INDICATORS = "*!|>%@`,]}"
+_YAML_INDICATORS = "*&!|>%@`,]}"
 
 
 def _yaml_int(token: str) -> int:
@@ -1090,6 +1107,29 @@ def last_line(result: subprocess.CompletedProcess[str]) -> str:
     return "failed"
 
 
+def orphaned_worktree(path: Path) -> str | None:
+    """The gitdir a linked worktree points at, when it is no longer there.
+
+    `git worktree prune` in the parent removes the admin directory but leaves
+    the files, so what is left looks like a repository and behaves like nothing
+    at all — every git command in it fails with "not a git repository: (null)".
+    Recognising it turns that into something a person can act on.
+    """
+    marker = path / ".git"
+    if not marker.is_file():
+        return None
+    try:
+        text = marker.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    if not text.startswith("gitdir:"):
+        return None
+    target = Path(text[len("gitdir:") :].strip())
+    if not target.is_absolute():
+        target = (path / target).resolve()
+    return None if target.exists() else str(target)
+
+
 def is_repo(path: Path) -> bool:
     """True for a work tree root. A .git *file* means a worktree or submodule."""
     dot_git = path / ".git"
@@ -1487,11 +1527,7 @@ def _fast_forward(
 ) -> list[Action]:
     if not sync["fast_forward"]:
         return []
-    upstream = (
-        target
-        if head == branch
-        else git.out("rev-parse", "--abbrev-ref", "@{upstream}", check=False)
-    )
+    upstream = target if head == branch else _upstream_of(git, head)
     if not head:
         return [Action("update", name, "HEAD", "detached, nothing to fast-forward", skipped=True)]
     if not upstream:
@@ -1642,6 +1678,20 @@ def _checked_out_elsewhere(git: Git, branch: str) -> str | None:
         elif field == "branch" and value == f"refs/heads/{branch}" and where != here:
             return where
     return None
+
+
+def _upstream_of(git: Git, branch: str) -> str:
+    """The upstream a branch tracks, or "" when it has none.
+
+    Not `rev-parse --abbrev-ref @{upstream}`: when the upstream ref has been
+    pruned that echoes the literal string "@{upstream}" on stdout and exits 128,
+    which then turns up in the report as a branch name. for-each-ref knows the
+    configured name whether or not the ref still exists.
+    """
+    name = git.out(
+        "for-each-ref", "--format=%(upstream:short)", f"refs/heads/{branch}", check=False
+    )
+    return name if name and "@{" not in name else ""
 
 
 def _diverged(
@@ -1847,7 +1897,13 @@ def _consider_branches(
         held_by = _checked_out_elsewhere(git, branch.name)
         if held_by:
             actions.append(
-                Action("branch", name, branch.name, f"checked out in {held_by}", skipped=True)
+                Action(
+                    "branch",
+                    name,
+                    branch.name,
+                    f"in use by the worktree at {held_by}",
+                    skipped=True,
+                )
             )
             continue
 
@@ -2432,7 +2488,7 @@ class Quarantine:
     def take(self, path: Path) -> Path:
         relative = path.resolve().relative_to(self.workspace.resolve())
         with self._lock:
-            destination = self.dir / relative
+            destination = self.dir / CONTENT_DIRNAME / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             # Keep counting: one suffix can collide as easily as none, and the
             # loser of that race would be overwritten rather than kept.
@@ -2474,7 +2530,11 @@ class Quarantine:
         }
         # Written to a neighbour and renamed, so it is never found half-written.
         scratch = manifest.with_suffix(".partial")
-        scratch.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        with scratch.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.flush()
+            # The rename is atomic; the bytes behind it are not, without this.
+            os.fsync(handle.fileno())
         scratch.replace(manifest)
         return manifest
 
@@ -2542,7 +2602,11 @@ def _put_back(
     decider: Decider,
     actions: list[Action],
 ) -> None:
-    for entry in manifest["entries"]:
+    # Shallowest first: restoring a descendant re-creates its parent directory
+    # on the way, and the ancestor's own restore would then find something in
+    # its place and refuse for ever.
+    ordered = sorted(manifest["entries"], key=lambda e: len(Path(e["from"]).parts))
+    for entry in ordered:
         source, destination = Path(entry["to"]), Path(entry["from"])
         action = Action("restore", chosen, str(destination), "restore")
         # The manifest is a file on disk like any other. Restoring what it says
@@ -2568,13 +2632,26 @@ def _put_back(
 
 
 def _read_manifest(directory: Path) -> dict[str, Any]:
-    """The manifest, or the journal a killed run left behind."""
+    """The manifest, or the journal a killed run left behind.
+
+    A manifest that will not parse is exactly the case the journal exists for —
+    a rename is atomic but the bytes behind it need not have reached the disk —
+    so an unreadable one falls through rather than ending the command.
+    """
     manifest = directory / MANIFEST_NAME
     if manifest.is_file():
-        return json.loads(manifest.read_text(encoding="utf-8"))
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and isinstance(data.get("entries"), list):
+                return data
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            pass  # fall through to the journal
     entries: list[dict[str, str]] = []
     torn = 0
-    for line in (directory / JOURNAL_NAME).read_text(encoding="utf-8").splitlines():
+    journal = directory / JOURNAL_NAME
+    if not journal.is_file():
+        raise Failure(f"{directory.name}: neither a readable manifest nor a journal")
+    for line in journal.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
         try:
@@ -2601,13 +2678,16 @@ def _within(path: Path, root: Path) -> bool:
         return False
 
 
-def expire_quarantines(quarantine_root: Path, days: int, decider: Decider) -> list[Action]:
+def expire_quarantines(
+    quarantine_root: Path, days: int, decider: Decider, only: str | None = None
+) -> list[Action]:
+    """Delete quarantines past their retention, or just the one named."""
     if not quarantine_root.is_dir():
         return []
     cutoff = time.time() - days * 86400
     actions: list[Action] = []
     with keeping(actions):
-        _expire(quarantine_root, cutoff, days, decider, actions)
+        _expire(quarantine_root, cutoff, days, decider, actions, only)
     return actions
 
 
@@ -2617,8 +2697,11 @@ def _expire(
     days: int,
     decider: Decider,
     actions: list[Action],
+    only: str | None = None,
 ) -> None:
     for entry in sorted(quarantine_root.iterdir()):
+        if only is not None and entry.name != only:
+            continue
         try:
             if not entry.is_dir() or entry.stat().st_mtime > cutoff:
                 continue
@@ -2914,14 +2997,21 @@ def _trash_candidates(workspace: Path, trash: dict[str, Any], repos: set[Path]) 
             dirnames[:] = []
             continue
         keep_walking = [
-            d for d in sorted(dirnames) if d != QUARANTINE_DIRNAME and not is_repo(here / d)
+            d
+            for d in sorted(dirnames)
+            if d != QUARANTINE_DIRNAME and not is_repo(here / d) and not (here / d).is_symlink()
         ]
         dirnames[:] = keep_walking
         if trash["dirs"]:
             for name in keep_walking:
                 yield here / name
         for name in sorted(filenames):
-            yield here / name
+            candidate = here / name
+            # Never a symlink: its size is its target's, which may not even be
+            # in the workspace, and _guard refuses to follow it anyway — so
+            # offering it would predict an action that cannot happen.
+            if not candidate.is_symlink():
+                yield candidate
 
 
 # --------------------------------------------------------------------------- #
@@ -3041,7 +3131,7 @@ def _past_tense(action: Action) -> str:
     """What a group of identical actions did, in one word."""
     if action.applied:
         return "quarantined" if "quarantin" in action.detail else "removed"
-    return "would remove"
+    return "would quarantine" if action.quarantined else "would remove"
 
 
 class Printer:
@@ -3066,9 +3156,17 @@ class Printer:
             if self.verbose or action.kind not in ROLLED_UP or action.error:
                 self.action(action)
                 continue
-            key = (action.kind, action.scope, action.skipped, action.quarantined)
+            key = (
+                action.kind,
+                action.scope,
+                action.skipped,
+                action.quarantined,
+                # Why, not only whether: five paths skipped for four different
+                # reasons must not all be labelled with the first one's.
+                _reason_of(action.detail) if action.skipped else "",
+            )
             rolled.setdefault(key, []).append(action)
-        for (kind, scope, skipped, quarantined), group in rolled.items():
+        for (kind, scope, skipped, quarantined, _reason), group in rolled.items():
             if len(group) == 1:
                 self.action(group[0])
                 continue
@@ -3214,8 +3312,10 @@ REASONS: tuple[tuple[str, str], ...] = (
     ("commits not in", "branches with commits not in the trunk"),
     ("diverged", "diverged from upstream — needs a merge or rebase by hand"),
     ("contains a git repository", "directories holding a git repository"),
+    ("in use by the worktree", "branches a worktree still has checked out"),
     ("checked out in", "default branch checked out in another worktree"),
     ("ignored_keep", "ignored files kept as local state (.env, *.tfstate, keys)"),
+    ("orphaned worktree", "orphaned worktrees — the parent pruned them away"),
     ("no upstream", "on a local-only branch, never pushed"),
     ("no such remote", "no remote configured"),
     ("no remote", "no remote configured"),
@@ -3348,6 +3448,18 @@ def _in_parallel(context: Context, work: Callable[[Path], list[Action]], report:
 
 def _guarded(work: Callable[[Path], list[Action]], repo: Path, context: Context) -> list[Action]:
     """One repo's failure must not take the other two hundred down with it."""
+    gone = orphaned_worktree(repo)
+    if gone is not None:
+        return [
+            Action(
+                "sync",
+                context.name_of(repo),
+                "-",
+                f"orphaned worktree: {gone} no longer exists, so git cannot work here. "
+                "The files are still on disk; the directory can go once you have them.",
+                skipped=True,
+            )
+        ]
     try:
         return work(repo)
     except Quit as quit_now:
@@ -3543,12 +3655,7 @@ def _loose_artefacts(
         descend: list[str] = []
         for name in sorted(dirnames):
             candidate = here / name
-            if (
-                name == QUARANTINE_DIRNAME
-                or candidate.is_symlink()
-                or is_repo(candidate)
-                or candidate.resolve() in repo_set
-            ):
+            if _not_ours(candidate, name, here_cfg, repo_set):
                 continue
             if _matches(name, dir_patterns) and not _protected(
                 candidate, context.workspace, keep, tracked
@@ -3585,6 +3692,20 @@ def _loose_artefacts(
             if _protected(candidate, context.workspace, keep, tracked):
                 continue
             yield candidate, False, here_cfg
+
+
+def _not_ours(candidate: Path, name: str, clean: dict[str, Any], repo_set: set[Path]) -> bool:
+    """Directories the loose walk has no business touching.
+
+    The quarantine, symlinks, repositories, and — unless clean.dependencies says
+    otherwise — dependency trees, which belong to whatever installed them and
+    need a network to put back. The in-repository walk applies the same rule.
+    """
+    if name == QUARANTINE_DIRNAME or candidate.is_symlink():
+        return True
+    if is_repo(candidate) or candidate.resolve() in repo_set:
+        return True
+    return not clean["dependencies"] and _matches(name, clean["dependency_dirs"])
 
 
 def _map_parallel(
@@ -3913,6 +4034,18 @@ def overrides_from(args: argparse.Namespace) -> dict[str, Any]:
     return overrides
 
 
+def _workspace_of(target: Path) -> Path:
+    """The nearest directory above `target` that could be a workspace root.
+
+    Used only by `git-tidy config <path>`, so that asking about a path outside
+    the current -C still answers with the configuration that governs it.
+    """
+    for parent in target.parents:
+        if any((parent / name).is_file() for name in CONFIG_NAMES):
+            return parent
+    return target if target.is_dir() else target.parent
+
+
 def resolve_workspace(raw: str) -> Path:
     workspace = Path(raw).expanduser().resolve()
     if not workspace.is_dir():
@@ -4001,6 +4134,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "config":
         target = Path(args.path).expanduser().resolve() if args.path else workspace
+        # A path outside -C would silently get none of its own .git-tidy.yaml
+        # files, which is the opposite of what this command is for.
+        if target != workspace and workspace not in target.parents:
+            resolver = ConfigResolver(_workspace_of(target), overrides_from(args))
         print(json.dumps(resolver.for_path(target), indent=2, sort_keys=True))
         return 0
 
@@ -4088,7 +4225,7 @@ def _restore_command(
     interrupted = False
     try:
         actions = (
-            expire_quarantines(quarantine_root, cfg["trash"]["retention_days"], decider)
+            expire_quarantines(quarantine_root, cfg["trash"]["retention_days"], decider, args.stamp)
             if args.expire
             else restore(quarantine_root, args.stamp, decider)
         )
