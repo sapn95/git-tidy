@@ -3822,10 +3822,12 @@ def cmd_init(
     chosen: dict[str, Any] = {}
     # init does not inherit the global dry-run: every other command defaults to
     # changing nothing, but an init that neither asks nor writes is useless. It
-    # asks whenever there is somebody to ask; -q and a pipe write the plain
-    # commented template instead.
-    del mode
-    interactive = prompt_input is not None or (sys.stdin.isatty() and not printer.quiet)
+    # asks whenever there is somebody to ask, and --ask says there is one even
+    # when stdin is a pipe — answers piped in are how a setup script uses this.
+    # -q writes the plain commented template instead.
+    interactive = (
+        prompt_input is not None or mode == ASK or (sys.stdin.isatty() and not printer.quiet)
+    )
     if interactive:
         printer.line(f"Writing {target}. Enter accepts the default in brackets.\n")
         chosen = _interview(printer, prompt_input)
@@ -4115,7 +4117,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         color=not args.no_color and sys.stdout.isatty() and os.environ.get("NO_COLOR") is None,
         verbose=args.verbose,
     )
-    if args.mode == ASK and not sys.stdin.isatty():
+    # init is exempt: its questions are read with input(), which a pipe answers
+    # perfectly well, and an unanswered one falls back to its default. The check
+    # is for the steps that would prompt per change and find nothing there.
+    if args.mode == ASK and args.command != "init" and not sys.stdin.isatty():
         raise Failure("--ask needs a terminal; use --apply for an unattended run")
 
     if args.command == "init":

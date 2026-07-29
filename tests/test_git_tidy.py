@@ -3627,3 +3627,24 @@ def test_a_rolled_up_dry_run_says_quarantine_when_it_means_it(workspace: Path):
         ]
     )
     assert "would quarantine" in stream.getvalue()
+
+
+def test_init_reads_answers_from_a_pipe(tmp_path: Path, monkeypatch, capsys):
+    """--ask was accepted and then ignored when stdin was not a terminal."""
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    answers = iter(["4", "y", "n", "n", "y", "n", "y", "30"])
+    monkeypatch.setattr("builtins.input", lambda _: next(answers))
+
+    target = tmp_path / ".git-tidy.yaml"
+    assert gt.main(["-C", str(tmp_path), "init", "--ask", "--path", str(tmp_path)]) == 0
+    parsed = gt._parse_yaml_subset(target.read_text(encoding="utf-8"), "<init>")
+    assert parsed["jobs"] == 4
+    assert parsed["clean"]["ignored"] is True
+    assert parsed["trash"] == {"enabled": True, "min_age_days": 30}
+
+
+def test_ask_still_needs_a_terminal_for_the_other_commands(workspace: Path, monkeypatch):
+    """Those prompt per change, and a pipe has nothing to answer with."""
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    with pytest.raises(gt.Failure, match="needs a terminal"):
+        gt.main(["-C", str(workspace), "clean", "--ask"])
