@@ -120,7 +120,8 @@ restore without a network, and the second are also perfectly ordinary source
 directory names. Turn them on with `clean.dependencies` and `clean.builds`.
 
 Inside a repository, a **tracked file is never deleted**, however much it looks
-like an artefact. Symlinks are never followed. Nested repositories are left for
+like an artefact — unless `clean.tracked: true` says so, which is off by default
+and the only way `clean` will touch committed content. Symlinks are never followed. Nested repositories are left for
 their own pass.
 
 ### trash
@@ -305,7 +306,9 @@ git tidy run --apply
 - Fast-forward only by default. Never merges, never force-pushes. Rebases only
   where `sync.diverged: rebase` explicitly asks for it.
 - A branch with unpushed commits is reported, never deleted.
-- Tracked files are never removed by `clean`.
+- Tracked files are never removed by `clean`, unless `clean.tracked: true`
+  explicitly asks — it is off by default and the one setting `clean` has that
+  can touch committed content.
 - Symlinks are never followed; nothing outside the workspace is ever touched.
 - Swept files go to a quarantine with a manifest, and `restore` undoes it.
 - Anything that looks like a credential is quarantined, never deleted.
