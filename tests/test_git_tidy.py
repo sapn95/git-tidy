@@ -14,6 +14,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -3961,3 +3962,47 @@ def test_a_byte_order_mark_does_not_change_what_a_config_means(tmp_path: Path):
     assert gt._parse_yaml_subset(text, "<t>") == yaml.safe_load(text)
     (tmp_path / ".git-tidy.yaml").write_text(text, encoding="utf-8")
     assert gt.ConfigResolver(tmp_path).for_path(tmp_path)["jobs"] == 4
+
+
+def test_no_message_the_tool_can_produce_lands_in_other():
+    """Swept out of the source, so the next uncategorised one fails here first.
+
+    "other, see the lines marked -" is true and useless: it tells a person
+    something needs them without telling them what.
+    """
+    source = (Path(__file__).resolve().parent.parent / "git_tidy.py").read_text(encoding="utf-8")
+    category_names = {reason for _, reason in gt.REASONS} | {"other, see the lines marked -"}
+    interesting = (
+        "kept",
+        "no ",
+        "cannot",
+        "already",
+        "declined",
+        "up to date",
+        "checked out",
+        "linked worktree",
+        "staying on",
+        "detached",
+        "diverged",
+        "uncommitted",
+        "unreadable",
+        "orphaned",
+        "would be replaced",
+        "not pushed",
+        "no longer exists",
+        "commits not in",
+        "needs a fetch",
+        "credential in",
+        "in use by",
+        "not a quarantine",
+    )
+    messages = {
+        found
+        for found in re.findall(r'(?:detail\s*=|,)\s*f?"([^"]{8,95})"', source)
+        if found not in category_names
+        and found != "{why}, contains {buried}"  # only ever on an applied action
+        and any(word in found for word in interesting)
+    }
+    assert messages, "the sweep found nothing, so it is not testing anything"
+    uncategorised = [m for m in messages if gt._reason_of(m) == "other, see the lines marked -"]
+    assert uncategorised == []
