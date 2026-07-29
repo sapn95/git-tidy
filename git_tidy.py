@@ -3216,6 +3216,7 @@ REASONS: tuple[tuple[str, str], ...] = (
     ("contains a git repository", "directories holding a git repository"),
     ("checked out in", "default branch checked out in another worktree"),
     ("ignored_keep", "ignored files kept as local state (.env, *.tfstate, keys)"),
+    ("no upstream", "on a local-only branch, never pushed"),
     ("no such remote", "no remote configured"),
     ("no remote", "no remote configured"),
     ("credential in the remote url", "a credential sits in the remote URL"),
