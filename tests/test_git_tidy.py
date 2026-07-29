@@ -3111,3 +3111,198 @@ def test_a_deleted_upstream_is_named_not_shrugged_at(workspace: Path, remote: Pa
     update = [a for a in actions if a.kind == "update"]
     assert update and "no longer exists" in update[0].detail
     assert gt._reason_of(update[0].detail) == "on a branch whose upstream was deleted"
+
+
+# --------------------------------------------------------------------------- #
+# Claude review, round one: parser parity
+# --------------------------------------------------------------------------- #
+
+PARITY_SCALARS = [
+    "true",
+    "false",
+    "yes",
+    "no",
+    "on",
+    "off",
+    "Yes",
+    "TRue",
+    "y",
+    "n",
+    "null",
+    "~",
+    "0",
+    "7",
+    "-3",
+    "1.5",
+    ".5",
+    "1e3",
+    "1E3",
+    "0755",
+    "+5",
+    "1_000",
+    ".inf",
+    ".nan",
+    "-.inf",
+    "0x1f",
+    "0o17",
+    '"quoted"',
+    "'single'",
+    "'it''s'",
+    "plain",
+    "plain with spaces",
+    "release/*",
+    ".env",
+    '"has: colon"',
+    "#notcomment",
+    "a#b",
+    "[]",
+    "{}",
+    "[a, b]",
+    "{a: 1}",
+    "",
+]
+
+
+@pytest.mark.parametrize("scalar", PARITY_SCALARS)
+def test_the_fallback_parser_agrees_with_pyyaml(scalar):
+    """Behaviour must not depend on whether PyYAML happens to be installed."""
+    yaml = pytest.importorskip("yaml")
+    for text in (f"k: {scalar}\n", f"k:\n  - {scalar}\n"):
+        try:
+            mine = gt._parse_yaml_subset(text, "<parity>")
+        except gt.Failure:
+            mine = "REJECTED"
+        try:
+            theirs = yaml.safe_load(text)
+        except Exception:
+            theirs = "REJECTED"
+        assert repr(mine) == repr(theirs), f"{text!r}: {mine!r} vs {theirs!r}"
+
+
+def test_an_unquoted_glob_is_refused_the_way_pyyaml_refuses_it():
+    """`keep: *.pem` is a YAML alias. Accepting it here only when PyYAML is
+    absent would make the config mean different things on different machines."""
+    with pytest.raises(gt.Failure, match="quote it"):
+        gt._parse_yaml_subset("clean:\n  keep: *.pem\n", "<test>")
+
+
+def test_the_generated_config_quotes_what_needs_quoting():
+    """Whatever init writes must read back as what it meant."""
+    yaml = pytest.importorskip("yaml")
+    text = gt.render_config({"clean": {"keep": ["*.pem", "release/*", "yes", "0755"]}}, "h")
+    assert yaml.safe_load(text)["clean"]["keep"] == ["*.pem", "release/*", "yes", "0755"]
+    assert gt._parse_yaml_subset(text, "<r>")["clean"]["keep"] == [
+        "*.pem",
+        "release/*",
+        "yes",
+        "0755",
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# Claude review, round one
+# --------------------------------------------------------------------------- #
+
+
+def test_quitting_keeps_loose_artefacts_already_removed(workspace: Path):
+    """The loose-artefact pass accumulates too, and 'q' must not un-report it."""
+    for name in ("one", "two"):
+        (workspace / name / "__pycache__").mkdir(parents=True)
+        (workspace / name / "__pycache__" / "m.pyc").write_text(name, encoding="utf-8")
+
+    replies = iter(["y", "q"])
+    decider = gt.Decider(gt.ASK, stream=io.StringIO(), prompt_input=lambda _: next(replies))
+    context = gt.Context(
+        workspace,
+        gt.ConfigResolver(workspace),
+        decider,
+        quiet_printer(),
+        gt.find_repos(workspace, []),
+        _holding(workspace),
+    )
+    with pytest.raises(gt.Quit) as stopped:
+        gt._outside_repos(context, config(), context.quarantine)
+
+    assert [a for a in stopped.value.done if a.applied], "the one agreed to is reported"
+
+
+def test_quitting_keeps_ignored_paths_already_removed(workspace: Path):
+    """clean.ignored's own list was outside the guard clean_tree provides."""
+    repo = workspace / "repo"
+    (repo / ".gitignore").write_text("a/\nb/\nc/\n", encoding="utf-8")
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-q", "-m", "ignore")
+    for name in ("a", "b", "c"):
+        (repo / name).mkdir()
+        (repo / name / "out.bin").write_bytes(b"0" * 1024)
+    (workspace / ".git-tidy.yaml").write_text("clean:\n  ignored: true\n", encoding="utf-8")
+
+    replies = iter(["y", "y", "q"])
+    decider = gt.Decider(gt.ASK, stream=io.StringIO(), prompt_input=lambda _: next(replies))
+    context = gt.Context(
+        workspace,
+        gt.ConfigResolver(workspace),
+        decider,
+        quiet_printer(),
+        [repo],
+        _holding(workspace),
+    )
+    actions: list[gt.Action] = []
+    with pytest.raises(gt.Quit) as stopped, gt.keeping(actions):
+        gt._clean_repo(repo, "repo", context.config_for(repo), context, actions)
+
+    removed = [a for a in stopped.value.done if a.applied]
+    assert len(removed) == 2, "both agreed-to removals are reported"
+    assert sum(a.size for a in removed) >= 2048
+
+
+def test_quitting_keeps_expired_quarantines_already_deleted(workspace: Path):
+    """Expiry deletes irreversibly, so an unrecorded deletion is the worst kind."""
+    root = workspace / gt.QUARANTINE_DIRNAME
+    long_ago = time.time() - 60 * 86400
+    for name in ("one", "two"):
+        stamp = root / name
+        stamp.mkdir(parents=True)
+        (stamp / gt.JOURNAL_NAME).write_text("{}\n", encoding="utf-8")
+        (stamp / "file").write_text(name, encoding="utf-8")
+        os.utime(stamp, (long_ago, long_ago))
+
+    replies = iter(["y", "q"])
+    decider = gt.Decider(gt.ASK, stream=io.StringIO(), prompt_input=lambda _: next(replies))
+    with pytest.raises(gt.Quit) as stopped:
+        gt.expire_quarantines(root, 30, decider)
+
+    assert [a for a in stopped.value.done if a.applied], "the deletion is reported"
+
+
+def test_trash_refuses_a_directory_holding_a_repository(workspace: Path):
+    """clean has always refused this; trash used to destroy it."""
+    forgotten = workspace / "project.old"
+    clone = forgotten / "clone"
+    clone.mkdir(parents=True)
+    git(clone, "init", "-q", "-b", "main")
+    commit(clone, "work.txt", "never pushed anywhere")
+    age(forgotten, 30)
+
+    cfg = config(trash={"enabled": True, "dirs": True, "quarantine": False})
+    actions = gt.sweep_trash(workspace, cfg, run(), _holding(workspace), [])
+    assert (clone / ".git").is_dir(), "the repository and its commit survive"
+    assert (clone / "work.txt").read_text(encoding="utf-8") == "never pushed anywhere"
+    assert actions and actions[0].skipped and "git repository" in actions[0].detail
+
+
+def test_a_bad_config_value_mid_run_still_leaves_a_report(workspace: Path, capsys):
+    """The disk was already changed; losing the report would hide that."""
+    (workspace / "loose" / ".ruff_cache").mkdir(parents=True)
+    (workspace / "loose" / ".ruff_cache" / "big").write_bytes(b"0" * 4096)
+    (workspace / ".git-tidy.yaml").write_text(
+        'trash:\n  enabled: true\n  scope: "all"\n', encoding="utf-8"
+    )
+
+    assert gt.main(["-C", str(workspace), "run", "--apply", "--json"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["interrupted"] is True
+    assert any(a["error"] and "trash.scope" in a["error"] for a in payload["actions"])
+    assert any(a["kind"] == "remove" and a["applied"] for a in payload["actions"]), (
+        "what was deleted before the failure is still reported"
+    )
