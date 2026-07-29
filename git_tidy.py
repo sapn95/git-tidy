@@ -65,7 +65,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NoReturn
 
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 
 CONFIG_NAMES = (".git-tidy.yaml", ".git-tidy.yml")
 QUARANTINE_DIRNAME = ".git-tidy-trash"
@@ -1431,7 +1431,12 @@ def _fast_forward(
     counts = git.out("rev-list", "--left-right", "--count", f"{upstream}...HEAD", check=False)
     behind, _, ahead = counts.partition("\t")
     if not counts:
-        return [Action("update", name, head, "cannot compare with upstream", skipped=True)]
+        # The upstream ref is gone — the branch was merged and deleted on the
+        # remote, most often. Naming that beats "cannot compare", which tells
+        # nobody what to do about it.
+        gone = not git.ok("show-ref", "--verify", "--quiet", f"refs/remotes/{upstream}")
+        why = f"upstream {upstream} no longer exists" if gone else "cannot compare with upstream"
+        return [Action("update", name, head, why, skipped=True)]
     if behind == "0":
         # In a dry run nothing was fetched, so this is measured against the
         # remote-tracking ref as it already stood. Saying "already up to date"
@@ -3064,6 +3069,8 @@ REASONS: tuple[tuple[str, str], ...] = (
     ("no such remote", "no remote configured"),
     ("no remote", "no remote configured"),
     ("credential in the remote url", "a credential sits in the remote URL"),
+    ("no longer exists", "on a branch whose upstream was deleted"),
+    ("cannot compare", "cannot be compared with its upstream"),
     ("not pushed", "branches with commits that exist only here"),
     ("detached", "detached HEAD"),
     ("declined", "declined at the prompt"),

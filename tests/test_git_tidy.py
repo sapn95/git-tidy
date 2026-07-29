@@ -3097,3 +3097,17 @@ def test_a_dry_run_says_quarantine_when_it_means_quarantine(workspace: Path):
     token = [a for a in actions if "token" in a.target]
     assert token and token[0].quarantined
     assert "quarantine" in token[0].detail and "remove" not in token[0].detail
+
+
+def test_a_deleted_upstream_is_named_not_shrugged_at(workspace: Path, remote: Path):
+    """ "cannot compare with upstream" tells nobody what to do about it."""
+    repo = workspace / "repo"
+    git(repo, "switch", "-q", "-c", "feature")
+    git(repo, "push", "-q", "-u", "origin", "feature")
+    git(remote, "branch", "-D", "feature")
+    git(repo, "fetch", "-q", "--prune", "origin")
+
+    actions = gt.sync_repo(repo, "repo", config(sync={"switch": "never"}), run())
+    update = [a for a in actions if a.kind == "update"]
+    assert update and "no longer exists" in update[0].detail
+    assert gt._reason_of(update[0].detail) == "on a branch whose upstream was deleted"
