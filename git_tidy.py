@@ -344,8 +344,8 @@ COMMENTS: dict[str, str] = {
     "heuristics below say.",
     "trash.heuristics": "mash:  keyboard-mash filenames (asdkjfhaksdjf.txt, lalalala.log)\n"
     "empty: zero-byte files\n"
-    "temp:  *~ *.swp *.swo *.orig *.rej *.bak *.tmp *.old — note the last two:\n"
-    "       a project.old/ somebody parked is swept whole, to quarantine.",
+    "temp:  *~ *.swp *.swo *.orig *.rej *.bak *.tmp *.old. Note the last two:\n"
+    "       with trash.dirs on, a project.old/ somebody parked goes whole.",
     "trash.sensitive": "Reported as sensitive and always quarantined rather than\n"
     "deleted, even with quarantine off, because a token may be the only copy.",
     "trash.min_age_days": "Nothing younger than this is touched, so today's scratch\n"
@@ -546,10 +546,19 @@ def _parse_sequence(lines: list[_Line], index: int, indent: int, source: str) ->
 
 
 def _looks_like_mapping(item: str) -> bool:
-    """True for `key: value` and `key:`, false for a plain or flow scalar."""
+    """True for `key: value` and `key:`, false for a plain or flow scalar.
+
+    YAML starts a mapping on ": " or on a colon that ends the item — not on any
+    colon at all. Without that, `- https://internal/mirror` in a list came out
+    as {"https": "//internal/mirror"} here and as a string under PyYAML, so a
+    config with a URL in it loaded from a checkout and failed on every shipped
+    build.
+    """
     if item.startswith(("[", "{", '"', "'")):
         return False
-    key, sep, _ = item.partition(":")
+    if item.endswith(":"):
+        return " " not in item[:-1].strip()
+    key, sep, _ = item.partition(": ")
     return bool(sep) and " " not in key.strip()
 
 
@@ -1837,7 +1846,17 @@ def _unstash(git: Git) -> str:
     undone, but the user's work would still be sitting in a stash they never
     asked for.
     """
-    result = git.run("stash", "pop", check=False)
+    # --index, so what was staged is staged again. Without it the pop restores
+    # the content, flattens the staged/unstaged split and then drops the stash —
+    # and "nothing changed" is the one line somebody reads before deciding
+    # whether to go and look.
+    result = git.run("stash", "pop", "--index", check=False)
+    if result.returncode != 0:
+        # --index fails if the index cannot be reinstated cleanly; the plain pop
+        # at least gets the content back.
+        result = git.run("stash", "pop", check=False)
+        if result.returncode == 0:
+            return "your work is back, but what was staged is no longer staged"
     if result.returncode == 0:
         return "nothing changed"
     return f"your changes are in the stash: {last_line(result)}"
@@ -3405,6 +3424,11 @@ def _check_unpushed(git: Git, name: str, sync: dict[str, Any]) -> list[Action]:
     trunk = default_branch(git, sync, readonly=True)
     for branch in list_branches(git):
         if not branch.upstream:
+            # Never pushed, so its commits are on no remote at all — the larger
+            # half of "commits that exist only locally", and nothing else
+            # reports it: prune passes over these unless prune_local_only is on,
+            # and that setting is about deleting them.
+            found.extend(_never_pushed(git, name, branch, trunk, sync))
             continue
         against = branch.upstream
         if branch.gone:
@@ -3428,6 +3452,31 @@ def _check_unpushed(git: Git, name: str, sync: dict[str, Any]) -> list[Action]:
                 )
             )
     return found
+
+
+def _never_pushed(
+    git: Git, name: str, branch: BranchInfo, trunk: str | None, sync: dict[str, Any]
+) -> list[Action]:
+    """A local-only branch, and how much of it exists nowhere else."""
+    if trunk is None or branch.name == trunk:
+        return []
+    against = f"{sync['remote']}/{trunk}"
+    if not git.ok("show-ref", "--verify", "--quiet", f"refs/remotes/{against}"):
+        against = trunk
+        if not git.ok("show-ref", "--verify", "--quiet", f"refs/heads/{against}"):
+            return []
+    ahead = git.out("rev-list", "--count", f"{against}..{branch.name}", check=False)
+    if not ahead or ahead == "0":
+        return []
+    return [
+        Action(
+            "doctor",
+            name,
+            branch.name,
+            f"no upstream: {plural(ahead, 'commit')} not pushed",
+            skipped=True,
+        )
+    ]
 
 
 def _check_git_size(git: Git, name: str, limit_mb: int) -> list[Action]:
@@ -3700,14 +3749,13 @@ REASONS: tuple[tuple[str, str], ...] = (
     ("build output", "build output — clean.builds is off"),
     ("orphaned worktree", "orphaned worktrees — the parent pruned them away"),
     ("no upstream", "on a local-only branch, never pushed"),
-    ("no such remote", "no remote configured"),
+    ("no such remote", "the configured remote is not there"),
     ("no remote", "no remote configured"),
     ("credential in the remote url", "a credential sits in the remote URL"),
     ("no longer exists", "on a branch whose upstream was deleted"),
     ("cannot compare", "cannot be compared with its upstream"),
     ("not pushed", "branches with commits that exist only here"),
     ("detached", "detached HEAD"),
-    ("declined", "declined at the prompt"),
     ("remote branch missing", "no usable default branch"),
     ("no default branch", "no usable default branch"),
     ("consider git gc", ".git big enough to be worth a git gc"),
@@ -4060,7 +4108,9 @@ def _loose_artefacts(
             "never_delete_outright": _never_delete_outright(governing),
         }
         if not here_cfg["enabled"]:
-            dirnames[:] = []
+            # Nothing from *this* directory, but the walk goes on: a deeper
+            # config can switch clean back on, and pruning here made that
+            # impossible for anything below a root that had it off.
             continue
         dir_patterns, file_patterns = clean_patterns(here_cfg)
         keep = here_cfg["keep"]
@@ -4245,7 +4295,7 @@ def cmd_init(
     # asks whenever there is somebody to ask, and --ask says there is one even
     # when stdin is a pipe — answers piped in are how a setup script uses this.
     # -q writes the plain commented template instead.
-    interactive = (
+    interactive = not explicit_dry and (
         prompt_input is not None or mode == ASK or (sys.stdin.isatty() and not printer.quiet)
     )
     if interactive:
@@ -4253,14 +4303,17 @@ def cmd_init(
         chosen = _interview(printer, prompt_input)
 
     body = render_config(chosen, INIT_HEADER)
-    if explicit_dry and not interactive:
+    if explicit_dry:
         # -n means change nothing, here as everywhere else. Printing it is still
         # useful: `git-tidy init -n > .git-tidy.yaml` is a reasonable thing to do.
         printer.loud().line(body.rstrip())
         printer.loud().line(f"\n  Not written. Run without -n, or redirect this into {target}.")
         return 0
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(body, encoding="utf-8")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(body, encoding="utf-8")
+    except OSError as exc:
+        raise Failure(f"cannot write {target}: {exc}") from exc
     # Reading it straight back catches a template that this tool's own parser
     # cannot load, which would otherwise only surface on the next run.
     _merge(DEFAULTS, read_config_file(target), str(target))
@@ -4353,7 +4406,7 @@ def add_common_options(parser: argparse.ArgumentParser, after_command: bool) -> 
         "--jobs",
         type=int,
         metavar="N",
-        help="how much to do at once (default: one per CPU core)",
+        help="how much to do at once; 0 = one per CPU core (the default)",
         **({"default": argparse.SUPPRESS} if after_command else {"default": None}),
     )
     # Appended rather than replaced, so `git-tidy --exclude a clean --exclude b`
@@ -4421,13 +4474,23 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _says_dry_run(word: str) -> bool:
+    """Whether one argv word asks for a dry run, clustered short flags included.
+
+    `-qn` is the same request as `-q -n`, and comparing whole words missed it.
+    """
+    if word == "--dry-run":
+        return True
+    return word.startswith("-") and not word.startswith("--") and "n" in word[1:]
+
+
 def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     """Parse, then fold the after-the-subcommand copies of --include/--exclude in."""
     args = build_parser().parse_args(argv)
     # -n and "no mode flag at all" both resolve to DRY, and init has to tell
     # them apart: with no flag it writes the file, with -n it prints it.
     given = sys.argv[1:] if argv is None else list(argv)
-    args.explicit_dry = any(flag in given for flag in ("-n", "--dry-run"))
+    args.explicit_dry = any(_says_dry_run(word) for word in given)
     for name in ("include", "exclude"):
         extra = getattr(args, f"{name}_after", None)
         if extra:
@@ -4464,8 +4527,8 @@ def overrides_from(args: argparse.Namespace) -> dict[str, Any]:
     if getattr(args, "force", False):
         overrides = {k: dict(v) for k, v in FORCE_OVERRIDES.items()}
     if getattr(args, "jobs", None) is not None:
-        if args.jobs < 1:
-            raise Failure("--jobs must be at least 1")
+        if args.jobs < 0:
+            raise Failure("--jobs cannot be negative")
         overrides["jobs"] = args.jobs
     return overrides
 

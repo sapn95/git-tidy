@@ -1442,11 +1442,6 @@ def test_main_refuses_a_missing_directory(tmp_path: Path):
         gt.main(["-C", str(tmp_path / "nope"), "clean"])
 
 
-def test_main_rejects_zero_jobs(workspace: Path):
-    with pytest.raises(gt.Failure, match=r"--jobs"):
-        gt.main(["-C", str(workspace), "-j", "0", "clean"])
-
-
 def test_main_run_does_every_step(workspace: Path, capsys):
     (workspace / "repo" / "__pycache__").mkdir()
     assert gt.main(["-C", str(workspace), "run", "--apply"]) == 0
@@ -4547,3 +4542,100 @@ def test_init_writes_by_default_and_prints_under_dry_run(tmp_path: Path, capsys,
     gt.main(["-C", str(tmp_path), "init", "-n", "--path", str(tmp_path)])
     assert not target.exists(), "-n means print it"
     assert "git-tidy configuration" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------- #
+# Claude review, round eight
+# --------------------------------------------------------------------------- #
+
+
+def test_unstash_puts_the_staging_back(workspace: Path):
+    """A plain pop flattens the staged/unstaged split and then drops the stash."""
+    repo = workspace / "repo"
+    commit(repo, "b.txt", "one\n")
+    commit(repo, "c.txt", "one\n")
+    (repo / "b.txt").write_text("staged\n", encoding="utf-8")
+    (repo / "c.txt").write_text("unstaged\n", encoding="utf-8")
+    git(repo, "add", "b.txt")
+    before = git(repo, "status", "--porcelain")
+
+    stashed, problem = gt._stash(gt.Git(repo), "repo")
+    assert stashed and problem is None
+    assert gt._unstash(gt.Git(repo)) == "nothing changed"
+    assert git(repo, "status", "--porcelain") == before, "staged is staged again"
+
+
+def test_a_never_pushed_branch_is_reported(workspace: Path):
+    """Its commits are on no remote at all, and nothing else mentions it."""
+    repo = workspace / "repo"
+    git(repo, "switch", "-q", "-c", "scratch/local-only")
+    commit(repo, "only-copy.txt")
+    git(repo, "switch", "-q", "main")
+
+    actions = gt.doctor_repo(repo, "repo", config())
+    reported = [a for a in actions if a.target == "scratch/local-only"]
+    assert reported and "not pushed" in reported[0].detail
+    assert gt._reason_of(reported[0].detail) == "on a local-only branch, never pushed"
+
+
+def test_a_deeper_config_can_switch_clean_on(workspace: Path):
+    """The walk pruned at the root, so the widening could never reach anything."""
+    sub = workspace / "sub"
+    (sub / "__pycache__").mkdir(parents=True)
+    (sub / "__pycache__" / "x.pyc").write_bytes(b"0" * 64)
+    (workspace / ".git-tidy.yaml").write_text("clean:\n  enabled: false\n", encoding="utf-8")
+    (sub / ".git-tidy.yaml").write_text("clean:\n  enabled: true\n", encoding="utf-8")
+
+    gt.main(["-C", str(workspace), "clean", "--apply"])
+    assert not (sub / "__pycache__").exists(), "the deeper config asked for it"
+
+
+@pytest.mark.parametrize("argv", [["init", "-n"], ["init", "-qn"], ["init", "-nq"]])
+def test_clustered_short_flags_still_mean_dry_run(argv):
+    assert gt.parse_args(argv).explicit_dry is True
+
+
+def test_dry_run_init_prints_even_on_a_terminal(tmp_path: Path, capsys, monkeypatch):
+    """-n was honoured only when stdin was not a tty, which is the rarer case."""
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    target = tmp_path / ".git-tidy.yaml"
+    gt.main(["-C", str(tmp_path), "init", "-n", "--path", str(tmp_path)])
+    assert not target.exists()
+    assert "git-tidy configuration" in capsys.readouterr().out
+
+
+def test_init_reports_a_target_it_cannot_write(tmp_path: Path):
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o555)
+    try:
+        with pytest.raises(gt.Failure, match="cannot write"):
+            gt.cmd_init(locked / ".git-tidy.yaml", gt.AUTO, force=False, printer=quiet_printer())
+    finally:
+        locked.chmod(0o755)
+
+
+def test_a_missing_named_remote_is_not_called_no_remote(workspace: Path):
+    repo = workspace / "repo"
+    git(repo, "remote", "rename", "origin", "upstream")
+    actions = gt.sync_repo(repo, "repo", config(), run())
+    assert actions[0].detail == "no such remote"
+    assert gt._reason_of(actions[0].detail) == "the configured remote is not there"
+
+
+def test_a_url_in_a_list_is_not_a_mapping():
+    """YAML starts a mapping on ": ", not on any colon at all."""
+    yaml = pytest.importorskip("yaml")
+    for text in (
+        "exclude:\n  - https://internal/mirror\n",
+        'clean:\n  keep:\n    - "C:/build/*"\n',
+        "exclude:\n  - a:b\n",
+    ):
+        assert gt._parse_yaml_subset(text, "<t>") == yaml.safe_load(text), text
+
+
+def test_jobs_zero_means_the_same_on_the_command_line(workspace: Path):
+    """The config comment says 0 = one per core, and init writes that verbatim."""
+    assert gt.main(["-C", str(workspace), "-j", "0", "doctor"]) == 0
+    with pytest.raises(gt.Failure, match="cannot be negative"):
+        gt.main(["-C", str(workspace), "-j", "-2", "doctor"])
