@@ -24,7 +24,7 @@ their commits are contained in the default branch. Unpushed work is reported.
 .B clean
 Remove build output and caches. With \fBclean.ignored\fR, everything
 .B .gitignore
-already calls disposable. A tracked file is never deleted.
+already calls disposable. A tracked file is never deleted, unless \fIclean.tracked\fR says so.
 .TP
 .B trash
 Sweep loose junk in the workspace into a timestamped quarantine with a

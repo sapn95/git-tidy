@@ -1150,6 +1150,19 @@ def is_repo(path: Path) -> bool:
     return dot_git.is_dir() or dot_git.is_file()
 
 
+def holds_git_data(path: Path) -> bool:
+    """True for a repository in any form, bare included.
+
+    is_repo answers "is this a checkout we can sync", which a bare clone is not.
+    This answers "would deleting this destroy a repository", which it certainly
+    would: `git clone --bare` and `--mirror` leave no .git entry at all, so every
+    guard that looked for one walked straight past them.
+    """
+    if is_repo(path):
+        return True
+    return (path / "HEAD").is_file() and (path / "objects").is_dir() and (path / "refs").is_dir()
+
+
 def find_repos(root: Path, exclude: Sequence[str], follow_nested: bool = False) -> list[Path]:
     """Find repository roots under `root`, skipping anything the config excludes.
 
@@ -1334,7 +1347,10 @@ def sync_repo(path: Path, name: str, cfg: dict[str, Any], decider: Decider) -> l
     remote = sync["remote"]
 
     if not git.out("remote", check=False):
-        return [Action("sync", name, "-", "no remote configured", skipped=True)]
+        # doctor reports this too, and counting it twice made a workspace with
+        # twenty remote-less clones report forty. Its wording keeps it out of
+        # the held-back tally; doctor's is the one that counts.
+        return [Action("sync", name, "-", "nothing to fetch: no remote", skipped=True)]
     if remote not in git.out("remote", check=False).split():
         return [Action("sync", name, remote, "no such remote", skipped=True)]
 
@@ -1496,6 +1512,21 @@ def _cannot_switch(
             [Action("switch", name, branch, f"checked out in {elsewhere}", skipped=True)],
             stop=True,
         )
+    stranded = _commits_on_no_branch(git)
+    if stranded:
+        return _Outcome(
+            [
+                Action(
+                    "switch",
+                    name,
+                    branch,
+                    f"detached HEAD at {stranded}, on no branch — switching would "
+                    "leave those commits reachable only through the reflog",
+                    skipped=True,
+                )
+            ],
+            stop=True,
+        )
     clobbered = _would_clobber_ignored(git, branch, ignored_keep)
     if clobbered is not None:
         return _Outcome(
@@ -1511,6 +1542,27 @@ def _cannot_switch(
             stop=True,
         )
     return None
+
+
+def _commits_on_no_branch(git: Git) -> str:
+    """The detached HEAD, when nothing else reaches the commits it is sitting on.
+
+    git warns about this on stderr and exits 0, so it is easy to discard. The
+    tool refuses to delete a branch holding one unpushed commit; abandoning the
+    identical commit here, in the default mode and with no flag, would be the
+    same loss by a quieter route. Doctor cannot catch it either — sync runs
+    first, and by then the evidence is gone.
+    """
+    if current_branch(git):
+        return ""
+    # for-each-ref, not `branch --contains`: the latter lists a pseudo-entry for
+    # the detached HEAD itself, so the answer was never empty.
+    on = git.out(
+        "for-each-ref", "--contains", "HEAD", "--format=%(refname)", "refs/heads", check=False
+    )
+    if on:
+        return ""  # detached, but the commits are on a branch too
+    return git.out("rev-parse", "--short", "HEAD", check=False) or "an unknown commit"
 
 
 def _make_room(
@@ -2084,7 +2136,7 @@ def _measure(path: Path) -> tuple[int, bool]:
     holds_repo = False
     for dirpath, dirnames, filenames in os.walk(path, followlinks=False):
         here = Path(dirpath)
-        if ".git" in dirnames or ".git" in filenames:
+        if ".git" in dirnames or ".git" in filenames or holds_git_data(here):
             holds_repo = True
         for name in filenames:
             candidate = here / name
@@ -2167,21 +2219,24 @@ def clean_ignored(
 ) -> list[Action]:
     """Remove everything the repo's own .gitignore already calls disposable."""
     clean = cfg["clean"]
-    protect = [*clean["ignored_keep"], *clean["keep"]]
+    # Each rule keeps its own name: pointing somebody at clean.ignored_keep for
+    # something node_modules kept sends them to a list it is not in.
     # .gitignore covers node_modules and dist in practically every repository,
-    # so without this clean.ignored alone emptied the very lists that
+    # so without the last two clean.ignored alone emptied the very lists that
     # clean.dependencies and clean.builds exist to keep switched off.
+    rules: list[tuple[Sequence[str], str]] = [
+        (clean["ignored_keep"], "kept by ignored_keep"),
+        (clean["keep"], "kept by clean.keep"),
+    ]
     if not clean["dependencies"]:
-        protect = [*protect, *clean["dependency_dirs"]]
+        rules.append((clean["dependency_dirs"], "kept: a dependency tree, clean.dependencies"))
     if not clean["builds"]:
-        protect = [*protect, *clean["build_dirs"]]
+        rules.append((clean["build_dirs"], "kept: build output, clean.builds"))
     actions: list[Action] = []
     # Its own guard: the caller's list does not have these until this returns,
     # so a Quit raised in here would take them with it.
     with keeping(actions):
-        _remove_ignored(
-            repo, scope, cfg, clean, protect, decider, quarantine, git, holding, actions
-        )
+        _remove_ignored(repo, scope, cfg, clean, rules, decider, quarantine, git, holding, actions)
     return actions
 
 
@@ -2190,7 +2245,7 @@ def _remove_ignored(
     scope: str,
     cfg: dict[str, Any],
     clean: dict[str, Any],
-    protect: Sequence[str],
+    rules: Sequence[tuple[Sequence[str], str]],
     decider: Decider,
     quarantine: Quarantine | None,
     git: Git,
@@ -2206,12 +2261,21 @@ def _remove_ignored(
         if path.is_symlink() or not path.exists():
             continue
         name = Path(relative).name
-        if any(fnmatch.fnmatch(name, p) or fnmatch.fnmatch(relative, p) for p in protect):
-            actions.append(Action("ignored", scope, relative, "kept by ignored_keep", skipped=True))
+        why = next(
+            (
+                reason
+                for patterns, reason in rules
+                if any(fnmatch.fnmatch(name, p) or fnmatch.fnmatch(relative, p) for p in patterns)
+            ),
+            None,
+        )
+        if why is not None:
+            actions.append(Action("ignored", scope, relative, why, skipped=True))
             continue
         # git collapses a wholly ignored directory into one entry, so a
         # build/ holding a .env or a *.pem arrives here as a single path.
         # Testing only its name would delete the protected file with it.
+        protect = [pattern for patterns, _ in rules for pattern in patterns]
         if path.is_dir() and (holds := _holds_protected(path, protect, base=repo)):
             actions.append(
                 Action("ignored", scope, relative, f"kept: contains {holds}", skipped=True)
@@ -2370,19 +2434,23 @@ def _sort_directories(plan: _Sweep, here: Path, dirnames: list[str]) -> tuple[li
             continue
         if plan.stay_inside and candidate != plan.root and is_repo(candidate):
             continue  # a repo of its own; not this walk's business
-        if not plan.clean["dependencies"] and _matches(name, plan.clean["dependency_dirs"]):
+        named = _matches(name, plan.dir_patterns)
+        if (
+            not named
+            and not plan.clean["dependencies"]
+            and _matches(name, plan.clean["dependency_dirs"])
+        ):
             # A .venv full of __pycache__ is the package manager's business, not
             # ours. Descending into it produced hundreds of lines of output for a
-            # few megabytes nobody asked about.
+            # few megabytes nobody asked about. Checked after the patterns, so
+            # naming one in clean.dirs still does what clean.dirs says it does.
             continue
         if candidate.relative_to(plan.root).as_posix() in plan.already:
             # clean.ignored already accounted for this one. In a dry run it is
             # still on disk, and reporting it again would double both the count
             # and the size against a run that removes it once.
             continue
-        if _matches(name, plan.dir_patterns) and not _protected(
-            candidate, plan.root, plan.keep, plan.tracked
-        ):
+        if named and not _protected(candidate, plan.root, plan.keep, plan.tracked):
             # Removing it whole would take anything keep protects inside it, so
             # walk in instead and decide file by file.
             if _holds_protected(candidate, plan.keep, base=plan.root):
@@ -3028,7 +3096,7 @@ def _holds_a_repository(path: Path, relative: str) -> Action | None:
     under a `project.old/` directory is exactly what the rule is for. Sweeping
     it would take its unpushed commits with it.
     """
-    if not path.is_dir() or not _measure(path)[1]:
+    if not path.is_dir() or not (_measure(path)[1] or holds_git_data(path)):
         return None
     return Action("trash", "workspace", relative, "kept: contains a git repository", skipped=True)
 
@@ -3068,7 +3136,9 @@ def _trash_candidates(workspace: Path, trash: dict[str, Any], repos: set[Path]) 
         for entry in sorted(workspace.iterdir()):
             if entry.name == QUARANTINE_DIRNAME or entry.is_symlink():
                 continue
-            if entry.is_dir() and (not trash["dirs"] or is_repo(entry) or entry.resolve() in repos):
+            if entry.is_dir() and (
+                not trash["dirs"] or holds_git_data(entry) or entry.resolve() in repos
+            ):
                 continue
             yield entry
         return
@@ -3080,7 +3150,9 @@ def _trash_candidates(workspace: Path, trash: dict[str, Any], repos: set[Path]) 
         keep_walking = [
             d
             for d in sorted(dirnames)
-            if d != QUARANTINE_DIRNAME and not is_repo(here / d) and not (here / d).is_symlink()
+            if d != QUARANTINE_DIRNAME
+            and not holds_git_data(here / d)
+            and not (here / d).is_symlink()
         ]
         dirnames[:] = keep_walking
         if trash["dirs"]:
@@ -3114,6 +3186,15 @@ def doctor_repo(path: Path, name: str, cfg: dict[str, Any]) -> list[Action]:
     git = Git(path, timeout=int(cfg["sync"]["timeout"]))
     actions: list[Action] = []
 
+    # Neither of these needs a remote, and a repository without one is where
+    # they matter most: nothing in it is pushed anywhere, and sync leaves it
+    # alone, so a detached HEAD there stays detached.
+    if checks["detached_head"] and not current_branch(git):
+        commit = git.out("rev-parse", "--short", "HEAD", check=False)
+        actions.append(Action("doctor", name, "HEAD", f"detached at {commit}", skipped=True))
+    if checks["large_git_mb"]:
+        actions += _check_git_size(git, name, checks["large_git_mb"])
+
     remotes = git.out("remote", check=False).split()
     if not remotes:
         if checks["no_remote"]:
@@ -3122,13 +3203,8 @@ def doctor_repo(path: Path, name: str, cfg: dict[str, Any]) -> list[Action]:
 
     if checks["credentials_in_url"]:
         actions += _check_credentials(git, name, remotes)
-    if checks["detached_head"] and not current_branch(git):
-        commit = git.out("rev-parse", "--short", "HEAD", check=False)
-        actions.append(Action("doctor", name, "HEAD", f"detached at {commit}", skipped=True))
     if checks["unpushed"]:
         actions += _check_unpushed(git, name)
-    if checks["large_git_mb"]:
-        actions += _check_git_size(git, name, checks["large_git_mb"])
     return actions
 
 
@@ -3405,10 +3481,15 @@ NOT_HELD_BACK = (
     "up to date",
     "already deleted",
     "nothing to fast-forward",
+    "nothing to fetch",
     "linked worktree",
     "staying on",
 )
 REASONS: tuple[tuple[str, str], ...] = (
+    # First, and deliberately: "declined: switch from detached HEAD" is about
+    # the answer, not about the HEAD. Every other needle here describes a state
+    # the tool found; this one describes what the person said.
+    ("declined", "declined at the prompt"),
     ("uncommitted changes", "uncommitted changes — left on their branch"),
     ("needs a fetch in this run", "unmerged branches waiting on a fetch — use `run --force`"),
     ("not in origin", "branches with commits not in the trunk"),
@@ -3419,12 +3500,16 @@ REASONS: tuple[tuple[str, str], ...] = (
     ("uncommitted work in", "submodules with uncommitted work"),
     ("would be replaced", "a local file the incoming commits would overwrite"),
     ("kept: contains", "directories holding something that must not go"),
+    ("on no branch", "commits on a detached HEAD and no branch"),
     ("cannot check merged", "branches with no trunk to compare against"),
     ("to compare against", "branches with no trunk to compare against"),
     ("not a quarantine", "directories under the quarantine that are not ours"),
     ("unreadable", "quarantine records that could not be read"),
     ("checked out in", "default branch checked out in another worktree"),
     ("ignored_keep", "ignored files kept as local state (.env, *.tfstate, keys)"),
+    ("kept by clean.keep", "paths clean.keep protects"),
+    ("a dependency tree", "dependency trees — clean.dependencies is off"),
+    ("build output", "build output — clean.builds is off"),
     ("orphaned worktree", "orphaned worktrees — the parent pruned them away"),
     ("no upstream", "on a local-only branch, never pushed"),
     ("no such remote", "no remote configured"),
@@ -3669,7 +3754,10 @@ def _clean_repo(
     if cfg["clean"]["ignored"]:
         ignored = clean_ignored(repo, name, cfg, context.decider, holding, git, context.quarantine)
         actions += ignored
-        already = {a.target for a in ignored}
+        # Only the ones that went: a path clean.ignored *kept* is still fair game
+        # for clean.dirs, and putting it here made turning clean.ignored on make
+        # the tool clean less.
+        already = {a.target for a in ignored if not a.skipped}
     actions += clean_tree(
         repo,
         name,
@@ -3813,8 +3901,10 @@ def _not_ours(candidate: Path, name: str, clean: dict[str, Any], repo_set: set[P
     """
     if name == QUARANTINE_DIRNAME or candidate.is_symlink():
         return True
-    if is_repo(candidate) or candidate.resolve() in repo_set:
+    if holds_git_data(candidate) or candidate.resolve() in repo_set:
         return True
+    if _matches(name, clean_patterns(clean)[0]):
+        return False  # named in clean.dirs, which says "wherever they appear"
     return not clean["dependencies"] and _matches(name, clean["dependency_dirs"])
 
 
@@ -4147,19 +4237,31 @@ def overrides_from(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _workspace_of(target: Path) -> Path:
-    """The nearest directory above `target` that could be a workspace root.
+    """The outermost directory above `target` that carries a config.
 
-    Used only by `git-tidy config <path>`, so that asking about a path outside
-    the current -C still answers with the configuration that governs it.
+    Outermost, not nearest: config_files_for merges nothing above the root it is
+    given, so rooting at the nearest one silently drops every setting that lives
+    further up — which is the layout the README describes.
     """
+    outermost = None
     for parent in target.parents:
         if any((parent / name).is_file() for name in CONFIG_NAMES):
-            return parent
+            outermost = parent
+    if outermost is not None:
+        return outermost
     return target if target.is_dir() else target.parent
 
 
+def _expand(raw: str) -> Path:
+    """`~user` for an account that is not on this machine raises RuntimeError."""
+    try:
+        return Path(raw).expanduser().resolve()
+    except RuntimeError as exc:
+        raise Failure(f"cannot work out what {raw!r} means: {exc}") from exc
+
+
 def resolve_workspace(raw: str) -> Path:
-    workspace = Path(raw).expanduser().resolve()
+    workspace = _expand(raw)
     if not workspace.is_dir():
         raise Failure(f"{workspace} is not a directory")
     # find_repos only looks *below* the root, so a root that is itself a
@@ -4239,18 +4341,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         target = (
             global_config_path()
             if args.global_config
-            else Path(args.path or args.workspace).expanduser().resolve() / CONFIG_NAMES[0]
+            else _expand(args.path or args.workspace) / CONFIG_NAMES[0]
         )
         return cmd_init(target, args.mode, args.force, printer)
 
-    workspace = resolve_workspace(args.workspace)
+    # config neither reads a workspace nor writes one: it answers a question
+    # about a path, and the most natural place to ask it is inside a checkout.
+    workspace = (
+        _expand(args.workspace) if args.command == "config" else resolve_workspace(args.workspace)
+    )
     resolver = ConfigResolver(workspace, overrides_from(args))
     root_cfg = resolver.for_path(workspace)
     quarantine_root = workspace / QUARANTINE_DIRNAME
     decider = Decider(args.mode)
 
     if args.command == "config":
-        target = Path(args.path).expanduser().resolve() if args.path else workspace
+        target = _expand(args.path) if args.path else workspace
         # A path outside -C would silently get none of its own .git-tidy.yaml
         # files, which is the opposite of what this command is for.
         if target != workspace and workspace not in target.parents:
