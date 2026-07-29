@@ -3169,7 +3169,6 @@ def summarise(report: Report, mode: str, printer: Printer, forced: bool = False)
 FORCE_CAN_FIX = (
     "branches with commits not in the trunk",
     "uncommitted changes — left on their branch",
-    "artefact directories holding a git repository",
 )
 
 
@@ -3210,7 +3209,7 @@ REASONS: tuple[tuple[str, str], ...] = (
     ("not in origin", "branches with commits not in the trunk"),
     ("commits not in", "branches with commits not in the trunk"),
     ("diverged", "diverged from upstream — needs a merge or rebase by hand"),
-    ("contains a git repository", "artefact directories holding a git repository"),
+    ("contains a git repository", "directories holding a git repository"),
     ("checked out in", "default branch checked out in another worktree"),
     ("ignored_keep", "ignored files kept as local state (.env, *.tfstate, keys)"),
     ("no such remote", "no remote configured"),
@@ -3885,10 +3884,16 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
 # protect committed content, local-only state like .env and *.tfstate, and files
 # that may hold the only copy of a credential — none of which this tool can put
 # back, and none of which anyone means when they say "force".
+# What --force is allowed to override. Deliberately not clean.regenerable: that
+# list is what turns off the guard against removing a directory with a git
+# repository inside it, and widening it to everything meant `--force` deleted a
+# vendored checkout and its unpushed commits — while the summary was offering
+# "--force does the ones it safely can". The repositories a workspace holds are
+# the one thing no flag here may take. The default list already covers the real
+# case, .terraform and its module clones.
 FORCE_OVERRIDES: dict[str, Any] = {
     "branches": {"require_merged": False},
     "sync": {"switch": "always", "stash": True},
-    "clean": {"regenerable": ["*"]},
 }
 
 

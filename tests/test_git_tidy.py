@@ -3306,3 +3306,40 @@ def test_a_bad_config_value_mid_run_still_leaves_a_report(workspace: Path, capsy
     assert any(a["kind"] == "remove" and a["applied"] for a in payload["actions"]), (
         "what was deleted before the failure is still reported"
     )
+
+
+def test_force_does_not_destroy_a_vendored_repository(workspace: Path):
+    """--force widens what may be deleted; it does not reach committed work.
+
+    Setting clean.regenerable to everything turned off the guard against
+    removing a directory with a repository inside it, so --force deleted a
+    vendored checkout and its unpushed commits — while the summary was offering
+    "--force does the ones it safely can".
+    """
+    repo = workspace / "repo"
+    vendored = repo / "node_modules" / "dep"
+    vendored.mkdir(parents=True)
+    git(vendored, "init", "-q", "-b", "main")
+    commit(vendored, "src.txt", "never pushed anywhere")
+    (workspace / ".git-tidy.yaml").write_text("clean:\n  dependencies: true\n", encoding="utf-8")
+
+    assert gt.main(["-C", str(workspace), "clean", "--apply", "--force"]) == 0
+    assert (vendored / ".git").is_dir()
+    assert (vendored / "src.txt").read_text(encoding="utf-8") == "never pushed anywhere"
+
+
+def test_force_overrides_do_not_touch_regenerable():
+    """The one guard no flag may lift."""
+    assert "clean" not in gt.FORCE_OVERRIDES
+    assert not any("git repository" in reason for reason in gt.FORCE_CAN_FIX)
+
+
+def test_a_tool_cache_is_still_reclaimable_without_force(workspace: Path):
+    """Removing the override must not cost the case it was meant for."""
+    repo = workspace / "repo"
+    cloned = repo / ".terraform" / "modules" / "vpc"
+    cloned.mkdir(parents=True)
+    git(cloned, "init", "-q", "-b", "main")
+
+    gt.clean_tree(repo, "repo", config(), run(), gt.Git(repo), None)
+    assert not (repo / ".terraform").exists()
