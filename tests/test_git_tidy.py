@@ -532,7 +532,10 @@ def test_sync_reports_a_repo_with_no_remote(tmp_path: Path):
     git(lonely, "init", "-q", "-b", "main")
     commit(lonely, "a.txt")
     actions = gt.sync_repo(lonely, "lonely", config(), run())
-    assert actions[0].detail == "no remote configured"
+    assert actions[0].detail == "nothing to fetch: no remote"
+    # doctor reports the repository itself; sync counting it too doubled every
+    # remote-less clone in the summary.
+    assert gt._reason_of(actions[0].detail) is None
 
 
 def test_sync_reports_a_missing_named_remote(workspace: Path):
@@ -4006,3 +4009,173 @@ def test_no_message_the_tool_can_produce_lands_in_other():
     assert messages, "the sweep found nothing, so it is not testing anything"
     uncategorised = [m for m in messages if gt._reason_of(m) == "other, see the lines marked -"]
     assert uncategorised == []
+
+
+# --------------------------------------------------------------------------- #
+# Claude review, round five
+# --------------------------------------------------------------------------- #
+
+
+def test_a_commit_on_no_branch_is_not_walked_away_from(workspace: Path):
+    """git warns on stderr and exits 0, so the warning was being discarded."""
+    repo = workspace / "repo"
+    git(repo, "checkout", "-q", "--detach")
+    commit(repo, "only-here.txt", "on no branch")
+    stranded = git(repo, "rev-parse", "HEAD")
+
+    actions = gt.sync_repo(repo, "repo", config(), run())
+    assert (repo / "only-here.txt").is_file()
+    assert git(repo, "rev-parse", "HEAD") == stranded
+    held = [a for a in actions if "on no branch" in a.detail]
+    assert held and held[0].skipped
+    assert gt._reason_of(held[0].detail) == "commits on a detached HEAD and no branch"
+
+
+def test_a_detached_head_on_a_branch_still_switches(workspace: Path):
+    """Detached at a commit a branch already reaches loses nothing."""
+    repo = workspace / "repo"
+    git(repo, "checkout", "-q", "--detach")
+    gt.sync_repo(repo, "repo", config(), run())
+    assert gt.current_branch(gt.Git(repo)) == "main"
+
+
+def test_a_bare_repository_is_a_repository(workspace: Path, tmp_path: Path):
+    """clone --bare leaves no .git entry, so every guard walked past it."""
+    bare = workspace / "backup.old"
+    git(workspace, "clone", "-q", "--bare", str(workspace / "repo"), "backup.old")
+    age(bare, 30)
+
+    assert gt.holds_git_data(bare)
+    assert not gt.is_repo(bare), "it is not a checkout, but it is still a repository"
+
+    cfg = config(trash={"enabled": True, "dirs": True, "quarantine": False, "min_age_days": 7})
+    actions = gt.sweep_trash(workspace, cfg, run(), _holding(workspace), [])
+    assert (bare / "objects").is_dir(), "the only copy of those commits"
+    # Excluded when candidates are chosen, as every other repository is, so it
+    # never becomes an action at all.
+    assert not [a for a in actions if "backup.old" in a.target]
+
+
+def test_a_bare_repository_inside_an_artefact_directory_survives(workspace: Path):
+    repo = workspace / "repo"
+    buried = repo / "node_modules" / "mirror"
+    buried.mkdir(parents=True)
+    git(repo / "node_modules", "clone", "-q", "--bare", str(repo), "mirror")
+
+    cfg = config(clean={"dependencies": True})
+    actions = gt.clean_tree(repo, "repo", cfg, run(), gt.Git(repo), None)
+    assert (buried / "objects").is_dir()
+    assert any(a.skipped and "git repository" in a.detail for a in actions)
+
+
+def test_doctor_reports_a_detached_head_without_a_remote(tmp_path: Path):
+    """A repository with no remote is where an unpushed commit matters most."""
+    lonely = tmp_path / "lonely"
+    lonely.mkdir()
+    git(lonely, "init", "-q", "-b", "main")
+    commit(lonely, "a.txt")
+    git(lonely, "checkout", "-q", "--detach")
+
+    actions = gt.doctor_repo(lonely, "lonely", config())
+    assert any("detached" in a.detail for a in actions)
+    assert any("no remote" in a.detail for a in actions)
+
+
+def test_doctor_does_not_report_a_detached_head_twice(workspace: Path):
+    repo = workspace / "repo"
+    git(repo, "checkout", "-q", "--detach")
+    actions = gt.doctor_repo(repo, "repo", config())
+    assert len([a for a in actions if "detached" in a.detail]) == 1
+
+
+def test_each_keep_rule_says_which_rule_it_was(workspace: Path):
+    """Pointing at ignored_keep for something node_modules kept is a dead end."""
+    repo = workspace / "repo"
+    (repo / ".gitignore").write_text("node_modules/\ndist/\n.env\n", encoding="utf-8")
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-q", "-m", "ignore")
+    for name in ("node_modules", "dist"):
+        (repo / name).mkdir()
+        (repo / name / "x").write_text("x", encoding="utf-8")
+    (repo / ".env").write_text("SECRET", encoding="utf-8")
+
+    actions = gt.clean_ignored(
+        repo, "repo", config(clean={"ignored": True}), run(), None, gt.Git(repo)
+    )
+    by_target = {a.target: a.detail for a in actions}
+    assert by_target[".env"] == "kept by ignored_keep"
+    assert "dependency tree" in by_target["node_modules"]
+    assert "build output" in by_target["dist"]
+    assert (
+        gt._reason_of(by_target["node_modules"]) == "dependency trees — clean.dependencies is off"
+    )
+
+
+def test_clean_ignored_does_not_shield_a_path_from_clean_dirs(workspace: Path):
+    """Turning it on made the tool clean less, and blamed ignored_keep for it."""
+    repo = workspace / "repo"
+    (repo / ".gitignore").write_text("build/\n", encoding="utf-8")
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-q", "-m", "ignore build")
+    (repo / "build").mkdir()
+    (repo / "build" / "out.bin").write_bytes(b"0" * 8)
+
+    (workspace / ".git-tidy.yaml").write_text(
+        'clean:\n  ignored: true\n  extra_dirs: ["build"]\n', encoding="utf-8"
+    )
+    gt.main(["-C", str(workspace), "clean", "--apply"])
+    assert not (repo / "build").exists(), "clean.dirs still names it"
+
+
+def test_a_dependency_name_in_clean_dirs_is_honoured(workspace: Path):
+    repo = workspace / "repo"
+    (repo / "node_modules").mkdir()
+    (repo / "node_modules" / "x").write_text("x", encoding="utf-8")
+
+    cfg = config(clean={"extra_dirs": ["node_modules"]})
+    actions = gt.clean_tree(repo, "repo", cfg, run(), gt.Git(repo), None)
+    assert any(a.target == "node_modules" and a.applied for a in actions)
+
+
+def test_declining_is_reported_as_declining(workspace: Path):
+    """ "declined: switch from detached HEAD" is about the answer, not the HEAD."""
+    assert gt._reason_of("declined: switch from detached HEAD") == "declined at the prompt"
+    assert gt._reason_of("detached at abc1234") == "detached HEAD"
+
+
+def test_a_remote_less_repository_is_counted_once(tmp_path: Path, capsys):
+    lonely = tmp_path / "space" / "lonely"
+    lonely.mkdir(parents=True)
+    git(lonely, "init", "-q", "-b", "main")
+    commit(lonely, "a.txt")
+
+    gt.main(["-C", str(tmp_path / "space"), "run"])
+    out = capsys.readouterr().out
+    assert "1  no remote configured" in out
+    assert "2  no remote configured" not in out
+
+
+def test_config_merges_everything_above_the_path(tmp_path: Path, capsys):
+    outer = tmp_path / "outer"
+    (outer / "b" / "c").mkdir(parents=True)
+    (outer / ".git-tidy.yaml").write_text("jobs: 7\nclean:\n  ignored: true\n", encoding="utf-8")
+    (outer / "b" / ".git-tidy.yaml").write_text("clean:\n  builds: true\n", encoding="utf-8")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+
+    gt.main(["-C", str(elsewhere), "config", str(outer / "b" / "c")])
+    merged = json.loads(capsys.readouterr().out)
+    assert merged["jobs"] == 7, "the config two levels up still counts"
+    assert merged["clean"]["ignored"] is True
+    assert merged["clean"]["builds"] is True
+
+
+def test_config_can_be_asked_from_inside_a_repository(workspace: Path, capsys):
+    """It reads nothing and writes nothing; the checkout is where people ask."""
+    assert gt.main(["-C", str(workspace / "repo"), "config"]) == 0
+    assert json.loads(capsys.readouterr().out)["jobs"] == gt.DEFAULTS["jobs"]
+
+
+def test_a_home_that_does_not_exist_is_a_message_not_a_traceback():
+    with pytest.raises(gt.Failure, match="cannot work out what"):
+        gt.resolve_workspace("~nosuchuser-git-tidy/git")
