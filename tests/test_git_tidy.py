@@ -3343,3 +3343,17 @@ def test_a_tool_cache_is_still_reclaimable_without_force(workspace: Path):
 
     gt.clean_tree(repo, "repo", config(), run(), gt.Git(repo), None)
     assert not (repo / ".terraform").exists()
+
+
+def test_a_forced_prune_without_a_fetch_says_what_to_do(workspace: Path, remote: Path):
+    """ "other, see the lines marked -" is not an answer anybody can act on."""
+    repo = workspace / "repo"
+    make_gone_branch(repo, remote, "feature", extra_commit=True)
+
+    cfg = config(branches={"require_merged": False})
+    actions = gt.prune_branches(repo, "repo", cfg, run(), fetched=False)
+    assert actions and actions[0].skipped
+    assert "run --force" in actions[0].detail
+    assert gt._reason_of(actions[0].detail) == (
+        "unmerged branches waiting on a fetch — use `run --force`"
+    )

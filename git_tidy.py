@@ -1905,7 +1905,10 @@ def _why_keep(
         # deletion is the [gone] mark — a cached observation. If it predates this
         # run the branch may have been recreated upstream since, and its commits
         # exist nowhere else.
-        return "kept: needs a fetch in this run before deleting unmerged work"
+        return (
+            "kept: deleting unmerged work needs a fetch in this run — "
+            "use `git-tidy run --force`, not `prune` on its own"
+        )
     return None
 
 
@@ -3206,6 +3209,7 @@ NOT_HELD_BACK = (
 )
 REASONS: tuple[tuple[str, str], ...] = (
     ("uncommitted changes", "uncommitted changes — left on their branch"),
+    ("needs a fetch in this run", "unmerged branches waiting on a fetch — use `run --force`"),
     ("not in origin", "branches with commits not in the trunk"),
     ("commits not in", "branches with commits not in the trunk"),
     ("diverged", "diverged from upstream — needs a merge or rebase by hand"),
