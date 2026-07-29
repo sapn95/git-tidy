@@ -820,16 +820,16 @@ def test_clean_dry_run_removes_nothing(workspace: Path):
 
 def test_clean_ignored_removes_what_gitignore_covers(workspace: Path):
     repo = workspace / "repo"
-    (repo / ".gitignore").write_text("build/\n*.log\n", encoding="utf-8")
+    (repo / ".gitignore").write_text("generated/\n*.log\n", encoding="utf-8")
     git(repo, "add", ".gitignore")
     git(repo, "commit", "-q", "-m", "ignore")
-    (repo / "build").mkdir()
-    (repo / "build" / "out.bin").write_bytes(b"0" * 100)
+    (repo / "generated").mkdir()
+    (repo / "generated" / "out.bin").write_bytes(b"0" * 100)
     (repo / "debug.log").write_text("noise", encoding="utf-8")
     (repo / "src.txt").write_text("kept", encoding="utf-8")
 
     gt.clean_ignored(repo, "repo", config(), run(), None, gt.Git(repo))
-    assert not (repo / "build").exists()
+    assert not (repo / "generated").exists()
     assert not (repo / "debug.log").exists()
     assert (repo / "src.txt").exists()
 
@@ -1631,13 +1631,13 @@ def test_declining_a_switch_does_not_stash_anyway(workspace: Path):
 def test_clean_ignored_protects_a_key_buried_in_an_ignored_directory(workspace: Path):
     """git hands back one entry for a wholly ignored directory."""
     repo = workspace / "repo"
-    (repo / ".gitignore").write_text("build/\n", encoding="utf-8")
+    (repo / ".gitignore").write_text("generated/\n", encoding="utf-8")
     git(repo, "add", ".gitignore")
-    git(repo, "commit", "-q", "-m", "ignore build")
-    deep = repo / "build" / "config"
+    git(repo, "commit", "-q", "-m", "ignore generated")
+    deep = repo / "generated" / "config"
     deep.mkdir(parents=True)
     (deep / "server.pem").write_text("PRIVATE KEY", encoding="utf-8")
-    (repo / "build" / "out.bin").write_bytes(b"0" * 64)
+    (repo / "generated" / "out.bin").write_bytes(b"0" * 64)
 
     actions = gt.clean_ignored(repo, "repo", config(), run(), None, gt.Git(repo))
     assert (deep / "server.pem").is_file(), "the key must survive its parent"
@@ -1646,14 +1646,14 @@ def test_clean_ignored_protects_a_key_buried_in_an_ignored_directory(workspace: 
 
 def test_clean_ignored_still_removes_a_directory_with_nothing_protected(workspace: Path):
     repo = workspace / "repo"
-    (repo / ".gitignore").write_text("build/\n", encoding="utf-8")
+    (repo / ".gitignore").write_text("generated/\n", encoding="utf-8")
     git(repo, "add", ".gitignore")
-    git(repo, "commit", "-q", "-m", "ignore build")
-    (repo / "build" / "sub").mkdir(parents=True)
-    (repo / "build" / "sub" / "out.bin").write_bytes(b"0" * 64)
+    git(repo, "commit", "-q", "-m", "ignore generated")
+    (repo / "generated" / "sub").mkdir(parents=True)
+    (repo / "generated" / "sub" / "out.bin").write_bytes(b"0" * 64)
 
     gt.clean_ignored(repo, "repo", config(), run(), None, gt.Git(repo))
-    assert not (repo / "build").exists()
+    assert not (repo / "generated").exists()
 
 
 def test_a_workspace_that_is_itself_a_repository_is_refused(workspace: Path):
@@ -1786,14 +1786,14 @@ def test_fetch_freshness_is_per_repository(workspace: Path, remote: Path, capsys
 
 def test_ignored_keep_matches_a_relative_pattern_too(workspace: Path):
     repo = workspace / "repo"
-    (repo / ".gitignore").write_text("build/\n", encoding="utf-8")
+    (repo / ".gitignore").write_text("generated/\n", encoding="utf-8")
     git(repo, "add", ".gitignore")
-    git(repo, "commit", "-q", "-m", "ignore build")
-    deep = repo / "build" / "config"
+    git(repo, "commit", "-q", "-m", "ignore generated")
+    deep = repo / "generated" / "config"
     deep.mkdir(parents=True)
     (deep / "server.crt").write_text("CERT", encoding="utf-8")
 
-    cfg = config(clean={"ignored_keep": ["build/config/*.crt"]})
+    cfg = config(clean={"ignored_keep": ["generated/config/*.crt"]})
     actions = gt.clean_ignored(repo, "repo", cfg, run(), None, gt.Git(repo))
     assert (deep / "server.crt").is_file()
     assert actions and actions[0].skipped
@@ -3836,3 +3836,128 @@ def test_the_summary_does_not_count_a_stash_that_never_happened(
     out = capsys.readouterr().out
     assert "stashed and switched" not in out
     assert "branches switched" in out
+
+
+# --------------------------------------------------------------------------- #
+# Claude review, round four
+# --------------------------------------------------------------------------- #
+
+
+def test_a_tag_of_the_same_name_does_not_shadow_the_branch(
+    workspace: Path, remote: Path, tmp_path: Path
+):
+    """git shortens refs/heads/main to "heads/main" once refs/tags/main exists."""
+    git(tmp_path, "clone", "-q", str(remote), "other")
+    commit(tmp_path / "other", "theirs.txt")
+    git(tmp_path / "other", "push", "-q")
+
+    repo = workspace / "repo"
+    git(repo, "tag", "main")
+
+    assert gt.current_branch(gt.Git(repo)) == "main"
+    assert [b.name for b in gt.list_branches(gt.Git(repo))] == ["main"]
+
+    gt.sync_repo(repo, "repo", config(), run())
+    assert (repo / "theirs.txt").is_file(), "it was fast-forwarded, not merely 'switched'"
+
+
+def test_a_tag_of_the_same_name_does_not_defeat_branches_keep(workspace: Path, remote: Path):
+    repo = workspace / "repo"
+    make_gone_branch(repo, remote, "release/1.0")
+    git(repo, "tag", "release/1.0")
+
+    actions = gt.prune_branches(repo, "repo", config(), run(), fetched=True)
+    assert actions == [], "keep still protects it"
+    # %(refname), not the short form — which is exactly the trap being tested.
+    assert "refs/heads/release/1.0" in git(repo, "branch", "--format=%(refname)").split()
+
+
+def test_a_default_sweep_is_counted(workspace: Path, capsys):
+    """trash.quarantine defaults to true, so this is the ordinary case."""
+    for name in ("aaaaaaaaaa.log", "qwrtplkjhgf.txt"):
+        junk = workspace / name
+        junk.write_text("x", encoding="utf-8")
+        age(junk, 30)
+    (workspace / ".git-tidy.yaml").write_text("trash:\n  enabled: true\n", encoding="utf-8")
+
+    gt.main(["-C", str(workspace), "trash", "--apply"])
+    assert "loose files quarantined" in capsys.readouterr().out
+
+
+def test_quiet_prints_the_summary_it_promises(workspace: Path, capsys):
+    """--quiet says "only print the summary", and printed nothing at all."""
+    junk = workspace / "lalalalala.log"
+    junk.write_text("x", encoding="utf-8")
+    age(junk, 30)
+    (workspace / ".git-tidy.yaml").write_text("trash:\n  enabled: true\n", encoding="utf-8")
+
+    gt.main(["-C", str(workspace), "trash", "--apply", "-q"])
+    out = capsys.readouterr().out
+    assert "Summary" in out
+    assert "lalalalala.log" not in out, "and only the summary"
+
+
+def test_clean_ignored_leaves_dependency_and_build_trees(workspace: Path):
+    """.gitignore covers node_modules in nearly every repository."""
+    repo = workspace / "repo"
+    (repo / ".gitignore").write_text("node_modules/\nbuild/\n", encoding="utf-8")
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-q", "-m", "ignore")
+    for name in ("node_modules", "build"):
+        (repo / name).mkdir()
+        (repo / name / "x.bin").write_bytes(b"0" * 16)
+
+    cfg = config(clean={"ignored": True})
+    gt.clean_ignored(repo, "repo", cfg, run(), None, gt.Git(repo))
+    assert (repo / "node_modules" / "x.bin").is_file()
+    assert (repo / "build" / "x.bin").is_file()
+
+    on = config(clean={"ignored": True, "dependencies": True, "builds": True})
+    gt.clean_ignored(repo, "repo", on, run(), None, gt.Git(repo))
+    assert not (repo / "node_modules").exists()
+    assert not (repo / "build").exists()
+
+
+def test_a_rebase_that_stashed_nothing_is_not_counted_as_one(
+    workspace: Path, remote: Path, tmp_path: Path
+):
+    repo = submodule_repo(workspace, tmp_path)
+    git(tmp_path, "clone", "-q", str(remote), "other")
+    commit(tmp_path / "other", "theirs.txt")
+    git(tmp_path / "other", "push", "-q")
+    commit(repo, "mine.txt")
+    git(repo, "fetch", "-q", "origin")
+
+    cfg = config(sync={"diverged": "rebase", "stash": True})
+    actions = gt._diverged(
+        gt.Git(repo), "repo", "main", "origin/main", "1", "1", cfg["sync"], run()
+    )
+    done = [a for a in actions if a.applied]
+    assert done and done[0].kind == "rebase", "no stash was made, so not stash+rebase"
+    assert "git stash pop" not in done[0].detail
+
+
+def test_a_torn_record_is_not_deleted_after_being_reported_as_kept(workspace: Path):
+    """restore said "left in the quarantine" and then removed the directory."""
+    for name in ("a.log", "torn.log"):
+        (workspace / name).write_text(name, encoding="utf-8")
+    holding = gt.Quarantine(workspace / gt.QUARANTINE_DIRNAME, workspace, stamp="stamp")
+    holding.take(workspace / "a.log")
+    holding.take(workspace / "torn.log")
+    stamp = workspace / gt.QUARANTINE_DIRNAME / "stamp"
+    # Only the first record survives the kill; the second line is half written.
+    lines = (stamp / gt.JOURNAL_NAME).read_text(encoding="utf-8").splitlines()
+    (stamp / gt.JOURNAL_NAME).write_text(lines[0] + '\n{"from": "/half', encoding="utf-8")
+
+    actions = gt.restore(workspace / gt.QUARANTINE_DIRNAME, "stamp", run())
+    assert any("unreadable" in a.detail for a in actions)
+    assert (stamp / gt.CONTENT_DIRNAME / "torn.log").is_file(), "left, as it was reported"
+
+
+def test_a_byte_order_mark_does_not_change_what_a_config_means(tmp_path: Path):
+    """An editor on Windows writes it; PyYAML strips it; this did not."""
+    yaml = pytest.importorskip("yaml")
+    text = "﻿jobs: 4\n"
+    assert gt._parse_yaml_subset(text, "<t>") == yaml.safe_load(text)
+    (tmp_path / ".git-tidy.yaml").write_text(text, encoding="utf-8")
+    assert gt.ConfigResolver(tmp_path).for_path(tmp_path)["jobs"] == 4

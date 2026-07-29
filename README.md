@@ -85,16 +85,20 @@ trunk. git-tidy therefore keeps those branches and tells you why. That is
 deliberate: the alternative is guessing that content which merely looks similar
 is the same work, and guessing wrong here deletes commits.
 
-If your team squash-merges everything, the honest way to clear them out is to
-look at them:
+If your team squash-merges everything, the way to clear them out is
+`branches.require_merged: false`, or the `--force` that turns it on. That skips
+the containment test, so it is the one setting here that can lose work.
+
+It also only takes effect where a fetch succeeded in the same run — the `[gone]`
+mark is a cached observation, and one from last week is not evidence the branch
+is still gone. `prune` on its own does not fetch, so use `run`:
 
 ```bash
-git-tidy prune --ask                       # decide branch by branch
+git-tidy run --force --ask     # fetches, then asks about each unmerged branch
 ```
 
-`branches.require_merged: false` skips the containment test altogether. It is the
-one setting in this tool that can lose work, so pair it with `--ask` rather than
-`--apply` until you trust what it selects.
+`prune --ask` will not offer them: a branch the containment test keeps is
+reported, not proposed, so there is nothing to answer.
 
 ### clean
 
@@ -109,7 +113,9 @@ Two mechanisms, and the first is usually all you need:
   `.scannerwork`, `*.pyc`, `.coverage`, and so on.
 
 Dependency trees (`node_modules`, `.venv`, `vendor`) and build directories
-(`dist`, `build`, `target`) are **off by default** — the first are expensive to
+(`dist`, `build`, `target`) are **off by default** — including under
+`clean.ignored`, which would otherwise take them, since `.gitignore` covers them
+in practically every repository. They are — the first are expensive to
 restore without a network, and the second are also perfectly ordinary source
 directory names. Turn them on with `clean.dependencies` and `clean.builds`.
 
@@ -125,7 +131,9 @@ It looks for loose files in the workspace — not inside repositories — that a
 - older than `trash.min_age_days` (7 by default), **and**
 - match a configured glob, or one of the heuristics: `mash` (keyboard-mash names
   like `asjfoisjdgipfdspigfjdpi.txt` or `lalalalala.log`), `empty` (zero bytes),
-  `temp` (`*~`, `*.swp`, `*.orig`, `*.rej`, `*.bak`).
+  `temp` (`*~`, `*.swp`, `*.swo`, `*.orig`, `*.rej`, `*.bak`, `*.tmp`, `*.old` —
+  note the last two: a `project.old/` somebody parked is swept whole, to
+  quarantine).
 
 Everything swept is **moved to a quarantine**, not deleted, with a manifest:
 
