@@ -132,9 +132,9 @@ It looks for loose files in the workspace — not inside repositories — that a
 - older than `trash.min_age_days` (7 by default), **and**
 - match a configured glob, or one of the heuristics: `mash` (keyboard-mash names
   like `asjfoisjdgipfdspigfjdpi.txt` or `lalalalala.log`), `empty` (zero bytes),
-  `temp` (`*~`, `*.swp`, `*.swo`, `*.orig`, `*.rej`, `*.bak`, `*.tmp`, `*.old` —
-  note the last two: a `project.old/` somebody parked is swept whole, to
-  quarantine).
+  `temp` (`*~`, `*.swp`, `*.swo`, `*.orig`, `*.rej`, `*.bak`, `*.tmp`, `*.old`).
+  Note the last two: with `trash.dirs: true`, which is off by default, a
+  `project.old/` somebody parked is swept whole — to quarantine.
 
 Everything swept is **moved to a quarantine**, not deleted, with a manifest:
 
