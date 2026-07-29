@@ -634,7 +634,8 @@ def test_prune_keeps_a_gone_branch_with_unpushed_commits(workspace: Path, remote
 def test_prune_deletes_unmerged_when_told_to(workspace: Path, remote: Path):
     repo = workspace / "repo"
     make_gone_branch(repo, remote, "feature", extra_commit=True)
-    actions = gt.prune_branches(repo, "repo", config(branches={"require_merged": False}), run())
+    cfg = config(branches={"require_merged": False})
+    actions = gt.prune_branches(repo, "repo", cfg, run(), fetched=True)
     assert any(a.applied for a in actions)
 
 
@@ -1014,7 +1015,7 @@ def test_force_stashes_instead_of_discarding(workspace: Path, remote: Path, tmp_
     actions = gt.sync_repo(repo, "repo", forced, run())
 
     assert gt.current_branch(gt.Git(repo)) == "main", "the switch happened"
-    assert any(a.kind == "stash" and a.applied for a in actions)
+    assert any(a.kind == "stash+switch" and a.applied for a in actions)
     assert not any(a.error for a in actions)
     # The work is not gone, it is one `git stash pop` away.
     assert "git-tidy: repo" in git(repo, "stash", "list")
@@ -1105,6 +1106,7 @@ def test_expire_removes_old_quarantines(workspace: Path):
     old = root / "old"
     old.mkdir(parents=True)
     (old / "x").write_text("x", encoding="utf-8")
+    (old / gt.MANIFEST_NAME).write_text('{"entries": []}', encoding="utf-8")
     long_ago = time.time() - 60 * 86400
     os.utime(old, (long_ago, long_ago))
 
@@ -1556,7 +1558,7 @@ def test_diverged_can_be_rebased(workspace: Path, remote: Path, tmp_path: Path):
     commit(repo, "mine.txt")
 
     actions = gt.sync_repo(repo, "repo", config(sync={"diverged": "rebase"}), run())
-    assert any(a.kind == "update" and a.applied for a in actions)
+    assert any(a.kind == "rebase" and a.applied for a in actions)
     assert (repo / "theirs.txt").exists(), "their commit arrived"
     assert (repo / "mine.txt").exists(), "and mine is still on top"
     assert git(repo, "rev-list", "--count", "HEAD") == "3"
@@ -1595,3 +1597,1503 @@ def test_init_dry_run_writes_the_plain_template(tmp_path: Path):
     target = tmp_path / ".git-tidy.yaml"
     gt.cmd_init(target, gt.DRY, force=False, printer=quiet_printer())
     assert gt._parse_yaml_subset(target.read_text(encoding="utf-8"), "<init>") is None
+
+
+# --------------------------------------------------------------------------- #
+# Round one of review: the ways this could still have lost something
+# --------------------------------------------------------------------------- #
+
+
+def test_declining_a_switch_does_not_stash_anyway(workspace: Path):
+    """Consent comes before the stash, or --ask means nothing."""
+    repo = workspace / "repo"
+    git(repo, "switch", "-q", "-c", "side")
+    (repo / "README.md").write_text("work in progress\n", encoding="utf-8")
+
+    decider = gt.Decider(gt.ASK, stream=io.StringIO(), prompt_input=lambda _: "n")
+    forced = gt._merge(gt.DEFAULTS, gt.FORCE_OVERRIDES, "force")
+    gt.sync_repo(repo, "repo", forced, decider)
+
+    assert git(repo, "stash", "list") == "", "declining must leave the worktree alone"
+    assert (repo / "README.md").read_text(encoding="utf-8") == "work in progress\n"
+    assert gt.current_branch(gt.Git(repo)) == "side"
+
+
+def test_clean_ignored_protects_a_key_buried_in_an_ignored_directory(workspace: Path):
+    """git hands back one entry for a wholly ignored directory."""
+    repo = workspace / "repo"
+    (repo / ".gitignore").write_text("build/\n", encoding="utf-8")
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-q", "-m", "ignore build")
+    deep = repo / "build" / "config"
+    deep.mkdir(parents=True)
+    (deep / "server.pem").write_text("PRIVATE KEY", encoding="utf-8")
+    (repo / "build" / "out.bin").write_bytes(b"0" * 64)
+
+    actions = gt.clean_ignored(repo, "repo", config(), run(), None, gt.Git(repo))
+    assert (deep / "server.pem").is_file(), "the key must survive its parent"
+    assert actions and actions[0].skipped and "server.pem" in actions[0].detail
+
+
+def test_clean_ignored_still_removes_a_directory_with_nothing_protected(workspace: Path):
+    repo = workspace / "repo"
+    (repo / ".gitignore").write_text("build/\n", encoding="utf-8")
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-q", "-m", "ignore build")
+    (repo / "build" / "sub").mkdir(parents=True)
+    (repo / "build" / "sub" / "out.bin").write_bytes(b"0" * 64)
+
+    gt.clean_ignored(repo, "repo", config(), run(), None, gt.Git(repo))
+    assert not (repo / "build").exists()
+
+
+def test_a_workspace_that_is_itself_a_repository_is_refused(workspace: Path):
+    """Its own tracked files would be cleaned as if they belonged to nobody."""
+    with pytest.raises(gt.Failure, match="itself a git repository"):
+        gt.resolve_workspace(str(workspace / "repo"))
+
+
+def test_a_dry_run_does_not_write_refs(workspace: Path):
+    """`remote set-head --auto` writes a ref and goes to the network."""
+    repo = workspace / "repo"
+    git(repo, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD")
+    assert gt.default_branch(gt.Git(repo), config()["sync"], readonly=True) == "main"
+    # Resolved from the refs that exist, without recreating the one just removed.
+    assert gt._cached_head(gt.Git(repo), "origin") is None
+
+
+def test_unmerged_branches_are_not_deleted_on_stale_information(workspace: Path, remote: Path):
+    """require_merged off removes the only other check, so the [gone] must be fresh."""
+    repo = workspace / "repo"
+    make_gone_branch(repo, remote, "feature", extra_commit=True)
+    cfg = config(branches={"require_merged": False})
+
+    actions = gt.prune_branches(repo, "repo", cfg, run(), fetched=False)
+    assert "feature" in git(repo, "branch", "--format=%(refname:short)").split()
+    assert actions and "needs a fetch" in actions[0].detail
+
+    actions = gt.prune_branches(repo, "repo", cfg, run(), fetched=True)
+    assert any(a.applied for a in actions)
+
+
+def test_a_merged_check_uses_git_own_verification(workspace: Path, remote: Path):
+    """--delete without --force makes git re-check containment as it deletes."""
+    repo = workspace / "repo"
+    make_gone_branch(repo, remote, "feature")
+    actions = gt.prune_branches(repo, "repo", config(), run(), fetched=True)
+    assert any(a.applied for a in actions)
+    assert "feature" not in git(repo, "branch", "--format=%(refname:short)").split()
+
+
+def test_a_killed_sweep_is_still_restorable(workspace: Path):
+    """The journal is written as files move, so a crash leaves a usable record."""
+    repo = workspace / "repo"
+    (repo / "__pycache__").mkdir()
+    (repo / "__pycache__" / "m.pyc").write_text("x", encoding="utf-8")
+    holding = gt.Quarantine(workspace / gt.QUARANTINE_DIRNAME, workspace, stamp="stamp")
+
+    gt.clean_tree(repo, "repo", config(), run(), gt.Git(repo), holding)
+    stamp_dir = workspace / gt.QUARANTINE_DIRNAME / "stamp"
+    assert (stamp_dir / gt.JOURNAL_NAME).is_file(), "written during the sweep"
+    assert not (stamp_dir / gt.MANIFEST_NAME).exists(), "the manifest comes at the end"
+
+    # Nothing folded the journal into a manifest — as after a kill — and restore
+    # still puts everything back.
+    actions = gt.restore(workspace / gt.QUARANTINE_DIRNAME, "stamp", run())
+    assert actions and all(a.applied for a in actions)
+    assert (repo / "__pycache__" / "m.pyc").is_file()
+
+
+def test_the_journal_is_appended_not_rewritten(workspace: Path):
+    """Rewriting it per file would serialise the whole run on one lock."""
+    repo = workspace / "repo"
+    for name in ("a", "b", "c"):
+        cache = repo / name / "__pycache__"
+        cache.mkdir(parents=True)
+        (cache / "m.pyc").write_text(name, encoding="utf-8")
+    holding = gt.Quarantine(workspace / gt.QUARANTINE_DIRNAME, workspace, stamp="stamp")
+
+    gt.clean_tree(repo, "repo", config(), run(), gt.Git(repo), holding)
+    lines = (
+        (workspace / gt.QUARANTINE_DIRNAME / "stamp" / gt.JOURNAL_NAME)
+        .read_text(encoding="utf-8")
+        .splitlines()
+    )
+    assert len(lines) == 3, "one line per move, not one rewrite per move"
+    assert all(json.loads(line)["from"] for line in lines)
+
+
+def test_restore_refuses_a_manifest_pointing_outside_the_workspace(workspace: Path, tmp_path: Path):
+    root = workspace / gt.QUARANTINE_DIRNAME / "stamp"
+    root.mkdir(parents=True)
+    (root / "loot").write_text("x", encoding="utf-8")
+    (root / gt.MANIFEST_NAME).write_text(
+        json.dumps(
+            {
+                "workspace": str(workspace),
+                "entries": [{"to": str(root / "loot"), "from": str(tmp_path / "elsewhere.txt")}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    actions = gt.restore(workspace / gt.QUARANTINE_DIRNAME, "stamp", run())
+    assert actions[0].error and "outside the workspace" in actions[0].error
+    assert not (tmp_path / "elsewhere.txt").exists()
+
+
+def test_declining_a_fast_forward_does_not_stash_anyway(
+    workspace: Path, remote: Path, tmp_path: Path
+):
+    """The same consent rule as the switch, on the fast-forward path."""
+    git(tmp_path, "clone", "-q", str(remote), "other")
+    commit(tmp_path / "other", "theirs.txt")
+    git(tmp_path / "other", "push", "-q")
+
+    repo = workspace / "repo"
+    git(repo, "fetch", "-q", "origin")
+    (repo / "README.md").write_text("work in progress\n", encoding="utf-8")
+
+    decider = gt.Decider(gt.ASK, stream=io.StringIO(), prompt_input=lambda _: "n")
+    gt.sync_repo(repo, "repo", gt._merge(gt.DEFAULTS, gt.FORCE_OVERRIDES, "force"), decider)
+
+    assert git(repo, "stash", "list") == ""
+    assert (repo / "README.md").read_text(encoding="utf-8") == "work in progress\n"
+
+
+def test_fetch_freshness_is_per_repository(workspace: Path, remote: Path, capsys):
+    """One repository's fetch must not vouch for another's [gone] marks."""
+    git(workspace, "clone", "-q", str(remote), "second")
+    repo = workspace / "repo"
+    make_gone_branch(repo, remote, "feature", extra_commit=True)
+    # repo cannot fetch; second can.
+    git(repo, "remote", "set-url", "origin", str(workspace / "gone.git"))
+    (workspace / ".git-tidy.yaml").write_text(
+        "branches:\n  require_merged: false\n", encoding="utf-8"
+    )
+
+    gt.main(["-C", str(workspace), "run", "--apply"])
+    assert "feature" in git(repo, "branch", "--format=%(refname:short)").split()
+
+
+def test_ignored_keep_matches_a_relative_pattern_too(workspace: Path):
+    repo = workspace / "repo"
+    (repo / ".gitignore").write_text("build/\n", encoding="utf-8")
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-q", "-m", "ignore build")
+    deep = repo / "build" / "config"
+    deep.mkdir(parents=True)
+    (deep / "server.crt").write_text("CERT", encoding="utf-8")
+
+    cfg = config(clean={"ignored_keep": ["build/config/*.crt"]})
+    actions = gt.clean_ignored(repo, "repo", cfg, run(), None, gt.Git(repo))
+    assert (deep / "server.crt").is_file()
+    assert actions and actions[0].skipped
+
+
+def test_a_workspace_inside_a_repository_keeps_its_tracked_files(tmp_path: Path):
+    """Nothing below the workspace claims them, but they are still committed."""
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    git(outer, "init", "-q", "-b", "main")
+    space = outer / "space"
+    (space / "dist").mkdir(parents=True)
+    (space / "dist" / "committed.txt").write_text("real content", encoding="utf-8")
+    (space / "__pycache__").mkdir()
+    git(outer, "add", "-A")
+    git(outer, "commit", "-q", "-m", "track the workspace")
+
+    (space / ".git-tidy.yaml").write_text("clean:\n  builds: true\n", encoding="utf-8")
+    gt.main(["-C", str(space), "clean", "--apply"])
+    assert (space / "dist" / "committed.txt").is_file(), "tracked, even from outside"
+    assert not (space / "__pycache__").exists(), "untracked artefacts still go"
+
+
+def test_enclosing_repo(tmp_path: Path):
+    outer = tmp_path / "outer"
+    (outer / "space").mkdir(parents=True)
+    git(outer, "init", "-q", "-b", "main")
+    assert gt.enclosing_repo(outer / "space") == outer
+    assert gt.enclosing_repo(tmp_path) is None
+
+
+# --------------------------------------------------------------------------- #
+# Round three of review
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "overlay,message",
+    [
+        ({"clean": {"enabled": "false"}}, "takes bool"),
+        ({"clean": {"tracked": "no"}}, "takes bool"),
+        ({"jobs": "8"}, "takes int"),
+        ({"sync": {"remote": 4}}, "takes str"),
+    ],
+)
+def test_a_scalar_of_the_wrong_type_is_refused(overlay, message):
+    """`enabled: "false"` is a non-empty string, and a non-empty string is true."""
+    with pytest.raises(gt.Failure, match=message):
+        gt._merge(gt.DEFAULTS, overlay, "test")
+
+
+def test_single_quoted_apostrophes_match_pyyaml():
+    yaml = pytest.importorskip("yaml")
+    text = "branches:\n  keep:\n    - 'team''s/*'\n"
+    assert gt._parse_yaml_subset(text, "<test>") == yaml.safe_load(text)
+    assert gt._parse_yaml_subset(text, "<test>")["branches"]["keep"] == ["team's/*"]
+
+
+def test_an_unknown_worktrees_mode_is_refused(workspace: Path):
+    repo = workspace / "repo"
+    git(repo, "switch", "-q", "-c", "side")
+    with pytest.raises(gt.Failure, match=r"sync\.worktrees"):
+        gt.sync_repo(repo, "repo", config(sync={"worktrees": "skpi"}), run())
+
+
+def test_all_of_these_does_not_leak_consent_into_stashing(workspace: Path):
+    """Answering 'a' to plain switches must not agree to stash somebody's work."""
+    plain = gt.Action("switch", "a", "main", "switch from side")
+    stashing = gt.Action("stash+switch", "b", "main", "stash and switch from side")
+    replies = iter(["a", "n"])
+    decider = gt.Decider(gt.ASK, stream=io.StringIO(), prompt_input=lambda _: next(replies))
+
+    assert decider.allow(plain) is True
+    assert decider.allow(stashing) is False, "a different question gets asked again"
+
+
+def test_expire_leaves_anything_that_is_not_a_quarantine(workspace: Path):
+    root = workspace / gt.QUARANTINE_DIRNAME
+    stranger = root / "someone-elses-directory"
+    stranger.mkdir(parents=True)
+    (stranger / "important.txt").write_text("not ours", encoding="utf-8")
+    long_ago = time.time() - 60 * 86400
+    os.utime(stranger, (long_ago, long_ago))
+
+    actions = gt.expire_quarantines(root, 30, run())
+    assert (stranger / "important.txt").is_file()
+    assert actions and actions[0].skipped and "not a quarantine" in actions[0].detail
+
+
+def test_trash_workspace_scope_can_sweep_directories(workspace: Path):
+    loose = workspace / "loose"
+    loose.mkdir()
+    junk = loose / "lalalalala"
+    junk.mkdir()
+    (junk / "x").write_text("x", encoding="utf-8")
+    age(junk, 30)
+
+    cfg = config(trash={"enabled": True, "scope": "workspace", "dirs": True, "keep": []})
+    actions = gt.sweep_trash(
+        workspace, cfg, run(), _holding(workspace), gt.find_repos(workspace, [])
+    )
+    assert not junk.exists()
+    assert actions and actions[0].applied
+
+
+def test_quitting_keeps_the_work_already_done(workspace: Path, capsys):
+    """'q' stops the run; it does not un-report what already happened."""
+    repo = workspace / "repo"
+    for name in ("a", "b", "c"):
+        cache = repo / name / "__pycache__"
+        cache.mkdir(parents=True)
+        (cache / "m.pyc").write_text(name, encoding="utf-8")
+
+    replies = iter(["y", "y", "q"])
+    decider = gt.Decider(gt.ASK, stream=io.StringIO(), prompt_input=lambda _: next(replies))
+    with pytest.raises(gt.Quit) as stopped:
+        gt.clean_tree(repo, "repo", config(), decider, gt.Git(repo), None)
+
+    applied = [a for a in stopped.value.done if a.applied]
+    assert len(applied) == 2, "the two that were agreed to are reported"
+
+
+def test_a_run_that_was_stopped_does_not_report_success(workspace: Path, monkeypatch):
+    repo = workspace / "repo"
+    (repo / "__pycache__").mkdir()
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _: "q")
+    assert gt.main(["-C", str(workspace), "clean", "--ask"]) == 1
+
+
+def test_restore_honours_json(workspace: Path, capsys):
+    root = workspace / gt.QUARANTINE_DIRNAME / "stamp"
+    root.mkdir(parents=True)
+    (root / gt.MANIFEST_NAME).write_text('{"entries": []}', encoding="utf-8")
+    gt.main(["-C", str(workspace), "restore", "--json"])
+    assert json.loads(capsys.readouterr().out)["actions"] == []
+
+
+def test_the_timeout_applies_outside_sync(workspace: Path):
+    (workspace / ".git-tidy.yaml").write_text("sync:\n  timeout: 7\n", encoding="utf-8")
+    resolver = gt.ConfigResolver(workspace)
+    context = gt.Context(
+        workspace,
+        resolver,
+        run(gt.DRY),
+        quiet_printer(),
+        gt.find_repos(workspace, []),
+        _holding(workspace),
+    )
+    assert context.timeout == 7
+
+
+# --------------------------------------------------------------------------- #
+# Round four of review
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "overlay",
+    [
+        {"trash": {"retention_days": False}},  # bool is an int in Python
+        {"trash": {"quarantine": None}},  # a blank value is falsy, not "default"
+        {"jobs": True},
+    ],
+)
+def test_a_value_that_would_change_the_meaning_is_refused(overlay):
+    with pytest.raises(gt.Failure):
+        gt._merge(gt.DEFAULTS, overlay, "test")
+
+
+def test_a_list_of_the_wrong_thing_is_refused_at_load_time():
+    """fnmatch would otherwise raise inside a worker, half way through a run."""
+    with pytest.raises(gt.Failure, match="must be text"):
+        gt._merge(gt.DEFAULTS, {"branches": {"keep": [{}]}}, "test")
+
+
+def test_family_discovery_survives_a_broken_repository(workspace: Path):
+    broken = workspace / "broken"
+    broken.mkdir()
+    (broken / ".git").write_text("gitdir: /nowhere\n", encoding="utf-8")
+    families = gt._families([workspace / "repo", broken], timeout=5)
+    assert len(families) == 2, "the healthy one is still grouped"
+
+
+def test_restore_list_shows_an_unfinished_sweep(workspace: Path, capsys):
+    root = workspace / gt.QUARANTINE_DIRNAME / "stamp"
+    root.mkdir(parents=True)
+    (root / gt.JOURNAL_NAME).write_text(
+        json.dumps({"from": "/a", "to": "/b"}) + "\n", encoding="utf-8"
+    )
+    gt.main(["-C", str(workspace), "restore", "--list"])
+    out = capsys.readouterr().out
+    assert "stamp" in out and "unfinished" in out
+
+
+def test_a_stash_is_not_counted_as_its_own_action(workspace: Path):
+    """It is part of the switch it made room for, not a second thing that happened."""
+    repo = workspace / "repo"
+    git(repo, "switch", "-q", "-c", "side")
+    (repo / "README.md").write_text("work in progress\n", encoding="utf-8")
+
+    actions = gt.sync_repo(repo, "repo", gt._merge(gt.DEFAULTS, gt.FORCE_OVERRIDES, "force"), run())
+    assert not [a for a in actions if a.kind == "stash"], "no separate success entry"
+    assert len([a for a in actions if a.applied and "stash" in a.kind]) == 1
+    assert "git-tidy: repo" in git(repo, "stash", "list")
+
+
+def test_a_repository_can_shorten_its_own_timeout(workspace: Path):
+    (workspace / ".git-tidy.yaml").write_text("sync:\n  timeout: 90\n", encoding="utf-8")
+    (workspace / "repo" / ".git-tidy.yaml").write_text("sync:\n  timeout: 5\n", encoding="utf-8")
+    resolver = gt.ConfigResolver(workspace)
+    assert resolver.for_path(workspace)["sync"]["timeout"] == 90
+    assert resolver.for_path(workspace / "repo")["sync"]["timeout"] == 5
+
+
+# --------------------------------------------------------------------------- #
+# Round five of review
+# --------------------------------------------------------------------------- #
+
+
+def test_a_dry_run_predicts_what_force_would_do(workspace: Path):
+    """A dry run stands in for the real one; it must not describe a different run."""
+    repo = workspace / "repo"
+    git(repo, "switch", "-q", "-c", "side")
+    (repo / "README.md").write_text("work in progress\n", encoding="utf-8")
+    forced = gt._merge(gt.DEFAULTS, gt.FORCE_OVERRIDES, "force")
+
+    actions = gt.sync_repo(repo, "repo", forced, run(gt.DRY))
+    switch = [a for a in actions if "switch" in a.kind]
+    assert switch and "would stash and switch" in switch[0].detail
+    # ...and still changed nothing.
+    assert git(repo, "stash", "list") == ""
+    assert gt.current_branch(gt.Git(repo)) == "side"
+
+
+def test_a_dry_run_predicts_a_forced_fast_forward(workspace: Path, remote: Path, tmp_path: Path):
+    git(tmp_path, "clone", "-q", str(remote), "other")
+    commit(tmp_path / "other", "theirs.txt")
+    git(tmp_path / "other", "push", "-q")
+    repo = workspace / "repo"
+    git(repo, "fetch", "-q", "origin")
+    (repo / "README.md").write_text("work in progress\n", encoding="utf-8")
+
+    forced = gt._merge(gt.DEFAULTS, gt.FORCE_OVERRIDES, "force")
+    actions = gt.sync_repo(repo, "repo", forced, run(gt.DRY))
+    update = [a for a in actions if "update" in a.kind]
+    assert update and "would stash and fast-forward" in update[0].detail
+    assert git(repo, "stash", "list") == ""
+
+
+def test_a_config_that_is_not_utf8_stops_one_repo_not_the_run(workspace: Path, capsys):
+    repo = workspace / "repo"
+    (repo / ".git-tidy.yaml").write_bytes(b"jobs: \xff\xfe\n")
+    (repo / "__pycache__").mkdir()
+    git(workspace, "clone", "-q", str(repo), "second")
+    (workspace / "second" / "__pycache__").mkdir()
+
+    assert gt.main(["-C", str(workspace), "clean", "--apply"]) == 1
+    assert (repo / "__pycache__").exists(), "the broken one was skipped"
+    assert not (workspace / "second" / "__pycache__").exists(), "the healthy one was not"
+
+
+def test_the_generated_config_does_not_promise_what_it_can_lift():
+    text = gt.render_config({}, "header")
+    assert "never rebased" not in text
+    assert "sync.diverged" not in text or "rebase" in text
+
+
+# --------------------------------------------------------------------------- #
+# Round six of review
+# --------------------------------------------------------------------------- #
+
+
+def test_an_untracked_file_counts_as_uncommitted_work(workspace: Path):
+    """The README promises such a repository stays on its branch."""
+    repo = workspace / "repo"
+    git(repo, "switch", "-q", "-c", "side")
+    (repo / "notes.txt").write_text("not committed anywhere\n", encoding="utf-8")
+
+    assert gt.is_dirty(gt.Git(repo))
+    actions = gt.sync_repo(repo, "repo", config(), run())
+    assert gt.current_branch(gt.Git(repo)) == "side"
+    assert any("uncommitted changes" in a.detail for a in actions)
+    assert (repo / "notes.txt").is_file()
+
+
+def test_an_ignored_file_does_not_freeze_a_repository(workspace: Path):
+    """Otherwise every repository that has ever been built would stop syncing."""
+    repo = workspace / "repo"
+    (repo / ".gitignore").write_text("*.log\n", encoding="utf-8")
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-q", "-m", "ignore logs")
+    git(repo, "switch", "-q", "-c", "side")
+    (repo / "build.log").write_text("noise", encoding="utf-8")
+
+    assert not gt.is_dirty(gt.Git(repo))
+    gt.sync_repo(repo, "repo", config(), run())
+    assert gt.current_branch(gt.Git(repo)) == "main"
+
+
+def test_two_sweeps_in_one_second_do_not_share_a_quarantine(workspace: Path):
+    """The second manifest would otherwise replace the first, stranding its files."""
+    root = workspace / gt.QUARANTINE_DIRNAME
+    first = gt.Quarantine(root, workspace)
+    (workspace / "one.pyc").write_text("first", encoding="utf-8")
+    first.take(workspace / "one.pyc")
+    first.write_manifest()
+
+    second = gt.Quarantine(root, workspace)
+    assert second.stamp != first.stamp, "same second, different sweep"
+    (workspace / "two.pyc").write_text("second", encoding="utf-8")
+    second.take(workspace / "two.pyc")
+    second.write_manifest()
+
+    # Both are listed, and both restore.
+    assert len([p for p in root.iterdir() if (p / gt.MANIFEST_NAME).is_file()]) == 2
+    gt.restore(root, first.stamp, run())
+    gt.restore(root, second.stamp, run())
+    assert (workspace / "one.pyc").read_text(encoding="utf-8") == "first"
+    assert (workspace / "two.pyc").read_text(encoding="utf-8") == "second"
+
+
+def test_a_quarantine_name_collision_keeps_both_files(workspace: Path):
+    holding = gt.Quarantine(workspace / gt.QUARANTINE_DIRNAME, workspace, stamp="stamp")
+    (workspace / "a").mkdir()
+    for round_number in ("first", "second", "third"):
+        (workspace / "a" / "m.pyc").write_text(round_number, encoding="utf-8")
+        holding.take(workspace / "a" / "m.pyc")
+
+    kept = sorted(
+        p.read_text(encoding="utf-8") for p in (holding.dir / "a").iterdir() if p.is_file()
+    )
+    assert kept == ["first", "second", "third"], "no sweep overwrote another"
+
+
+# --------------------------------------------------------------------------- #
+# Round seven of review
+# --------------------------------------------------------------------------- #
+
+
+def test_a_submodule_with_uncommitted_work_is_not_forced(workspace: Path, tmp_path: Path):
+    """`submodule update --force` is a checkout --force inside the submodule."""
+    inner = tmp_path / "inner"
+    inner.mkdir()
+    git(inner, "init", "-q", "-b", "main")
+    commit(inner, "lib.txt", "v1\n")
+
+    repo = workspace / "repo"
+    git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(inner), "vendor")
+    git(repo, "commit", "-q", "-m", "add submodule")
+    (repo / "vendor" / "lib.txt").write_text("work in progress\n", encoding="utf-8")
+
+    gt._sync_submodules(gt.Git(repo), "repo", config(sync={"submodules": "update"})["sync"], run())
+    assert (repo / "vendor" / "lib.txt").read_text(encoding="utf-8") == "work in progress\n"
+
+
+def test_trash_does_not_sweep_an_enclosing_repositorys_tracked_file(tmp_path: Path):
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    git(outer, "init", "-q", "-b", "main")
+    space = outer / "space"
+    space.mkdir()
+    (space / "lalalalala.log").write_text("committed, oddly named", encoding="utf-8")
+    git(outer, "add", "-A")
+    git(outer, "commit", "-q", "-m", "track it")
+    age(space / "lalalalala.log", 30)
+
+    cfg = config(trash={"enabled": True, "min_age_days": 7})
+    actions = gt.sweep_trash(space, cfg, run(), _holding(space), [])
+    assert (space / "lalalalala.log").is_file(), "committed content is not junk"
+    assert actions == []
+
+
+def test_trash_still_sweeps_when_nothing_encloses_the_workspace(workspace: Path):
+    junk = workspace / "lalalalala.log"
+    junk.write_text("x", encoding="utf-8")
+    age(junk, 30)
+    cfg = config(trash={"enabled": True})
+    actions = gt.sweep_trash(workspace, cfg, run(), _holding(workspace), [])
+    assert actions and actions[0].applied
+    assert not junk.exists()
+
+
+# --------------------------------------------------------------------------- #
+# Round eight of review
+# --------------------------------------------------------------------------- #
+
+
+def test_quarantined_bytes_are_not_reported_as_freed(workspace: Path, capsys):
+    """They are still on the disk; the next df would expose the claim."""
+    junk = workspace / "lalalalala.log"
+    junk.write_text("x" * 4096, encoding="utf-8")
+    age(junk, 30)
+    (workspace / ".git-tidy.yaml").write_text(
+        "trash:\n  enabled: true\n  min_age_days: 7\n", encoding="utf-8"
+    )
+    gt.main(["-C", str(workspace), "trash", "--apply"])
+    out = capsys.readouterr().out
+    assert "moved to quarantine, not reclaimed" in out
+    assert "freed" not in out
+
+
+def test_a_config_outside_a_repository_protects_its_own_directory(workspace: Path):
+    """Deepest wins applies out here as much as it does inside a repository."""
+    loose = workspace / "loose"
+    (loose / "__pycache__").mkdir(parents=True)
+    (loose / ".git-tidy.yaml").write_text('clean:\n  keep: ["__pycache__"]\n', encoding="utf-8")
+    other = workspace / "other"
+    (other / "__pycache__").mkdir(parents=True)
+
+    gt.main(["-C", str(workspace), "clean", "--apply"])
+    assert (loose / "__pycache__").exists(), "kept by the config next to it"
+    assert not (other / "__pycache__").exists()
+
+
+def test_a_dry_run_does_not_count_the_same_path_twice(workspace: Path, capsys):
+    """clean.ignored and the pattern walk both see it while it is still there."""
+    repo = workspace / "repo"
+    (repo / ".gitignore").write_text("__pycache__/\n", encoding="utf-8")
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-q", "-m", "ignore caches")
+    (repo / "__pycache__").mkdir()
+    (repo / "__pycache__" / "m.pyc").write_bytes(b"0" * 2048)
+    (workspace / ".git-tidy.yaml").write_text("clean:\n  ignored: true\n", encoding="utf-8")
+
+    gt.main(["-C", str(workspace), "clean", "--json"])
+    actions = json.loads(capsys.readouterr().out)["actions"]
+    caches = [a for a in actions if a["target"] == "__pycache__"]
+    assert len(caches) == 1, "reported once, as it will be removed once"
+
+
+# --------------------------------------------------------------------------- #
+# Round nine of review
+# --------------------------------------------------------------------------- #
+
+
+def test_an_unreadable_index_stops_the_repo_rather_than_the_protection(workspace: Path):
+    """An empty tracked set would mean every artefact rule applies to commits."""
+    repo = workspace / "repo"
+    (repo / "__pycache__").mkdir()
+    (repo / ".git" / "index").write_bytes(b"not an index")
+
+    with pytest.raises(gt.Failure, match="cannot read the index"):
+        gt.clean_tree(repo, "repo", config(), run(), gt.Git(repo), None)
+    assert (repo / "__pycache__").exists(), "nothing was removed on a broken index"
+
+
+def test_a_broken_index_is_reported_and_the_others_still_run(workspace: Path):
+    repo = workspace / "repo"
+    (repo / "__pycache__").mkdir()
+    (repo / ".git" / "index").write_bytes(b"not an index")
+    git(workspace, "clone", "-q", str(remote_of(repo)), "second")
+    (workspace / "second" / "__pycache__").mkdir()
+
+    assert gt.main(["-C", str(workspace), "clean", "--apply"]) == 1
+    assert (repo / "__pycache__").exists()
+    assert not (workspace / "second" / "__pycache__").exists()
+
+
+def remote_of(repo: Path) -> str:
+    return git(repo, "remote", "get-url", "origin")
+
+
+def test_restore_reports_a_filesystem_failure(workspace: Path, monkeypatch):
+    repo = workspace / "repo"
+    (repo / "__pycache__").mkdir()
+    (repo / "__pycache__" / "m.pyc").write_text("x", encoding="utf-8")
+    holding = gt.Quarantine(workspace / gt.QUARANTINE_DIRNAME, workspace, stamp="stamp")
+    gt.clean_tree(repo, "repo", config(), run(), gt.Git(repo), holding)
+    holding.write_manifest()
+
+    def refuse(*_args, **_kwargs):
+        raise PermissionError("read-only file system")
+
+    monkeypatch.setattr(gt.shutil, "move", refuse)
+    actions = gt.restore(workspace / gt.QUARANTINE_DIRNAME, "stamp", run())
+    assert actions[0].error and "read-only" in actions[0].error
+
+
+def test_expire_reports_a_filesystem_failure(workspace: Path, monkeypatch):
+    root = workspace / gt.QUARANTINE_DIRNAME
+    old = root / "old"
+    old.mkdir(parents=True)
+    (old / gt.MANIFEST_NAME).write_text('{"entries": []}', encoding="utf-8")
+    long_ago = time.time() - 60 * 86400
+    os.utime(old, (long_ago, long_ago))
+
+    def refuse(*_args, **_kwargs):
+        raise PermissionError("in use")
+
+    monkeypatch.setattr(gt.shutil, "rmtree", refuse)
+    actions = gt.expire_quarantines(root, 30, run())
+    assert actions and actions[0].error and "in use" in actions[0].error
+    assert old.exists()
+
+
+# --------------------------------------------------------------------------- #
+# Round ten of review
+# --------------------------------------------------------------------------- #
+
+
+def test_a_repository_can_exclude_itself(workspace: Path):
+    """Deepest wins applies to `exclude` as much as to anything else."""
+    repo = workspace / "repo"
+    (repo / ".git-tidy.yaml").write_text('exclude: ["*"]\n', encoding="utf-8")
+    (repo / "__pycache__").mkdir()
+    git(workspace, "clone", "-q", str(repo), "second")
+    (workspace / "second" / "__pycache__").mkdir()
+
+    gt.main(["-C", str(workspace), "clean", "--apply"])
+    assert (repo / "__pycache__").exists(), "it asked to be left alone"
+    assert not (workspace / "second" / "__pycache__").exists()
+
+
+# --------------------------------------------------------------------------- #
+# Round eleven of review
+# --------------------------------------------------------------------------- #
+
+
+def test_a_quarantined_artefact_is_not_reported_as_removed(workspace: Path):
+    """It is a restore away, so calling it removed would be untrue."""
+    repo = workspace / "repo"
+    (repo / "__pycache__").mkdir()
+    holding = gt.Quarantine(workspace / gt.QUARANTINE_DIRNAME, workspace, stamp="stamp")
+
+    cfg = config(clean={"quarantine": True})
+    actions = gt.clean_tree(repo, "repo", cfg, run(), gt.Git(repo), holding)
+    assert actions[0].applied and actions[0].detail == "quarantined"
+    assert actions[0].quarantined
+    assert (holding.dir / "repo" / "__pycache__").exists()
+
+
+# --------------------------------------------------------------------------- #
+# Round twelve of review
+# --------------------------------------------------------------------------- #
+
+
+def test_a_loose_directory_can_ask_for_its_own_quarantine(workspace: Path):
+    """The root's setting must not decide what happens to a deeper directory."""
+    careful = workspace / "careful"
+    (careful / "__pycache__").mkdir(parents=True)
+    (careful / "__pycache__" / "m.pyc").write_text("keep me recoverable", encoding="utf-8")
+    (careful / ".git-tidy.yaml").write_text("clean:\n  quarantine: true\n", encoding="utf-8")
+    plain = workspace / "plain"
+    (plain / "__pycache__").mkdir(parents=True)
+
+    gt.main(["-C", str(workspace), "clean", "--apply"])
+    assert not (careful / "__pycache__").exists()
+    assert not (plain / "__pycache__").exists()
+    quarantined = list((workspace / gt.QUARANTINE_DIRNAME).glob("*/careful/__pycache__/m.pyc"))
+    assert quarantined, "the deeper config asked for this one to be recoverable"
+    assert not list((workspace / gt.QUARANTINE_DIRNAME).glob("*/plain/*")), "and only that one"
+
+
+# --------------------------------------------------------------------------- #
+# Round thirteen of review
+# --------------------------------------------------------------------------- #
+
+
+def test_quitting_keeps_branch_work_already_done(workspace: Path, remote: Path):
+    """Every step that accumulates must hand its work to the Quit, not only clean."""
+    repo = workspace / "repo"
+    for name in ("one", "two", "three"):
+        make_gone_branch(repo, remote, name)
+
+    replies = iter(["y", "q"])
+    decider = gt.Decider(gt.ASK, stream=io.StringIO(), prompt_input=lambda _: next(replies))
+    with pytest.raises(gt.Quit) as stopped:
+        gt.prune_branches(repo, "repo", config(), decider, fetched=True)
+
+    assert [a for a in stopped.value.done if a.applied], "the one agreed to is reported"
+
+
+def test_quitting_keeps_trash_already_swept(workspace: Path):
+    for name in ("lalalalala.log", "lalalalalala.log", "lalalog.log"):
+        junk = workspace / name
+        junk.write_text("x", encoding="utf-8")
+        age(junk, 30)
+
+    replies = iter(["y", "q"])
+    decider = gt.Decider(gt.ASK, stream=io.StringIO(), prompt_input=lambda _: next(replies))
+    cfg = config(trash={"enabled": True, "patterns": ["lala*"]})
+    with pytest.raises(gt.Quit) as stopped:
+        gt.sweep_trash(workspace, cfg, decider, _holding(workspace), [])
+
+    assert [a for a in stopped.value.done if a.applied]
+
+
+def test_quitting_keeps_restores_already_made(workspace: Path):
+    repo = workspace / "repo"
+    for name in ("a", "b"):
+        cache = repo / name / "__pycache__"
+        cache.mkdir(parents=True)
+        (cache / "m.pyc").write_text(name, encoding="utf-8")
+    holding = gt.Quarantine(workspace / gt.QUARANTINE_DIRNAME, workspace, stamp="stamp")
+    gt.clean_tree(repo, "repo", config(), run(), gt.Git(repo), holding)
+    holding.write_manifest()
+
+    replies = iter(["y", "q"])
+    decider = gt.Decider(gt.ASK, stream=io.StringIO(), prompt_input=lambda _: next(replies))
+    with pytest.raises(gt.Quit) as stopped:
+        gt.restore(workspace / gt.QUARANTINE_DIRNAME, "stamp", decider)
+
+    assert [a for a in stopped.value.done if a.applied]
+
+
+# --------------------------------------------------------------------------- #
+# Round fourteen of review
+# --------------------------------------------------------------------------- #
+
+
+def test_a_directory_about_to_go_whole_gets_the_last_word(workspace: Path):
+    """Its own config would otherwise be deleted along with what it protects."""
+    protected = workspace / "dist"
+    protected.mkdir()
+    (protected / "important.bin").write_text("not really build output", encoding="utf-8")
+    (protected / ".git-tidy.yaml").write_text("clean:\n  enabled: false\n", encoding="utf-8")
+    ordinary = workspace / "elsewhere" / "dist"
+    ordinary.mkdir(parents=True)
+
+    (workspace / ".git-tidy.yaml").write_text("clean:\n  builds: true\n", encoding="utf-8")
+    gt.main(["-C", str(workspace), "clean", "--apply"])
+    assert (protected / "important.bin").is_file(), "it said not to"
+    assert not ordinary.exists()
+
+
+# --------------------------------------------------------------------------- #
+# Round fifteen of review
+# --------------------------------------------------------------------------- #
+
+
+def test_a_case_only_difference_still_protects_a_tracked_path(workspace: Path):
+    """On macOS and Windows the index spelling need not match the disk."""
+    repo = workspace / "repo"
+    (repo / "Dist").mkdir()
+    (repo / "Dist" / "committed.txt").write_text("real content", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "track Dist")
+
+    tracked = gt.tracked_paths(gt.Git(repo))
+    assert gt._protected(repo / "Dist", repo, [], tracked)
+    # The same directory reached by the other spelling is the same directory.
+    assert gt._protected(repo / "dist", repo, [], tracked)
+
+
+# --------------------------------------------------------------------------- #
+# Round sixteen of review
+# --------------------------------------------------------------------------- #
+
+
+def test_a_failed_rebase_gives_the_stashed_work_back(workspace: Path, remote: Path, tmp_path: Path):
+    """Otherwise "nothing changed" is untrue: the work sits in an unasked-for stash."""
+    git(tmp_path, "clone", "-q", str(remote), "other")
+    commit(tmp_path / "other", "README.md", "theirs\n")
+    git(tmp_path / "other", "push", "-q")
+
+    repo = workspace / "repo"
+    commit(repo, "README.md", "mine\n")
+    git(repo, "fetch", "-q", "origin")
+    (repo / "notes.txt").write_text("work in progress\n", encoding="utf-8")
+
+    cfg = config(sync={"diverged": "rebase", "stash": True, "switch": "always"})
+    actions = gt.sync_repo(repo, "repo", cfg, run())
+
+    failed = [a for a in actions if a.error]
+    assert failed and "nothing changed" in failed[0].error
+    assert git(repo, "stash", "list") == "", "the stash was put back"
+    assert (repo / "notes.txt").read_text(encoding="utf-8") == "work in progress\n"
+
+
+# --------------------------------------------------------------------------- #
+# Round seventeen of review
+# --------------------------------------------------------------------------- #
+
+
+def test_a_mixed_batch_is_not_summarised_with_one_verb(workspace: Path):
+    """Some quarantined, some deleted: the roll-up must not pick one for both."""
+    stream = io.StringIO()
+    printer = gt.Printer(stream, quiet=False, color=False)
+
+    printer.batch(
+        [
+            gt.Action("remove", "repo", "a", "removed", size=10, applied=True),
+            gt.Action("remove", "repo", "b", "removed", size=10, applied=True),
+            gt.Action(
+                "remove", "repo", "c", "quarantined", size=10, applied=True, quarantined=True
+            ),
+            gt.Action(
+                "remove", "repo", "d", "quarantined", size=10, applied=True, quarantined=True
+            ),
+        ]
+    )
+    joined = stream.getvalue()
+    assert "removed" in joined and "quarantined" in joined
+    assert joined.count("2 paths") == 2, "two groups, one per outcome"
+
+
+# --------------------------------------------------------------------------- #
+# Round eighteen of review
+# --------------------------------------------------------------------------- #
+
+
+def test_keep_protects_a_file_inside_a_matched_directory(workspace: Path):
+    """Removing the parent whole would take what keep was written to protect."""
+    repo = workspace / "repo"
+    (repo / "dist").mkdir()
+    (repo / "dist" / "important.dat").write_text("keep me", encoding="utf-8")
+    (repo / "dist" / "junk.bin").write_bytes(b"0" * 32)
+
+    cfg = config(clean={"builds": True, "keep": ["dist/important.dat"]})
+    gt.clean_tree(repo, "repo", cfg, run(), gt.Git(repo), None)
+    assert (repo / "dist" / "important.dat").is_file()
+
+
+def test_keep_protects_inside_a_loose_directory_too(workspace: Path):
+    loose = workspace / "loose" / "dist"
+    loose.mkdir(parents=True)
+    (loose / "important.dat").write_text("keep me", encoding="utf-8")
+    (workspace / ".git-tidy.yaml").write_text(
+        'clean:\n  builds: true\n  keep: ["loose/dist/important.dat"]\n', encoding="utf-8"
+    )
+    gt.main(["-C", str(workspace), "clean", "--apply"])
+    assert (loose / "important.dat").is_file()
+
+
+# --------------------------------------------------------------------------- #
+# Round nineteen of review
+# --------------------------------------------------------------------------- #
+
+
+def test_a_successful_stash_says_where_the_work_went(workspace: Path, remote: Path, tmp_path: Path):
+    """Leaving it stashed is the design; leaving it stashed silently is not."""
+    git(tmp_path, "clone", "-q", str(remote), "other")
+    commit(tmp_path / "other", "theirs.txt")
+    git(tmp_path / "other", "push", "-q")
+
+    repo = workspace / "repo"
+    git(repo, "fetch", "-q", "origin")
+    (repo / "README.md").write_text("work in progress\n", encoding="utf-8")
+
+    actions = gt.sync_repo(repo, "repo", gt._merge(gt.DEFAULTS, gt.FORCE_OVERRIDES, "force"), run())
+    applied = [a for a in actions if a.applied and "stash" in a.kind]
+    assert applied and "git stash pop" in applied[0].detail
+    assert "git-tidy: repo" in git(repo, "stash", "list")
+
+
+# --------------------------------------------------------------------------- #
+# Round twenty of review
+# --------------------------------------------------------------------------- #
+
+
+def test_a_swept_directorys_contents_are_not_reported_separately(workspace: Path):
+    """The dry run must match the apply that follows it."""
+    junk = workspace / "loose" / "lalalalala"
+    junk.mkdir(parents=True)
+    (junk / "lalalog.log").write_text("x", encoding="utf-8")
+    age(junk / "lalalog.log", 30)
+    age(junk, 30)
+
+    cfg = config(trash={"enabled": True, "scope": "workspace", "dirs": True, "patterns": ["lala*"]})
+    dry = gt.sweep_trash(workspace, cfg, run(gt.DRY), _holding(workspace), [])
+    assert len(dry) == 1 and dry[0].target.endswith("lalalalala")
+
+    applied = gt.sweep_trash(workspace, cfg, run(), _holding(workspace), [])
+    assert len(applied) == len(dry), "the dry run predicted exactly this"
+    assert not junk.exists()
+
+
+# --------------------------------------------------------------------------- #
+# Round twenty-one of review
+# --------------------------------------------------------------------------- #
+
+
+def test_a_torn_journal_record_does_not_cost_the_rest(workspace: Path):
+    """The kill that stopped the sweep can tear the line it was writing."""
+    repo = workspace / "repo"
+    for name in ("a", "b"):
+        cache = repo / name / "__pycache__"
+        cache.mkdir(parents=True)
+        (cache / "m.pyc").write_text(name, encoding="utf-8")
+    holding = gt.Quarantine(workspace / gt.QUARANTINE_DIRNAME, workspace, stamp="stamp")
+    gt.clean_tree(repo, "repo", config(), run(), gt.Git(repo), holding)
+
+    journal = workspace / gt.QUARANTINE_DIRNAME / "stamp" / gt.JOURNAL_NAME
+    with journal.open("a", encoding="utf-8") as handle:
+        handle.write('{"from": "/half-written')  # power went out here
+
+    actions = gt.restore(workspace / gt.QUARANTINE_DIRNAME, "stamp", run())
+    assert [a for a in actions if a.applied], "the intact records still restore"
+    assert any("unreadable" in a.detail for a in actions), "and the loss is stated"
+    assert (repo / "a" / "__pycache__" / "m.pyc").is_file()
+
+
+# --------------------------------------------------------------------------- #
+# Round twenty-two of review
+# --------------------------------------------------------------------------- #
+
+
+def test_a_switch_that_would_replace_a_local_env_is_refused(workspace: Path):
+    """git replaces ignored files during a checkout without a word."""
+    repo = workspace / "repo"
+    # main tracks .env; here it is ignored and holds local credentials.
+    (repo / ".env").write_text("SECRET=production\n", encoding="utf-8")
+    git(repo, "add", "-f", ".env")
+    git(repo, "commit", "-q", "-m", "add .env to main")
+    git(repo, "switch", "-q", "-c", "side")
+    git(repo, "rm", "-q", "--cached", ".env")
+    (repo / ".gitignore").write_text(".env\n", encoding="utf-8")
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-q", "-m", "ignore .env on side")
+    (repo / ".env").write_text("SECRET=mine, and the only copy\n", encoding="utf-8")
+
+    actions = gt.sync_repo(repo, "repo", config(), run())
+    assert (repo / ".env").read_text(encoding="utf-8") == "SECRET=mine, and the only copy\n"
+    assert gt.current_branch(gt.Git(repo)) == "side"
+    assert any("would be replaced" in a.detail for a in actions)
+
+
+def test_an_ordinary_ignored_file_does_not_block_a_switch(workspace: Path):
+    """Only what ignored_keep names is worth stopping for."""
+    repo = workspace / "repo"
+    (repo / ".gitignore").write_text("*.log\n", encoding="utf-8")
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-q", "-m", "ignore logs")
+    git(repo, "switch", "-q", "-c", "side")
+    (repo / "build.log").write_text("noise", encoding="utf-8")
+
+    gt.sync_repo(repo, "repo", config(), run())
+    assert gt.current_branch(gt.Git(repo)) == "main"
+
+
+# --------------------------------------------------------------------------- #
+# Round twenty-three of review
+# --------------------------------------------------------------------------- #
+
+
+def test_submodule_init_does_not_move_an_existing_checkout(workspace: Path, tmp_path: Path):
+    """ "init" means init. Moving a checked-out submodule is what "update" is for."""
+    inner = tmp_path / "inner"
+    inner.mkdir()
+    git(inner, "init", "-q", "-b", "main")
+    commit(inner, "lib.txt", "v1\n")
+
+    repo = workspace / "repo"
+    git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(inner), "vendor")
+    git(repo, "commit", "-q", "-m", "add submodule")
+    # Move the submodule somewhere of its own, as a person would while working.
+    commit(inner, "lib.txt", "v2\n")
+    git(repo / "vendor", "fetch", "-q", "origin")
+    git(repo / "vendor", "checkout", "-q", "origin/main")
+    moved = git(repo / "vendor", "rev-parse", "HEAD")
+
+    gt._sync_submodules(gt.Git(repo), "repo", config(sync={"submodules": "init"})["sync"], run())
+    assert git(repo / "vendor", "rev-parse", "HEAD") == moved, "left where it was"
+
+
+def test_a_directory_can_turn_trash_off_for_itself(workspace: Path):
+    loose = workspace / "keepme"
+    loose.mkdir()
+    junk = loose / "lalalalala.log"
+    junk.write_text("x", encoding="utf-8")
+    age(junk, 30)
+    (loose / ".git-tidy.yaml").write_text("trash:\n  enabled: false\n", encoding="utf-8")
+    (workspace / ".git-tidy.yaml").write_text(
+        "trash:\n  enabled: true\n  scope: workspace\n", encoding="utf-8"
+    )
+
+    gt.main(["-C", str(workspace), "trash", "--apply"])
+    assert junk.is_file(), "the directory said no"
+
+
+def test_a_credential_inside_a_disposable_directory_is_moved_not_deleted(workspace: Path):
+    """The promise trash makes, kept by clean too."""
+    repo = workspace / "repo"
+    cache = repo / ".terraform"
+    cache.mkdir()
+    (cache / "provider.bin").write_bytes(b"0" * 64)
+    (cache / "client.pem").write_text("PRIVATE KEY", encoding="utf-8")
+    holding = gt.Quarantine(workspace / gt.QUARANTINE_DIRNAME, workspace, stamp="stamp")
+
+    actions = gt.clean_tree(
+        repo,
+        "repo",
+        config(),
+        run(),
+        gt.Git(repo),
+        None,
+        sensitive=gt.DEFAULTS["trash"]["sensitive"],
+        holding=holding,
+    )
+    assert not cache.exists()
+    assert (holding.dir / "repo" / ".terraform" / "client.pem").is_file()
+    assert any("contains" in a.detail and a.quarantined for a in actions)
+
+
+# --------------------------------------------------------------------------- #
+# Round twenty-four of review
+# --------------------------------------------------------------------------- #
+
+
+def test_a_fast_forward_that_would_replace_a_local_env_is_refused(
+    workspace: Path, remote: Path, tmp_path: Path
+):
+    """git merge overwrites ignored files as silently as a checkout does."""
+    repo = workspace / "repo"
+    (repo / ".gitignore").write_text(".env\n", encoding="utf-8")
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-q", "-m", "ignore .env")
+    git(repo, "push", "-q")
+    (repo / ".env").write_text("SECRET=mine, and the only copy\n", encoding="utf-8")
+
+    # Upstream starts tracking the very path this checkout ignores.
+    git(tmp_path, "clone", "-q", str(remote), "other")
+    other = tmp_path / "other"
+    (other / ".env").write_text("SECRET=theirs\n", encoding="utf-8")
+    git(other, "add", "-f", ".env")
+    git(other, "commit", "-q", "-m", "track .env upstream")
+    git(other, "push", "-q")
+    git(repo, "fetch", "-q", "origin")
+
+    actions = gt.sync_repo(repo, "repo", config(), run())
+    assert (repo / ".env").read_text(encoding="utf-8") == "SECRET=mine, and the only copy\n"
+    assert any("would be replaced" in a.detail for a in actions)
+
+
+# --------------------------------------------------------------------------- #
+# Round twenty-five of review
+# --------------------------------------------------------------------------- #
+
+
+def test_two_processes_cannot_claim_the_same_quarantine(workspace: Path, monkeypatch):
+    """Checking a name is free and then using it leaves a gap both can walk through."""
+    root = workspace / gt.QUARANTINE_DIRNAME
+    first = gt._free_stamp(root)
+    assert (root / first).is_dir(), "claimed by creating it, not by looking"
+
+    # A second process, in the same second, gets a different one.
+    second = gt._free_stamp(root)
+    assert second != first
+    assert (root / second).is_dir()
+
+
+def test_a_reclaimed_stamp_does_not_strand_the_other_sweep(workspace: Path):
+    root = workspace / gt.QUARANTINE_DIRNAME
+    (workspace / "one.pyc").write_text("first", encoding="utf-8")
+    (workspace / "two.pyc").write_text("second", encoding="utf-8")
+
+    a, b = gt.Quarantine(root, workspace), gt.Quarantine(root, workspace)
+    assert a.stamp != b.stamp
+    a.take(workspace / "one.pyc")
+    b.take(workspace / "two.pyc")
+    a.write_manifest()
+    b.write_manifest()
+
+    gt.restore(root, a.stamp, run())
+    gt.restore(root, b.stamp, run())
+    assert (workspace / "one.pyc").read_text(encoding="utf-8") == "first"
+    assert (workspace / "two.pyc").read_text(encoding="utf-8") == "second"
+
+
+# --------------------------------------------------------------------------- #
+# Round twenty-six of review
+# --------------------------------------------------------------------------- #
+
+
+def test_a_dry_run_leaves_no_quarantine_behind(workspace: Path):
+    """Claiming the directory eagerly would contradict "nothing was changed"."""
+    junk = workspace / "lalalalala.log"
+    junk.write_text("x", encoding="utf-8")
+    age(junk, 30)
+    (workspace / ".git-tidy.yaml").write_text("trash:\n  enabled: true\n", encoding="utf-8")
+
+    gt.main(["-C", str(workspace), "run"])
+    assert not (workspace / gt.QUARANTINE_DIRNAME).exists()
+    assert junk.is_file()
+
+
+def test_the_quarantine_is_claimed_on_the_first_move(workspace: Path):
+    holding = gt.Quarantine(workspace / gt.QUARANTINE_DIRNAME, workspace)
+    assert not (workspace / gt.QUARANTINE_DIRNAME).exists(), "nothing yet"
+
+    (workspace / "one.pyc").write_text("x", encoding="utf-8")
+    holding.take(workspace / "one.pyc")
+    assert holding.dir.is_dir(), "claimed when it was needed"
+
+
+# --------------------------------------------------------------------------- #
+# Round twenty-seven of review
+# --------------------------------------------------------------------------- #
+
+
+def test_an_ignored_credential_file_is_quarantined_not_deleted(workspace: Path):
+    """The guarantee covers a single file as much as a directory holding one."""
+    repo = workspace / "repo"
+    (repo / ".gitignore").write_text("*.txt\n", encoding="utf-8")
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-q", "-m", "ignore txt")
+    (repo / "api-token.txt").write_text("the only copy", encoding="utf-8")
+    (repo / "notes.txt").write_text("disposable", encoding="utf-8")
+    holding = gt.Quarantine(workspace / gt.QUARANTINE_DIRNAME, workspace, stamp="stamp")
+
+    actions = gt.clean_ignored(repo, "repo", config(), run(), None, gt.Git(repo), holding)
+    assert not (repo / "api-token.txt").exists()
+    assert not (repo / "notes.txt").exists()
+    assert (holding.dir / "repo" / "api-token.txt").read_text(encoding="utf-8") == "the only copy"
+    assert any(a.quarantined and "api-token" in a.target for a in actions)
+
+
+# --------------------------------------------------------------------------- #
+# Round twenty-eight of review
+# --------------------------------------------------------------------------- #
+
+
+def test_a_credential_matched_by_a_file_pattern_is_quarantined(workspace: Path):
+    """The guarantee cannot depend on which mechanism found the file."""
+    repo = workspace / "repo"
+    (repo / "api-token.pyc").write_text("the only copy", encoding="utf-8")
+    (repo / "module.pyc").write_text("disposable", encoding="utf-8")
+    holding = gt.Quarantine(workspace / gt.QUARANTINE_DIRNAME, workspace, stamp="stamp")
+
+    gt.clean_tree(
+        repo,
+        "repo",
+        config(),
+        run(),
+        gt.Git(repo),
+        None,
+        sensitive=gt.DEFAULTS["trash"]["sensitive"],
+        holding=holding,
+    )
+    assert not (repo / "module.pyc").exists()
+    assert (holding.dir / "repo" / "api-token.pyc").read_text(encoding="utf-8") == "the only copy"
+
+
+def test_a_loose_credential_is_quarantined_too(workspace: Path):
+    loose = workspace / "loose"
+    loose.mkdir()
+    (loose / "api-token.pyc").write_text("the only copy", encoding="utf-8")
+
+    gt.main(["-C", str(workspace), "clean", "--apply"])
+    found = list((workspace / gt.QUARANTINE_DIRNAME).glob("*/loose/api-token.pyc"))
+    assert found and found[0].read_text(encoding="utf-8") == "the only copy"
+
+
+# --------------------------------------------------------------------------- #
+# Round twenty-nine of review
+# --------------------------------------------------------------------------- #
+
+
+def test_a_directory_being_swept_is_governed_by_its_own_config(workspace: Path):
+    """It is the thing about to go, so its own .git-tidy.yaml decides."""
+    loose = workspace / "loose"
+    junk = loose / "lalalalala"
+    junk.mkdir(parents=True)
+    (junk / ".git-tidy.yaml").write_text("trash:\n  enabled: false\n", encoding="utf-8")
+    age(junk, 30)
+    (workspace / ".git-tidy.yaml").write_text(
+        'trash:\n  enabled: true\n  scope: workspace\n  dirs: true\n  patterns: ["lala*"]\n',
+        encoding="utf-8",
+    )
+
+    gt.main(["-C", str(workspace), "trash", "--apply"])
+    assert junk.is_dir(), "it said not to"
+
+
+# --------------------------------------------------------------------------- #
+# Round thirty of review
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "own,survives",
+    [
+        ("trash:\n  enabled: false\n", True),
+        ("trash:\n  dirs: false\n", True),
+        ("trash:\n  scope: root\n", True),
+        ("trash:\n  min_age_days: 0\n", False),
+    ],
+)
+def test_a_directorys_own_config_decides_whether_it_can_be_swept(
+    workspace: Path, own: str, survives: bool
+):
+    """Every setting that governs sweeping, not one at a time."""
+    junk = workspace / "loose" / "lalalalala"
+    junk.mkdir(parents=True)
+    (junk / "x").write_text("x", encoding="utf-8")
+    (junk / ".git-tidy.yaml").write_text(own, encoding="utf-8")
+    age(junk, 30)
+    (workspace / ".git-tidy.yaml").write_text(
+        'trash:\n  enabled: true\n  scope: workspace\n  dirs: true\n  patterns: ["lala*"]\n',
+        encoding="utf-8",
+    )
+
+    gt.main(["-C", str(workspace), "trash", "--apply"])
+    assert junk.exists() is survives
+
+
+# --------------------------------------------------------------------------- #
+# Round thirty-one of review
+# --------------------------------------------------------------------------- #
+
+
+def test_a_blocked_switch_never_stashes_first(workspace: Path):
+    """Deciding not to switch after stashing would hide the work in a stash."""
+    repo = workspace / "repo"
+    (repo / ".env").write_text("SECRET=production\n", encoding="utf-8")
+    git(repo, "add", "-f", ".env")
+    git(repo, "commit", "-q", "-m", "add .env to main")
+    git(repo, "switch", "-q", "-c", "side")
+    git(repo, "rm", "-q", "--cached", ".env")
+    (repo / ".gitignore").write_text(".env\n", encoding="utf-8")
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-q", "-m", "ignore .env on side")
+    (repo / ".env").write_text("SECRET=mine\n", encoding="utf-8")
+    (repo / "README.md").write_text("work in progress\n", encoding="utf-8")
+
+    forced = gt._merge(gt.DEFAULTS, gt.FORCE_OVERRIDES, "force")
+    actions = gt.sync_repo(repo, "repo", forced, run())
+
+    assert git(repo, "stash", "list") == "", "nothing was put aside"
+    assert (repo / "README.md").read_text(encoding="utf-8") == "work in progress\n"
+    assert (repo / ".env").read_text(encoding="utf-8") == "SECRET=mine\n"
+    assert any("would be replaced" in a.detail for a in actions)
+
+
+# --------------------------------------------------------------------------- #
+# Round thirty-two of review
+# --------------------------------------------------------------------------- #
+
+
+def test_a_swept_directory_holding_a_credential_is_quarantined(workspace: Path):
+    """Deleting the directory would take the credential with it."""
+    junk = workspace / "loose" / "lalalalala"
+    junk.mkdir(parents=True)
+    (junk / "notes").write_text("disposable", encoding="utf-8")
+    (junk / "id_rsa.pem").write_text("the only copy", encoding="utf-8")
+    age(junk, 30)
+    holding = _holding(workspace)
+
+    cfg = config(
+        trash={
+            "enabled": True,
+            "scope": "workspace",
+            "dirs": True,
+            "quarantine": False,
+            "patterns": ["lala*"],
+        }
+    )
+    actions = gt.sweep_trash(workspace, cfg, run(), holding, [])
+    assert not junk.exists()
+    assert (holding.dir / "loose" / "lalalalala" / "id_rsa.pem").is_file()
+    assert actions and "contains" in actions[0].detail
+
+
+# --------------------------------------------------------------------------- #
+# Round thirty-three of review
+# --------------------------------------------------------------------------- #
+
+
+def test_a_deeper_sensitive_list_protects_a_loose_credential(workspace: Path):
+    """The guarantee has to follow the config that governs the path."""
+    loose = workspace / "loose"
+    loose.mkdir()
+    (loose / "vault.pyc").write_text("the only copy", encoding="utf-8")
+    (loose / ".git-tidy.yaml").write_text('trash:\n  sensitive: ["vault*"]\n', encoding="utf-8")
+
+    gt.main(["-C", str(workspace), "clean", "--apply"])
+    found = list((workspace / gt.QUARANTINE_DIRNAME).glob("*/loose/vault.pyc"))
+    assert found and found[0].read_text(encoding="utf-8") == "the only copy"
+
+
+# --------------------------------------------------------------------------- #
+# Round thirty-four of review
+# --------------------------------------------------------------------------- #
+
+
+def test_a_dry_run_separates_what_would_move_from_what_would_go(workspace: Path, capsys):
+    """Quarantined bytes stay inside the workspace; calling them freed is untrue."""
+    junk = workspace / "lalalalala.log"
+    junk.write_text("x" * 4096, encoding="utf-8")
+    age(junk, 30)
+    (workspace / ".git-tidy.yaml").write_text(
+        "trash:\n  enabled: true\n  min_age_days: 7\n", encoding="utf-8"
+    )
+    gt.main(["-C", str(workspace), "trash"])
+    out = capsys.readouterr().out
+    assert "would move to quarantine, not reclaimed" in out
+    assert "to free" not in out
+
+
+# --------------------------------------------------------------------------- #
+# Confirmation round
+# --------------------------------------------------------------------------- #
+
+
+def test_trash_protects_a_tracked_path_whose_case_differs(tmp_path: Path):
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    git(outer, "init", "-q", "-b", "main")
+    space = outer / "space"
+    space.mkdir()
+    (space / "Lalalalala.log").write_text("committed", encoding="utf-8")
+    git(outer, "add", "-A")
+    git(outer, "commit", "-q", "-m", "track it")
+    age(space / "Lalalalala.log", 30)
+
+    cfg = config(trash={"enabled": True, "patterns": ["lala*", "Lala*"]})
+    actions = gt.sweep_trash(space, cfg, run(), _holding(space), [])
+    assert (space / "Lalalalala.log").is_file()
+    assert actions == []
+
+
+def test_a_directory_can_drop_the_pattern_that_matched_it(workspace: Path):
+    """Its own config decides whether it is an artefact at all."""
+    kept = workspace / "loose" / "__pycache__"
+    kept.mkdir(parents=True)
+    (kept / "m.pyc").write_text("x", encoding="utf-8")
+    (kept / ".git-tidy.yaml").write_text("clean:\n  dirs: []\n  files: []\n", encoding="utf-8")
+    ordinary = workspace / "other" / "__pycache__"
+    ordinary.mkdir(parents=True)
+
+    gt.main(["-C", str(workspace), "clean", "--apply"])
+    assert kept.is_dir(), "it said it is not an artefact"
+    assert not ordinary.exists()
+
+
+def test_submodule_init_reports_nothing_when_there_is_nothing_to_do(
+    workspace: Path, tmp_path: Path
+):
+    """A dry run must not promise work that will not happen."""
+    inner = tmp_path / "inner"
+    inner.mkdir()
+    git(inner, "init", "-q", "-b", "main")
+    commit(inner, "lib.txt")
+
+    repo = workspace / "repo"
+    git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(inner), "vendor")
+    git(repo, "commit", "-q", "-m", "add submodule")
+
+    cfg = config(sync={"submodules": "init"})["sync"]
+    assert gt._sync_submodules(gt.Git(repo), "repo", cfg, run(gt.DRY)) == []
+
+
+# --------------------------------------------------------------------------- #
+# Round thirty-seven of review
+# --------------------------------------------------------------------------- #
+
+
+def test_keep_cannot_be_overridden_by_an_explicit_pattern(workspace: Path):
+    """keep says never swept; patterns win over the heuristics, not over that."""
+    protected = workspace / "notes.md"
+    protected.write_text("mine", encoding="utf-8")
+    age(protected, 30)
+
+    cfg = config(trash={"enabled": True, "patterns": ["*.md"]})
+    actions = gt.sweep_trash(workspace, cfg, run(), _holding(workspace), [])
+    assert protected.is_file()
+    assert actions == []
+
+
+def test_a_dirty_submodule_is_left_alone(workspace: Path, tmp_path: Path):
+    """git moves one whose edits happen not to conflict, so ask first."""
+    inner = tmp_path / "inner"
+    inner.mkdir()
+    git(inner, "init", "-q", "-b", "main")
+    commit(inner, "lib.txt", "v1\n")
+
+    repo = workspace / "repo"
+    git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(inner), "vendor")
+    git(repo, "commit", "-q", "-m", "add submodule")
+    (repo / "vendor" / "lib.txt").write_text("work in progress\n", encoding="utf-8")
+
+    cfg = config(sync={"submodules": "update"})["sync"]
+    actions = gt._sync_submodules(gt.Git(repo), "repo", cfg, run())
+    assert actions and actions[0].skipped and "uncommitted work" in actions[0].detail
+    assert (repo / "vendor" / "lib.txt").read_text(encoding="utf-8") == "work in progress\n"
+
+
+def test_a_restored_entry_leaves_the_manifest(workspace: Path, capsys):
+    """Otherwise --list describes files that are no longer there."""
+    repo = workspace / "repo"
+    (repo / "__pycache__").mkdir()
+    (repo / "__pycache__" / "m.pyc").write_text("x", encoding="utf-8")
+    holding = gt.Quarantine(workspace / gt.QUARANTINE_DIRNAME, workspace, stamp="stamp")
+    gt.clean_tree(repo, "repo", config(), run(), gt.Git(repo), holding)
+    holding.write_manifest()
+
+    gt.restore(workspace / gt.QUARANTINE_DIRNAME, "stamp", run())
+    assert not (workspace / gt.QUARANTINE_DIRNAME / "stamp").exists(), "nothing left in it"
+
+    gt.main(["-C", str(workspace), "restore", "--list"])
+    assert "stamp" not in capsys.readouterr().out
+
+
+def test_a_dry_run_says_quarantine_when_it_means_quarantine(workspace: Path):
+    """ "would remove" for something that would only be moved is the wrong word."""
+    loose = workspace / "loose"
+    loose.mkdir()
+    (loose / "api-token.pyc").write_text("the only copy", encoding="utf-8")
+
+    context = gt.Context(
+        workspace,
+        gt.ConfigResolver(workspace),
+        run(gt.DRY),
+        quiet_printer(),
+        gt.find_repos(workspace, []),
+        _holding(workspace),
+    )
+    actions = gt._outside_repos(context, config(), context.quarantine)
+    token = [a for a in actions if "token" in a.target]
+    assert token and token[0].quarantined
+    assert "quarantine" in token[0].detail and "remove" not in token[0].detail

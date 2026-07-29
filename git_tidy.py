@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import contextlib
 import fnmatch
 import json
 import os
@@ -64,11 +65,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NoReturn
 
-__version__ = "1.2.0"
+__version__ = "2.0.0"
 
 CONFIG_NAMES = (".git-tidy.yaml", ".git-tidy.yml")
 QUARANTINE_DIRNAME = ".git-tidy-trash"
 MANIFEST_NAME = "manifest.json"
+# Appended to as files move, and folded into the manifest at the end. It is what
+# survives a run that was killed part way through.
+JOURNAL_NAME = "journal.jsonl"
 
 # A URL with a password or token in it, e.g. https://user:token@host/repo.git.
 # Bitbucket and GitLab hand these out from their web UI, and a clone made that way
@@ -90,7 +94,15 @@ class Failure(Exception):
 
 
 class Quit(Exception):
-    """Raised when the user answers 'q' to a prompt: stop, but keep what is done."""
+    """Raised when the user answers 'q': stop, but keep and report what is done.
+
+    Carries the actions accumulated so far, so a repository that had already
+    removed twenty things before the prompt still reports them.
+    """
+
+    def __init__(self, done: list[Action] | None = None) -> None:
+        super().__init__("stopped at your request")
+        self.done: list[Action] = done or []
 
 
 def worker_count(configured: Any) -> int:
@@ -253,14 +265,15 @@ COMMENTS: dict[str, str] = {
     "            clobber anything)\n"
     "clean-only: only switch when the worktree is clean\n"
     "never:      fast-forward whatever is checked out, do not switch",
-    "sync.fast_forward": "Only ever fast-forward. A diverged repository is reported,\n"
-    "never merged and never rebased.",
+    "sync.fast_forward": "Only ever fast-forward: never a merge commit. A diverged\n"
+    "repository is reported and left alone unless sync.diverged says otherwise.",
     "sync.prune": "Drop remote-tracking refs for branches deleted on the remote.",
     "sync.prune_tags": "Off by default: a tag that only exists locally also counts as\n"
     "gone, and deleting it loses it.",
     "sync.submodules": "none:   leave them alone\n"
     "init:   init and update missing ones\n"
-    "update: also force existing ones onto the recorded commit",
+    "update: also move existing ones onto the recorded commit. Never forced: a\n"
+    "        submodule with uncommitted work is left alone and reported.",
     "sync.gc": "Repack loose objects when git itself thinks it is worth it.",
     "sync.worktrees": "What to do with a linked worktree (one made by `git worktree add`).\n"
     "skip:   leave it on its branch — holding a branch of its own is the entire\n"
@@ -332,7 +345,8 @@ COMMENTS: dict[str, str] = {
     "deleted, even with quarantine off, because a token may be the only copy.",
     "trash.min_age_days": "Nothing younger than this is touched, so today's scratch\n"
     "file survives.",
-    "trash.keep": "Never swept.",
+    "trash.keep": "Never swept, whatever else matches. patterns win over the\n"
+    "heuristics, not over this.",
     "trash.dirs": "Consider directories too. A directory of junk is much more often a\n"
     "project somebody forgot about, so this is off.",
     "trash.quarantine": "Move to quarantine instead of deleting. Strongly recommended.",
@@ -550,7 +564,10 @@ def _scalar(token: str, source: str, number: int) -> Any:
         return flow
     if len(token) >= 2 and token[0] == token[-1] and token[0] in "\"'":
         body = token[1:-1]
-        return body.replace('\\"', '"').replace("\\\\", "\\") if token[0] == '"' else body
+        if token[0] == '"':
+            return body.replace('\\"', '"').replace("\\\\", "\\")
+        # In a single-quoted YAML scalar '' is a literal apostrophe.
+        return body.replace("''", "'")
     return _plain_scalar(token)
 
 
@@ -690,16 +707,43 @@ def _merge(base: dict[str, Any], overlay: dict[str, Any], where: str) -> dict[st
             elif not isinstance(value, list):
                 raise Failure(f"{where}: {key!r} takes a list")
             else:
+                for item in value:
+                    if not isinstance(item, str):
+                        # fnmatch would raise deep inside a worker instead.
+                        raise Failure(
+                            f"{where}: every entry of {key!r} must be text, "
+                            f"not {type(item).__name__} ({item!r})"
+                        )
                 result[key] = value
         else:
+            _check_scalar(base[key], value, key, where)
             result[key] = value
     return result
+
+
+def _check_scalar(default: Any, value: Any, key: str, where: str) -> None:
+    """Refuse a value whose type would change what the setting means.
+
+    `enabled: "false"` is a non-empty string, and a non-empty string is true.
+    `retention_days: false` is a bool, and a bool is an int in Python, so it
+    would sail through as zero days and expire every quarantine. `quarantine:`
+    with nothing after it is null, which is falsy — and would delete rather than
+    quarantine. None of those can be allowed to pass quietly in a tool that
+    deletes things.
+    """
+    if value is None:
+        raise Failure(f"{where}: {key!r} has no value; remove the line to keep the default")
+    expected = type(default)
+    if isinstance(default, bool) != isinstance(value, bool) or not isinstance(value, expected):
+        raise Failure(
+            f"{where}: {key!r} takes {expected.__name__}, not {type(value).__name__} ({value!r})"
+        )
 
 
 def read_config_file(path: Path) -> dict[str, Any]:
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         raise Failure(f"cannot read {path}: {exc}") from exc
     data = load_yaml(text, str(path))
     if data is None:
@@ -873,7 +917,7 @@ class Decider:
                 self._per_kind[action.kind] = False
                 return False
             if choice == "q":
-                raise Quit
+                raise Quit()
             print("  answer y, n, a, s, Y or q", file=self.stream)
 
 
@@ -1034,6 +1078,9 @@ class Action:
     applied: bool = False
     skipped: bool = False
     error: str | None = None
+    # Moved to the quarantine rather than deleted, so its bytes are still on
+    # disk and must not be counted as reclaimed.
+    quarantined: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -1044,6 +1091,7 @@ class Action:
             "size": self.size,
             "applied": self.applied,
             "skipped": self.skipped,
+            "quarantined": self.quarantined,
             "error": self.error,
         }
 
@@ -1061,11 +1109,23 @@ class Report:
 
     @property
     def bytes_freed(self) -> int:
-        return sum(a.size for a in self.actions if a.applied)
+        """Bytes actually reclaimed. Quarantined files are still on the disk."""
+        return sum(a.size for a in self.actions if a.applied and not a.quarantined)
+
+    @property
+    def bytes_quarantined(self) -> int:
+        return sum(a.size for a in self.actions if a.applied and a.quarantined)
 
     @property
     def bytes_found(self) -> int:
-        return sum(a.size for a in self.actions if not a.error and not a.skipped)
+        """Bytes a dry run would actually reclaim. Quarantined ones only move."""
+        return sum(
+            a.size for a in self.actions if not a.error and not a.skipped and not a.quarantined
+        )
+
+    @property
+    def bytes_found_quarantined(self) -> int:
+        return sum(a.size for a in self.actions if not a.error and not a.skipped and a.quarantined)
 
     @property
     def errors(self) -> list[Action]:
@@ -1077,7 +1137,7 @@ class Report:
 # --------------------------------------------------------------------------- #
 
 
-def default_branch(git: Git, cfg: dict[str, Any]) -> str | None:
+def default_branch(git: Git, cfg: dict[str, Any], readonly: bool = False) -> str | None:
     """Work out which branch this repo considers its trunk.
 
     Asks the remote's own HEAD first, because a repo may well not use `main`, and
@@ -1096,8 +1156,9 @@ def default_branch(git: Git, cfg: dict[str, Any]) -> str | None:
         return cached
     # Either there is no cached HEAD, or it is stale — a repository renamed from
     # master to main upstream keeps pointing at a branch that is no longer there.
-    # Both cases are answered by asking the remote again.
-    if git.ok("remote", "set-head", remote, "--auto"):
+    # Both cases are answered by asking the remote again, which writes a ref and
+    # goes to the network, so a dry run does neither.
+    if not readonly and git.ok("remote", "set-head", remote, "--auto"):
         fresh = _cached_head(git, remote)
         if fresh and exists(fresh):
             return fresh
@@ -1116,7 +1177,18 @@ def _cached_head(git: Git, remote: str) -> str | None:
 
 
 def is_dirty(git: Git) -> bool:
-    return bool(git.out("status", "--porcelain", "--untracked-files=no", check=False))
+    """Whether the worktree holds anything uncommitted — untracked files included.
+
+    An untracked file is uncommitted work by any ordinary reading, and the README
+    promises such a repository stays on its branch. Excluding them also opened a
+    real hole: switch away from a feature branch, and a file the *default*
+    branch's .gitignore happens to match becomes fair game for clean.ignored.
+
+    Ignored files do not count. They are what clean.ignored exists to remove, and
+    treating them as work would freeze every repository that has ever been built.
+    """
+    status = git.out("status", "--porcelain", "--untracked-files=normal", check=False)
+    return bool(status)
 
 
 def current_branch(git: Git) -> str:
@@ -1136,12 +1208,28 @@ def sync_repo(path: Path, name: str, cfg: dict[str, Any], decider: Decider) -> l
     if remote not in git.out("remote", check=False).split():
         return [Action("sync", name, remote, "no such remote", skipped=True)]
 
+    fetch = Action("fetch", name, remote, "fetch")
+    with keeping(actions):
+        return _sync_from(
+            git, name, sync, remote, fetch, actions, decider, cfg["clean"]["ignored_keep"]
+        )
+
+
+def _sync_from(
+    git: Git,
+    name: str,
+    sync: dict[str, Any],
+    remote: str,
+    fetch: Action,
+    actions: list[Action],
+    decider: Decider,
+    ignored_keep: Sequence[str] = (),
+) -> list[Action]:
     fetch_args = ["fetch", remote, "--quiet"]
     if sync["prune"]:
         fetch_args.append("--prune")
     if sync["prune_tags"]:
         fetch_args.append("--prune-tags")
-    fetch = Action("fetch", name, remote, "fetch")
     if decider.allow(fetch):
         result = git.run(*fetch_args, check=False)
         if result.returncode != 0:
@@ -1151,7 +1239,7 @@ def sync_repo(path: Path, name: str, cfg: dict[str, Any], decider: Decider) -> l
         fetch.detail = "fetched"
     actions.append(fetch)
 
-    branch = default_branch(git, sync)
+    branch = default_branch(git, sync, readonly=decider.dry)
     if branch is None:
         actions.append(Action("sync", name, "-", "no default branch found", skipped=True))
         return actions
@@ -1163,13 +1251,13 @@ def sync_repo(path: Path, name: str, cfg: dict[str, Any], decider: Decider) -> l
 
     head = current_branch(git)
     if head != branch:
-        outcome = _switch(git, name, head, branch, target, sync, decider)
+        outcome = _switch(git, name, head, branch, target, sync, decider, ignored_keep)
         actions.extend(outcome.actions)
         if outcome.stop:
             return actions
         head = current_branch(git)
 
-    actions.extend(_fast_forward(git, name, head, branch, target, sync, decider))
+    actions.extend(_fast_forward(git, name, head, branch, target, sync, decider, ignored_keep))
     actions.extend(_sync_submodules(git, name, sync, decider))
     if sync["gc"] and not decider.dry:
         git.run("gc", "--auto", "--quiet", check=False)
@@ -1190,44 +1278,30 @@ def _switch(
     target: str,
     sync: dict[str, Any],
     decider: Decider,
+    cfg_ignored_keep: Sequence[str] = (),
 ) -> _Outcome:
     policy = sync["switch"]
     where = head or "detached HEAD"
-    if sync["worktrees"] == "skip" and is_linked_worktree(git):
-        # Nothing is wrong here: this checkout exists to hold its own branch.
-        return _Outcome(
-            [Action("switch", name, branch, f"linked worktree, left on {where}", skipped=True)],
-            stop=False,
-        )
-    if policy == "never":
-        return _Outcome([Action("switch", name, branch, f"staying on {where}", skipped=True)])
-    if policy not in ("always", "clean-only"):
-        raise Failure(f"sync.switch must be always, clean-only or never, not {policy!r}")
-    stashed: list[Action] = []
-    if is_dirty(git):
-        if policy == "clean-only":
-            return _Outcome(
-                [Action("switch", name, branch, f"uncommitted changes on {where}", skipped=True)],
-                stop=True,
-            )
-        if sync["stash"] and not decider.dry:
-            put_aside = _stash(git, name)
-            stashed.append(put_aside)
-            if put_aside.error:
-                return _Outcome(stashed, stop=True)
-    # A branch can only be checked out in one worktree at a time, and a workspace
-    # that keeps .worktrees/ next to the clones hits this constantly. Nothing is
-    # wrong: the branch is simply in use elsewhere, so say so rather than fail.
-    elsewhere = _checked_out_elsewhere(git, branch)
-    if elsewhere:
-        return _Outcome(
-            [Action("switch", name, branch, f"checked out in {elsewhere}", skipped=True)],
-            stop=True,
-        )
+    blocked = _cannot_switch(git, name, branch, where, policy, sync, cfg_ignored_keep)
+    if blocked is not None:
+        return blocked
 
-    action = Action("switch", name, branch, f"switch from {where}")
-    if not decider.allow(action):
-        return _Outcome([*stashed, action], stop=True)
+    action: Action | None = None
+    if is_dirty(git):
+        room = _make_room(git, name, branch, where, policy, sync, decider)
+        if isinstance(room, _Outcome):
+            return room
+        # Consent was given for "stash and switch", so that is the action being
+        # carried out — and the one the summary should name.
+        action = room
+        put_aside = _stash(git, name)
+        if put_aside is not None:
+            return _Outcome([put_aside], stop=True)
+
+    if action is None:
+        action = Action("switch", name, branch, f"switch from {where}")
+        if not decider.allow(action):
+            return _Outcome([action], stop=True)
     result = git.run("switch", branch, check=False)
     if result.returncode != 0 and not git.ok(
         "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"
@@ -1237,52 +1311,99 @@ def _switch(
         # the useless "a branch named 'main' already exists".
         result = git.run("switch", "--create", branch, "--track", target, check=False)
     if result.returncode != 0:
-        action.error = last_line(result)
-        return _Outcome([*stashed, action], stop=True)
+        undone = f" ({_unstash(git)})" if action.kind == "stash+switch" else ""
+        action.error = f"{last_line(result)}{undone}"
+        return _Outcome([action], stop=True)
     action.applied = True
-    action.detail = f"switched from {where}"
-    return _Outcome([*stashed, action])
+    action.detail = (
+        f"stashed and switched from {where}, recover it with git stash pop"
+        if action.kind == "stash+switch"
+        else f"switched from {where}"
+    )
+    return _Outcome([action])
 
 
-def _stash(git: Git, name: str) -> Action:
-    """Put uncommitted work aside so a switch or fast-forward can proceed.
+def _cannot_switch(
+    git: Git,
+    name: str,
+    branch: str,
+    where: str,
+    policy: str,
+    sync: dict[str, Any],
+    ignored_keep: Sequence[str] = (),
+) -> _Outcome | None:
+    """The reasons a switch is not going to happen, before any work is done.
 
-    Deliberately a stash and not `checkout --force`: the point of --force is to
-    get the move done, not to destroy work that was never committed anywhere.
-    `git stash pop` brings it back.
+    Every one of them is checked here, before the stash: deciding not to switch
+    after putting somebody's work aside would leave it in a stash nobody
+    mentioned.
     """
-    result = git.run("stash", "push", "--include-untracked", "-m", f"git-tidy: {name}", check=False)
-    if result.returncode != 0:
-        return Action("stash", name, "-", "", error=last_line(result))
-    return Action("stash", name, "-", "stashed uncommitted work", applied=True)
-
-
-def is_linked_worktree(git: Git) -> bool:
-    """True when this checkout was made by `git worktree add`.
-
-    A linked worktree keeps its own .git *file* pointing into the parent's
-    .git/worktrees/<name>, so its git-dir and its common git-dir differ.
-    """
-    own = git.out("rev-parse", "--absolute-git-dir", check=False)
-    shared = git.out("rev-parse", "--path-format=absolute", "--git-common-dir", check=False)
-    return bool(own) and bool(shared) and own != shared
-
-
-def _checked_out_elsewhere(git: Git, branch: str) -> str | None:
-    """The other worktree holding `branch`, or None.
-
-    Read from `git worktree list` rather than matched against git's error text,
-    which varies by version and locale.
-    """
-    here = git.out("rev-parse", "--show-toplevel", check=False)
-    where: str | None = None
-    for line in git.out("worktree", "list", "--porcelain", check=False).splitlines():
-        field, _, value = line.partition(" ")
-        if field == "worktree":
-            where = value
-        elif field == "branch" and value == f"refs/heads/{branch}" and where != here:
-            return where
+    if sync["worktrees"] not in ("skip", "switch"):
+        raise Failure(f"sync.worktrees must be skip or switch, not {sync['worktrees']!r}")
+    if policy not in ("always", "clean-only", "never"):
+        raise Failure(f"sync.switch must be always, clean-only or never, not {policy!r}")
+    if sync["worktrees"] == "skip" and is_linked_worktree(git):
+        # Nothing is wrong here: this checkout exists to hold its own branch.
+        return _Outcome(
+            [Action("switch", name, branch, f"linked worktree, left on {where}", skipped=True)]
+        )
+    if policy == "never":
+        return _Outcome([Action("switch", name, branch, f"staying on {where}", skipped=True)])
+    # A branch lives in one worktree at a time, and a workspace that keeps
+    # .worktrees/ next to the clones hits that constantly. Nothing is wrong: the
+    # branch is simply in use elsewhere, so say so rather than fail.
+    elsewhere = _checked_out_elsewhere(git, branch)
+    if elsewhere:
+        return _Outcome(
+            [Action("switch", name, branch, f"checked out in {elsewhere}", skipped=True)],
+            stop=True,
+        )
+    clobbered = _would_clobber_ignored(git, branch, ignored_keep)
+    if clobbered is not None:
+        return _Outcome(
+            [
+                Action(
+                    "switch",
+                    name,
+                    branch,
+                    f"{branch} tracks {clobbered}, which is ignored here and would be replaced",
+                    skipped=True,
+                )
+            ],
+            stop=True,
+        )
     return None
+
+
+def _make_room(
+    git: Git,
+    name: str,
+    branch: str,
+    where: str,
+    policy: str,
+    sync: dict[str, Any],
+    decider: Decider,
+) -> _Outcome | Action:
+    """Decide what to do about uncommitted work.
+
+    Returns an _Outcome to stop, or the Action that was consented to. The consent
+    happens here, before the stash: declining must leave the worktree exactly as
+    it was, not tidied into a stash the user never agreed to.
+    """
+    # No decider.dry here: a dry run has to describe the run it is standing in
+    # for. allow() refuses in dry mode anyway, so nothing is stashed — but the
+    # line now reads "would stash and switch" instead of claiming it was blocked.
+    if policy == "clean-only" or not sync["stash"]:
+        return _Outcome(
+            [Action("switch", name, branch, f"uncommitted changes on {where}", skipped=True)],
+            stop=True,
+        )
+    # A distinct kind, so answering "all of these" to plain switches cannot leak
+    # into consent for stashing somebody's uncommitted work.
+    proposed = Action("stash+switch", name, branch, f"stash and switch from {where}")
+    if not decider.allow(proposed):
+        return _Outcome([proposed], stop=True)
+    return proposed
 
 
 def _fast_forward(
@@ -1293,6 +1414,7 @@ def _fast_forward(
     target: str,
     sync: dict[str, Any],
     decider: Decider,
+    ignored_keep: Sequence[str] = (),
 ) -> list[Action]:
     if not sync["fast_forward"]:
         return []
@@ -1318,29 +1440,134 @@ def _fast_forward(
         return [Action("update", name, head, f"up to date{when}", skipped=True)]
     if ahead != "0":
         return _diverged(git, name, head, upstream, ahead, behind, sync, decider)
-    stashed: list[Action] = []
-    if is_dirty(git):
-        if not sync["stash"] or decider.dry:
-            # git would refuse anyway, with "Your local changes would be
-            # overwritten by merge". Refusing first turns a failure into a plain
-            # statement of fact, which is what it is.
-            return [
-                Action("update", name, head, f"uncommitted changes, {behind} behind", skipped=True)
-            ]
-        put_aside = _stash(git, name)
-        stashed.append(put_aside)
-        if put_aside.error:
-            return stashed
-    action = Action("update", name, head, f"fast-forward {plural(behind, 'commit')}")
+    dirty = is_dirty(git)
+    if dirty and not sync["stash"]:
+        # git would refuse anyway, with "Your local changes would be overwritten
+        # by merge". Refusing first turns a failure into a plain statement of
+        # fact, which is what it is.
+        return [Action("update", name, head, f"uncommitted changes, {behind} behind", skipped=True)]
+    verb = "stash and fast-forward" if dirty else "fast-forward"
+    # A different kind, so answering "all of these" to plain fast-forwards never
+    # silently consents to stashing somebody's uncommitted work as well.
+    kind = "stash+update" if dirty else "update"
+    # git merge overwrites an ignored file the incoming commits track, exactly as
+    # a checkout does, and just as silently.
+    clobbered = _would_clobber_ignored(git, upstream, ignored_keep)
+    if clobbered is not None:
+        return [
+            Action(
+                "update",
+                name,
+                head,
+                f"{upstream} tracks {clobbered}, which is ignored here and would be replaced",
+                skipped=True,
+            )
+        ]
+    action = Action(kind, name, head, f"{verb} {plural(behind, 'commit')}")
+    # Consent covers the stash too: declining must leave the worktree as it was,
+    # not tidied into a stash nobody agreed to.
     if not decider.allow(action):
-        return [*stashed, action]
+        return [action]
+    if dirty and (put_aside := _stash(git, name)) is not None:
+        return [put_aside]
     result = git.run("merge", "--ff-only", "--quiet", upstream, check=False)
     if result.returncode != 0:
-        action.error = last_line(result)
+        undone = f" ({_unstash(git)})" if dirty else ""
+        action.error = f"{last_line(result)}{undone}"
     else:
         action.applied = True
-        action.detail = f"fast-forwarded {plural(behind, 'commit')}"
-    return [*stashed, action]
+        # The "stashed and" survives into the result: work left in a stash the
+        # user did not ask for must never be reported silently.
+        done = f"fast-forwarded {plural(behind, 'commit')}"
+        action.detail = f"stashed and {done}, recover it with git stash pop" if dirty else done
+    return [action]
+
+
+@contextlib.contextmanager
+def keeping(actions: list[Action]) -> Iterator[None]:
+    """Hand what has been done so far to a Quit on its way out.
+
+    Every step that accumulates actions needs this, or answering 'q' half way
+    through makes the report claim less happened than did.
+    """
+    try:
+        yield
+    except Quit as quit_now:
+        quit_now.done.extend(actions)
+        raise
+
+
+def _stash(git: Git, name: str) -> Action | None:
+    """Put uncommitted work aside so a switch or fast-forward can proceed.
+
+    Deliberately a stash and not `checkout --force`: the point of --force is to
+    get the move done, not to destroy work that was never committed anywhere.
+    `git stash pop` brings it back.
+    """
+    result = git.run("stash", "push", "--include-untracked", "-m", f"git-tidy: {name}", check=False)
+    if result.returncode != 0:
+        return Action("stash", name, "-", "", error=last_line(result))
+    # Nothing on success: the action this made room for already says "stashed
+    # and switched". Reporting it separately counted the same event twice.
+    return None
+
+
+def is_linked_worktree(git: Git) -> bool:
+    """True when this checkout was made by `git worktree add`.
+
+    A linked worktree keeps its own .git *file* pointing into the parent's
+    .git/worktrees/<name>, so its git-dir and its common git-dir differ.
+    """
+    own = git.out("rev-parse", "--absolute-git-dir", check=False)
+    shared = git.out("rev-parse", "--path-format=absolute", "--git-common-dir", check=False)
+    return bool(own) and bool(shared) and own != shared
+
+
+def _would_clobber_ignored(git: Git, branch: str, protect: Sequence[str]) -> str | None:
+    """An ignored file the target branch tracks, which switching would overwrite.
+
+    git treats ignored files as expendable during a checkout: unlike an untracked
+    file, it replaces them without a word. That is exactly the wrong outcome for
+    a local .env or *.tfstate, which is what ignored_keep names. Only those are
+    checked — asking about every ignored file would mean walking node_modules.
+    """
+    for relative in ignored_paths(git):
+        name = Path(relative).name
+        if not (_matches(name, protect) or any(fnmatch.fnmatch(relative, p) for p in protect)):
+            continue
+        if git.ok("cat-file", "-e", f"{branch}:{relative}"):
+            return relative
+    return None
+
+
+def _unstash(git: Git) -> str:
+    """Put a stash back after the operation it made room for failed.
+
+    Without this, "nothing changed" would be untrue: the rebase or switch was
+    undone, but the user's work would still be sitting in a stash they never
+    asked for.
+    """
+    result = git.run("stash", "pop", check=False)
+    if result.returncode == 0:
+        return "nothing changed"
+    return f"your changes are in the stash: {last_line(result)}"
+
+
+def _checked_out_elsewhere(git: Git, branch: str) -> str | None:
+    """The other worktree holding `branch`, or None.
+
+    Read from `git worktree list` rather than matched against git's error text,
+    which varies by version and locale.
+    """
+    here = git.out("rev-parse", "--show-toplevel", check=False)
+    where: str | None = None
+    for line in git.out("worktree", "list", "--porcelain", check=False).splitlines():
+        field, _, value = line.partition(" ")
+        if field == "worktree":
+            where = value
+        elif field == "branch" and value == f"refs/heads/{branch}" and where != here:
+            return where
+    return None
 
 
 def _diverged(
@@ -1362,22 +1589,61 @@ def _diverged(
     if is_dirty(git) and not sync["stash"]:
         return [Action("update", name, head, f"{summary}, and uncommitted changes", skipped=True)]
 
-    action = Action("update", name, head, f"rebase {plural(ahead, 'commit')} onto {upstream}")
+    dirty = is_dirty(git)
+    verb = "stash and rebase" if dirty else "rebase"
+    # 11: its own kind, so the summary does not call a rebase a fast-forward.
+    action = Action(
+        "stash+rebase" if dirty else "rebase",
+        name,
+        head,
+        f"{verb} {plural(ahead, 'commit')} onto {upstream}",
+    )
     if not decider.allow(action):
         return [action]
-    stashed = [_stash(git, name)] if is_dirty(git) else []
-    if stashed and stashed[0].error:
-        return stashed
+    if dirty and (put_aside := _stash(git, name)) is not None:
+        return [put_aside]
     result = git.run("rebase", "--autostash", upstream, check=False)
     if result.returncode != 0:
         # Leave nothing half-applied: a conflicted rebase in 200 repositories is
         # far worse than a report saying it did not happen.
         git.run("rebase", "--abort", check=False)
-        action.error = f"{last_line(result)} (rebase aborted, nothing changed)"
+        undone = _unstash(git) if dirty else "nothing changed"
+        action.error = f"{last_line(result)} (rebase aborted, {undone})"
     else:
         action.applied = True
-        action.detail = f"rebased {plural(ahead, 'commit')} onto {upstream}"
-    return [*stashed, action]
+        done = f"rebased {plural(ahead, 'commit')} onto {upstream}"
+        action.detail = f"stashed and {done}, recover it with git stash pop" if dirty else done
+    return [action]
+
+
+def _dirty_submodules(git: Git) -> list[str]:
+    """Submodules with uncommitted work in them.
+
+    `git submodule status` does not answer this — its '+' means the checked-out
+    commit differs from the recorded one, not that the worktree is dirty — so
+    each one is asked directly. git will happily move a submodule whose edits
+    happen not to conflict, and asking first is the only way to keep the promise
+    that they are left alone.
+    """
+    dirty: list[str] = []
+    for line in git.out("submodule", "status", "--recursive", check=False).splitlines():
+        fields = line[1:].split() if line[:1] in ("+", "-", "U", " ") else line.split()
+        if len(fields) < 2:
+            continue
+        path = git.path / fields[1]
+        if path.is_dir() and is_dirty(Git(path, timeout=git.timeout)):
+            dirty.append(fields[1])
+    return dirty
+
+
+def _uninitialised_submodules(git: Git) -> list[str]:
+    """Submodule paths git has not checked out yet, marked with a leading '-'."""
+    out = git.out("submodule", "status", "--recursive", check=False)
+    return [
+        line[1:].split()[1]
+        for line in out.splitlines()
+        if line.startswith("-") and len(line[1:].split()) > 1
+    ]
 
 
 def _sync_submodules(git: Git, name: str, sync: dict[str, Any], decider: Decider) -> list[Action]:
@@ -1388,12 +1654,37 @@ def _sync_submodules(git: Git, name: str, sync: dict[str, Any], decider: Decider
         raise Failure(f"sync.submodules must be none, init or update, not {mode!r}")
     if not (git.path / ".gitmodules").is_file():
         return []
+    dirty = _dirty_submodules(git)
+    if dirty:
+        return [
+            Action(
+                "submodules",
+                name,
+                mode,
+                f"uncommitted work in {dirty[0]}"
+                + (f" and {len(dirty) - 1} more" if len(dirty) > 1 else ""),
+                skipped=True,
+            )
+        ]
+    missing = _uninitialised_submodules(git) if mode == "init" else []
+    if mode == "init" and not missing:
+        # Nothing to initialise, so there is nothing to report — least of all in
+        # a dry run, which would be promising work that will not happen.
+        return []
     action = Action("submodules", name, mode, "update submodules")
     if not decider.allow(action):
         return [action]
+    # Deliberately no --force. `git submodule update --force` is a
+    # `checkout --force` inside each submodule, which throws away uncommitted
+    # work there exactly as `git checkout --force` would in the parent — and
+    # nothing else in this tool does that. Without it git refuses to clobber and
+    # the refusal is reported.
     args = ["submodule", "update", "--init", "--recursive", "--quiet"]
-    if mode == "update":
-        args.insert(2, "--force")
+    if mode == "init":
+        # Only the ones that are not there yet. A bare --init --recursive also
+        # moves already-checked-out submodules onto the recorded commit, which is
+        # what "update" is for.
+        args += ["--", *missing]
     result = git.run(*args, check=False)
     if result.returncode != 0:
         action.error = last_line(result)
@@ -1437,15 +1728,34 @@ def list_branches(git: Git) -> list[BranchInfo]:
     return branches
 
 
-def prune_branches(path: Path, name: str, cfg: dict[str, Any], decider: Decider) -> list[Action]:
+def prune_branches(
+    path: Path, name: str, cfg: dict[str, Any], decider: Decider, fetched: bool = False
+) -> list[Action]:
     """Delete local branches the remote no longer has, keeping unpushed work."""
     rules = cfg["branches"]
     git = Git(path, timeout=int(cfg["sync"]["timeout"]))
     actions: list[Action] = []
-    trunk = default_branch(git, cfg["sync"])
+    # prune does not fetch, so it must not go to the network here either.
+    trunk = default_branch(git, cfg["sync"], readonly=True)
     remote = cfg["sync"]["remote"]
     head = current_branch(git)
 
+    with keeping(actions):
+        _consider_branches(git, name, rules, trunk, remote, head, fetched, decider, actions)
+    return actions
+
+
+def _consider_branches(
+    git: Git,
+    name: str,
+    rules: dict[str, Any],
+    trunk: str | None,
+    remote: str,
+    head: str,
+    fetched: bool,
+    decider: Decider,
+    actions: list[Action],
+) -> None:
     for branch in list_branches(git):
         if any(fnmatch.fnmatch(branch.name, pattern) for pattern in rules["keep"]):
             continue
@@ -1467,17 +1777,22 @@ def prune_branches(path: Path, name: str, cfg: dict[str, Any], decider: Decider)
             )
             continue
 
-        if rules["require_merged"]:
-            kept = _keep_reason(git, branch, trunk, remote, reason)
-            if kept is not None:
-                actions.append(Action("branch", name, branch.name, kept, skipped=True))
-                continue
+        kept = _why_keep(git, branch, trunk, remote, reason, rules, fetched)
+        if kept is not None:
+            actions.append(Action("branch", name, branch.name, kept, skipped=True))
+            continue
 
         action = Action("branch", name, branch.name, f"delete ({reason})")
         if not decider.allow(action):
             actions.append(action)
             continue
-        result = git.run("branch", "--delete", "--force", branch.name, check=False)
+        # --delete without --force makes git re-check containment at the moment
+        # of deletion, which closes the gap between the check above and here.
+        # --force is only used where containment was deliberately waived.
+        args = ["branch", "--delete", branch.name]
+        if not rules["require_merged"]:
+            args.insert(2, "--force")
+        result = git.run(*args, check=False)
         if result.returncode == 0:
             action.applied = True
             action.detail = f"deleted ({reason})"
@@ -1491,13 +1806,33 @@ def prune_branches(path: Path, name: str, cfg: dict[str, Any], decider: Decider)
         else:
             action.error = last_line(result)
         actions.append(action)
-    return actions
 
 
 # The branch was there when it was listed and is not there now: another worker
 # sharing this ref store got to it first. Distinct from "keep it", which is what
 # a bare reason string means.
 VANISHED = object()
+
+
+def _why_keep(
+    git: Git,
+    branch: BranchInfo,
+    trunk: str | None,
+    remote: str,
+    reason: str,
+    rules: dict[str, Any],
+    fetched: bool,
+) -> str | None:
+    """The message to report instead of deleting, or None to go ahead."""
+    if rules["require_merged"]:
+        return _keep_reason(git, branch, trunk, remote, reason)
+    if not fetched:
+        # Without the containment check, the only thing between this branch and
+        # deletion is the [gone] mark — a cached observation. If it predates this
+        # run the branch may have been recreated upstream since, and its commits
+        # exist nowhere else.
+        return "kept: needs a fetch in this run before deleting unmerged work"
+    return None
 
 
 def _keep_reason(
@@ -1573,7 +1908,13 @@ def tracked_paths(git: Git) -> set[str]:
     files and directories alike, with one git call per repo instead of one per
     candidate path.
     """
-    out = git.run("ls-files", "-z", check=False).stdout
+    result = git.run("ls-files", "-z", check=False)
+    if result.returncode != 0:
+        # An empty set here would mean "nothing is tracked", and every artefact
+        # rule would then apply to committed files. Refusing isolates this one
+        # repository instead; _guarded turns it into a reported failure.
+        raise Failure(f"cannot read the index: {last_line(result)}")
+    out = result.stdout
     paths: set[str] = set()
     for entry in out.split("\0"):
         if not entry:
@@ -1583,7 +1924,11 @@ def tracked_paths(git: Git) -> set[str]:
         while str(parent) != ".":
             paths.add(parent.as_posix())
             parent = parent.parent
-    return paths
+    # macOS and Windows hand back a path whose case need not match the index —
+    # after a case-only rename, git says Build/x while the disk says build/x.
+    # Both spellings are protected: over-protecting keeps a file that could have
+    # gone, under-protecting deletes one that was committed.
+    return paths | {entry.lower() for entry in paths}
 
 
 def ignored_paths(git: Git) -> list[str]:
@@ -1622,6 +1967,7 @@ def clean_ignored(
     decider: Decider,
     quarantine: Quarantine | None,
     git: Git,
+    holding: Quarantine | None = None,
 ) -> list[Action]:
     """Remove everything the repo's own .gitignore already calls disposable."""
     clean = cfg["clean"]
@@ -1639,6 +1985,14 @@ def clean_ignored(
         if any(fnmatch.fnmatch(name, p) or fnmatch.fnmatch(relative, p) for p in protect):
             actions.append(Action("ignored", scope, relative, "kept by ignored_keep", skipped=True))
             continue
+        # git collapses a wholly ignored directory into one entry, so a
+        # build/ holding a .env or a *.pem arrives here as a single path.
+        # Testing only its name would delete the protected file with it.
+        if path.is_dir() and (holds := _holds_protected(path, protect, base=repo)):
+            actions.append(
+                Action("ignored", scope, relative, f"kept: contains {holds}", skipped=True)
+            )
+            continue
         actions.append(
             _remove(
                 path,
@@ -1649,9 +2003,33 @@ def clean_ignored(
                 is_dir=path.is_dir(),
                 kind="ignored",
                 protect_nested=not _matches(name, clean["regenerable"]),
+                sensitive=cfg["trash"]["sensitive"],
+                holding=holding,
             )
         )
     return actions
+
+
+def _holds_protected(
+    directory: Path, protect: Sequence[str], base: Path | None = None
+) -> str | None:
+    """The first ignored_keep match buried in `directory`, or None.
+
+    Patterns are tested against the name *and* against the path relative to the
+    repository, so `build/config/*.pem` protects as surely as `*.pem` does.
+    """
+    root = base or directory
+    for dirpath, dirnames, filenames in os.walk(directory, followlinks=False):
+        here = Path(dirpath)
+        for entry in (*dirnames, *filenames):
+            candidate = here / entry
+            relative = candidate.relative_to(root).as_posix()
+            if _matches(entry, protect) or any(fnmatch.fnmatch(relative, p) for p in protect):
+                return candidate.relative_to(directory).as_posix()
+        # Pruned only after their names have been considered: a symlink whose
+        # own name is protected still protects its parent from removal.
+        dirnames[:] = [d for d in dirnames if not (here / d).is_symlink()]
+    return None
 
 
 def clean_tree(
@@ -1662,6 +2040,9 @@ def clean_tree(
     git: Git | None,
     quarantine: Quarantine | None,
     stay_inside: bool = True,
+    already: set[str] | None = None,
+    sensitive: Sequence[str] = (),
+    holding: Quarantine | None = None,
 ) -> list[Action]:
     """Remove artefact directories and files under `root`.
 
@@ -1671,55 +2052,131 @@ def clean_tree(
     """
     clean = cfg["clean"]
     dir_patterns, file_patterns = clean_patterns(clean)
-    keep = clean["keep"]
-    tracked = tracked_paths(git) if git is not None and not clean["tracked"] else set()
+    plan = _Sweep(
+        root=root,
+        scope=scope,
+        clean=clean,
+        dir_patterns=dir_patterns,
+        file_patterns=file_patterns,
+        keep=clean["keep"],
+        tracked=tracked_paths(git) if git is not None and not clean["tracked"] else set(),
+        decider=decider,
+        quarantine=quarantine,
+        stay_inside=stay_inside,
+        already=already or set(),
+        sensitive=sensitive,
+        holding=holding,
+    )
     actions: list[Action] = []
+    try:
+        _walk_and_remove(plan, actions)
+    except Quit as quit_now:
+        quit_now.done.extend(actions)
+        raise
+    return actions
 
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+
+@dataclass
+class _Sweep:
+    """Everything one artefact walk needs, so the walk itself stays readable."""
+
+    root: Path
+    scope: str
+    clean: dict[str, Any]
+    dir_patterns: list[str]
+    file_patterns: list[str]
+    keep: Sequence[str]
+    tracked: set[str]
+    decider: Decider
+    quarantine: Quarantine | None
+    stay_inside: bool
+    already: set[str]
+    # Consulted only when quarantine is off: a directory holding one of these is
+    # moved rather than deleted.
+    sensitive: Sequence[str] = ()
+    holding: Quarantine | None = None
+
+
+def _walk_and_remove(plan: _Sweep, actions: list[Action]) -> None:
+    for dirpath, dirnames, filenames in os.walk(plan.root, followlinks=False):
         here = Path(dirpath)
         if ".git" in here.parts:
             dirnames[:] = []
             continue
-        descend: list[str] = []
-        matched: list[str] = []
-        for name in sorted(dirnames):
-            candidate = here / name
-            if name in (".git", QUARANTINE_DIRNAME) or candidate.is_symlink():
-                continue
-            if stay_inside and candidate != root and is_repo(candidate):
-                continue  # a repo of its own; not this walk's business
-            if not clean["dependencies"] and _matches(name, clean["dependency_dirs"]):
-                # A .venv full of __pycache__ is the package manager's business,
-                # not ours. Descending into it produced hundreds of lines of
-                # output for a few megabytes nobody asked about.
-                continue
-            if _matches(name, dir_patterns) and not _protected(candidate, root, keep, tracked):
-                matched.append(name)
-            else:
-                descend.append(name)
+        descend, matched = _sort_directories(plan, here, dirnames)
         # Matched directories go whole, so they are not descended into.
         dirnames[:] = descend
         for name in matched:
             actions.append(
                 _remove(
                     here / name,
-                    root,
-                    scope,
-                    decider,
-                    quarantine,
+                    plan.root,
+                    plan.scope,
+                    plan.decider,
+                    plan.quarantine,
                     is_dir=True,
-                    protect_nested=not _matches(name, clean["regenerable"]),
+                    protect_nested=not _matches(name, plan.clean["regenerable"]),
+                    sensitive=plan.sensitive,
+                    holding=plan.holding,
                 )
             )
-
         for name in sorted(filenames):
             candidate = here / name
-            if candidate.is_symlink() or not _matches(name, file_patterns):
-                continue
-            if _protected(candidate, root, keep, tracked):
-                continue
-            actions.append(_remove(candidate, root, scope, decider, quarantine, is_dir=False))
-    return actions
+            if _wanted_file(plan, candidate, name):
+                actions.append(
+                    _remove(
+                        candidate,
+                        plan.root,
+                        plan.scope,
+                        plan.decider,
+                        plan.quarantine,
+                        is_dir=False,
+                        sensitive=plan.sensitive,
+                        holding=plan.holding,
+                    )
+                )
+
+
+def _sort_directories(plan: _Sweep, here: Path, dirnames: list[str]) -> tuple[list[str], list[str]]:
+    """Split this level into what to walk into and what to remove whole."""
+    descend: list[str] = []
+    matched: list[str] = []
+    for name in sorted(dirnames):
+        candidate = here / name
+        if name in (".git", QUARANTINE_DIRNAME) or candidate.is_symlink():
+            continue
+        if plan.stay_inside and candidate != plan.root and is_repo(candidate):
+            continue  # a repo of its own; not this walk's business
+        if not plan.clean["dependencies"] and _matches(name, plan.clean["dependency_dirs"]):
+            # A .venv full of __pycache__ is the package manager's business, not
+            # ours. Descending into it produced hundreds of lines of output for a
+            # few megabytes nobody asked about.
+            continue
+        if candidate.relative_to(plan.root).as_posix() in plan.already:
+            # clean.ignored already accounted for this one. In a dry run it is
+            # still on disk, and reporting it again would double both the count
+            # and the size against a run that removes it once.
+            continue
+        if _matches(name, plan.dir_patterns) and not _protected(
+            candidate, plan.root, plan.keep, plan.tracked
+        ):
+            # Removing it whole would take anything keep protects inside it, so
+            # walk in instead and decide file by file.
+            if _holds_protected(candidate, plan.keep, base=plan.root):
+                descend.append(name)
+            else:
+                matched.append(name)
+        else:
+            descend.append(name)
+    return descend, matched
+
+
+def _wanted_file(plan: _Sweep, candidate: Path, name: str) -> bool:
+    if candidate.is_symlink() or not _matches(name, plan.file_patterns):
+        return False
+    if _protected(candidate, plan.root, plan.keep, plan.tracked):
+        return False
+    return candidate.relative_to(plan.root).as_posix() not in plan.already
 
 
 def _matches(name: str, patterns: Sequence[str]) -> bool:
@@ -1733,7 +2190,8 @@ def _protected(path: Path, root: Path, keep: Sequence[str], tracked: set[str]) -
         for pattern in keep
     ):
         return True
-    return relative in tracked
+    # tracked holds both spellings; see tracked_paths.
+    return relative in tracked or relative.lower() in tracked
 
 
 def _remove(
@@ -1745,6 +2203,8 @@ def _remove(
     is_dir: bool,
     kind: str = "remove",
     protect_nested: bool = True,
+    sensitive: Sequence[str] = (),
+    holding: Quarantine | None = None,
 ) -> Action:
     relative = path.relative_to(root).as_posix()
     holds_repo = False
@@ -1753,6 +2213,28 @@ def _remove(
     except OSError:
         size = 0
     action = Action(kind, scope, relative, f"remove {'directory' if is_dir else 'file'}", size=size)
+    action.quarantined = quarantine is not None
+    because = ""
+    if quarantine is None and holding is not None and sensitive:
+        buried = (
+            _holds_protected(path, sensitive)
+            if is_dir
+            else (path.name if _matches(path.name, sensitive) else None)
+        )
+        if buried is not None:
+            # The promise trash makes, kept here too: something that may be the
+            # only copy of a credential is moved, never deleted outright — even
+            # when it is buried inside a directory that is otherwise disposable.
+            quarantine = holding
+            action.quarantined = True
+            because = (
+                f" because it is {buried}" if not is_dir else (f" because it contains {buried}")
+            )
+    # Said before the decision, so a dry run names the outcome it is predicting.
+    action.detail = (
+        f"{'quarantine' if action.quarantined else 'remove'} "
+        f"{'directory' if is_dir else 'file'}{because}"
+    )
     if holds_repo and protect_nested:
         # A vendored or forgotten checkout inside an artefact directory. Deleting
         # the parent would take the repository with it, and nothing in an
@@ -1776,7 +2258,9 @@ def _remove(
         action.error = str(exc)
         return action
     action.applied = True
-    action.detail = "removed"
+    # "removed" would be untrue for a quarantined path: it is still on the disk,
+    # a restore away.
+    action.detail = ("quarantined" if action.quarantined else "removed") + because
     return action
 
 
@@ -1797,6 +2281,28 @@ def _guard(path: Path, root: Path) -> None:
 # --------------------------------------------------------------------------- #
 
 
+def _free_stamp(root: Path) -> str:
+    """Claim a quarantine directory, atomically.
+
+    Checking that a name is free and then using it leaves a gap two processes
+    can both walk through — and the loser's manifest would overwrite the
+    winner's, stranding files `restore` promises to bring back. mkdir without
+    exist_ok is the claim: whoever creates it owns it, and the other tries the
+    next name.
+    """
+    base = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    for suffix in range(0, 1000):
+        candidate = base if suffix == 0 else f"{base}-{suffix}"
+        try:
+            (root / candidate).mkdir(parents=True)
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise Failure(f"cannot create a quarantine under {root}: {exc}") from exc
+        return candidate
+    raise Failure(f"cannot find an unused quarantine name under {root}")  # pragma: no cover
+
+
 class Quarantine:
     """A timestamped holding area, so a wrong guess is undoable.
 
@@ -1806,39 +2312,73 @@ class Quarantine:
 
     def __init__(self, root: Path, workspace: Path, stamp: str | None = None) -> None:
         self.workspace = workspace
-        self.stamp = stamp or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        self.dir = root / self.stamp
+        self.root = root
         self.entries: list[dict[str, str]] = []
         self._lock = threading.Lock()
+        # Claimed on the first move, not here: a dry run must not leave a
+        # directory behind while reporting that it changed nothing. The claim
+        # itself is a mkdir, so two runs in the same second cannot share one.
+        self._stamp = stamp
+        if stamp is not None:
+            (root / stamp).mkdir(parents=True, exist_ok=True)
+
+    @property
+    def stamp(self) -> str:
+        if self._stamp is None:
+            self._stamp = _free_stamp(self.root)
+        return self._stamp
+
+    @property
+    def dir(self) -> Path:
+        return self.root / self.stamp
 
     def take(self, path: Path) -> Path:
         relative = path.resolve().relative_to(self.workspace.resolve())
         with self._lock:
             destination = self.dir / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
+            # Keep counting: one suffix can collide as easily as none, and the
+            # loser of that race would be overwritten rather than kept.
             if destination.exists():
-                destination = destination.with_name(f"{destination.name}.{len(self.entries)}")
+                stem, suffix = destination.name, 1
+                while destination.exists():
+                    destination = destination.with_name(f"{stem}.{suffix}")
+                    suffix += 1
+            # Recorded before the move, one appended line at a time. A crash, a
+            # kill or a flat battery half way through then leaves a journal that
+            # still says where everything came from; the alternative is a
+            # directory of files nobody can put back. Appending rather than
+            # rewriting matters: two thousand removals would otherwise serialise
+            # two million records and hold the lock through all of them.
+            entry = {"from": str(path), "to": str(destination)}
+            self.entries.append(entry)
+            self._append(entry)
             shutil.move(str(path), str(destination))
-            self.entries.append({"from": str(path), "to": str(destination)})
         return destination
 
+    def _append(self, entry: dict[str, str]) -> None:
+        journal = self.dir / JOURNAL_NAME
+        journal.parent.mkdir(parents=True, exist_ok=True)
+        with journal.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+
     def write_manifest(self) -> Path | None:
+        """Fold the journal into the manifest restore reads. Written once."""
         if not self.entries:
             return None
         manifest = self.dir / MANIFEST_NAME
-        manifest.parent.mkdir(parents=True, exist_ok=True)
-        manifest.write_text(
-            json.dumps(
-                {
-                    "version": __version__,
-                    "created": self.stamp,
-                    "workspace": str(self.workspace),
-                    "entries": self.entries,
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
+        payload = {
+            "version": __version__,
+            "created": self.stamp,
+            "workspace": str(self.workspace),
+            "entries": self.entries,
+        }
+        # Written to a neighbour and renamed, so it is never found half-written.
+        scratch = manifest.with_suffix(".partial")
+        scratch.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        scratch.replace(manifest)
         return manifest
 
 
@@ -1846,28 +2386,122 @@ def restore(quarantine_root: Path, stamp: str | None, decider: Decider) -> list[
     """Put quarantined files back where they came from."""
     if not quarantine_root.is_dir():
         raise Failure(f"no quarantine at {quarantine_root}")
-    stamps = sorted(p.name for p in quarantine_root.iterdir() if (p / MANIFEST_NAME).is_file())
+    stamps = sorted(
+        p.name
+        for p in quarantine_root.iterdir()
+        if (p / MANIFEST_NAME).is_file() or (p / JOURNAL_NAME).is_file()
+    )
     if not stamps:
         raise Failure(f"no quarantine with a manifest under {quarantine_root}")
     chosen = stamp or stamps[-1]
     if chosen not in stamps:
         raise Failure(f"no quarantine {chosen!r}; available: {', '.join(stamps)}")
-    manifest = json.loads((quarantine_root / chosen / MANIFEST_NAME).read_text(encoding="utf-8"))
+    manifest = _read_manifest(quarantine_root / chosen)
     actions: list[Action] = []
+    workspace = Path(manifest.get("workspace", quarantine_root.parent))
+    if manifest.get("unreadable"):
+        actions.append(
+            Action(
+                "restore",
+                chosen,
+                "-",
+                f"{plural(manifest['unreadable'], 'record')} unreadable, left in the quarantine",
+                skipped=True,
+            )
+        )
+    with keeping(actions):
+        _put_back(manifest, workspace, quarantine_root, chosen, decider, actions)
+    _forget_restored(quarantine_root / chosen, manifest, actions)
+    return actions
+
+
+def _forget_restored(directory: Path, manifest: dict[str, Any], actions: Sequence[Action]) -> None:
+    """Drop the entries that are back where they belong.
+
+    Leaving them in would make `restore --list` describe files that are no longer
+    there, and make the next default restore pick a quarantine with nothing in
+    it.
+    """
+    restored = {a.target for a in actions if a.applied}
+    if not restored:
+        return
+    left = [entry for entry in manifest["entries"] if entry["from"] not in restored]
+    if left:
+        payload = {**manifest, "entries": left}
+        payload.pop("unreadable", None)
+        scratch = directory / f"{MANIFEST_NAME}.partial"
+        scratch.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        scratch.replace(directory / MANIFEST_NAME)
+        return
+    # Nothing left to restore, and an empty quarantine is just clutter.
+    shutil.rmtree(directory, ignore_errors=True)
+
+
+def _put_back(
+    manifest: dict[str, Any],
+    workspace: Path,
+    quarantine_root: Path,
+    chosen: str,
+    decider: Decider,
+    actions: list[Action],
+) -> None:
     for entry in manifest["entries"]:
         source, destination = Path(entry["to"]), Path(entry["from"])
         action = Action("restore", chosen, str(destination), "restore")
-        if not source.exists():
+        # The manifest is a file on disk like any other. Restoring what it says
+        # without checking would move anything anywhere.
+        if not _within(source, quarantine_root) or not _within(destination, workspace):
+            action.error = "manifest points outside the workspace"
+        elif not source.exists():
             action.error = "missing from the quarantine"
         elif destination.exists():
             action.error = "something is already at that path"
         elif decider.allow(action):
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(source), str(destination))
-            action.applied = True
-            action.detail = "restored"
+            try:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(source), str(destination))
+            except OSError as exc:
+                # One unwritable destination must not abandon the rest of the
+                # sweep still sitting in the quarantine.
+                action.error = str(exc)
+            else:
+                action.applied = True
+                action.detail = "restored"
         actions.append(action)
-    return actions
+
+
+def _read_manifest(directory: Path) -> dict[str, Any]:
+    """The manifest, or the journal a killed run left behind."""
+    manifest = directory / MANIFEST_NAME
+    if manifest.is_file():
+        return json.loads(manifest.read_text(encoding="utf-8"))
+    entries: list[dict[str, str]] = []
+    torn = 0
+    for line in (directory / JOURNAL_NAME).read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            entries.append(json.loads(line))
+        except json.JSONDecodeError:
+            # The kill that stopped the sweep can tear the record it was writing.
+            # Losing that one entry is the cost; refusing to read the file would
+            # lose every entry before it, which is what the journal exists to
+            # prevent.
+            torn += 1
+    return {
+        "workspace": str(directory.parent.parent),
+        "entries": entries,
+        "unreadable": torn,
+    }
+
+
+def _within(path: Path, root: Path) -> bool:
+    """True when `path` really is inside `root`, symlinks resolved."""
+    try:
+        resolved_root = root.resolve()
+        return resolved_root == path.resolve() or resolved_root in path.resolve().parents
+    except OSError:  # pragma: no cover - unreadable path
+        return False
 
 
 def expire_quarantines(quarantine_root: Path, days: int, decider: Decider) -> list[Action]:
@@ -1876,14 +2510,29 @@ def expire_quarantines(quarantine_root: Path, days: int, decider: Decider) -> li
     cutoff = time.time() - days * 86400
     actions: list[Action] = []
     for entry in sorted(quarantine_root.iterdir()):
-        if not entry.is_dir() or entry.stat().st_mtime > cutoff:
+        try:
+            if not entry.is_dir() or entry.stat().st_mtime > cutoff:
+                continue
+        except OSError as exc:
+            actions.append(Action("expire", "quarantine", entry.name, "", error=str(exc)))
+            continue
+        # Only quarantines this tool wrote. Something else that happens to sit
+        # under the quarantine root is not ours to delete recursively.
+        if not (entry / MANIFEST_NAME).is_file() and not (entry / JOURNAL_NAME).is_file():
+            actions.append(
+                Action("expire", "quarantine", entry.name, "kept: not a quarantine", skipped=True)
+            )
             continue
         action = Action("expire", "quarantine", entry.name, f"delete, older than {days} days")
         action.size = directory_size(entry)
         if decider.allow(action):
-            shutil.rmtree(entry)
-            action.applied = True
-            action.detail = "deleted"
+            try:
+                shutil.rmtree(entry)
+            except OSError as exc:
+                action.error = str(exc)
+            else:
+                action.applied = True
+                action.detail = "deleted"
         actions.append(action)
     return actions
 
@@ -1929,9 +2578,11 @@ def classify_trash(path: Path, trash: dict[str, Any], now: float) -> tuple[bool,
     """Decide whether one path is junk. Returns (is_junk, why, is_sensitive)."""
     name = path.name
     sensitive = _matches(name, trash["sensitive"])
-    explicit = _matches(name, trash["patterns"])
-    if _matches(name, trash["keep"]) and not explicit:
+    # keep is absolute. patterns win over the heuristics, not over an explicit
+    # instruction to leave something alone.
+    if _matches(name, trash["keep"]):
         return False, "", sensitive
+    explicit = _matches(name, trash["patterns"])
     try:
         stat = path.stat()
     except OSError:
@@ -1958,6 +2609,7 @@ def sweep_trash(
     decider: Decider,
     quarantine: Quarantine,
     repos: Sequence[Path],
+    resolver: ConfigResolver | None = None,
 ) -> list[Action]:
     trash = cfg["trash"]
     if not trash["enabled"]:
@@ -1966,18 +2618,58 @@ def sweep_trash(
         raise Failure(f"trash.scope must be root or workspace, not {trash['scope']!r}")
     now = time.time()
     repo_set = {p.resolve() for p in repos}
+    tracked = tracked_from_outside(workspace)
     actions: list[Action] = []
+    with keeping(actions):
+        _sweep(workspace, trash, tracked, repo_set, now, decider, quarantine, actions, resolver)
+    return actions
 
+
+def _sweep(
+    workspace: Path,
+    trash: dict[str, Any],
+    tracked: set[str],
+    repo_set: set[Path],
+    now: float,
+    decider: Decider,
+    quarantine: Quarantine,
+    actions: list[Action],
+    resolver: ConfigResolver | None = None,
+) -> None:
+    # A directory that is going as a whole takes its contents with it. Reporting
+    # those separately would inflate a dry run against the apply that follows it.
+    swept: list[str] = []
     for path in _trash_candidates(workspace, trash, repo_set):
-        junk, why, sensitive = classify_trash(path, trash, now)
+        relative = path.relative_to(workspace).as_posix()
+        # tracked holds both spellings; see tracked_paths. A case-only
+        # difference is the same file on macOS and Windows.
+        if relative in tracked or relative.lower() in tracked:
+            continue
+        if any(relative.startswith(f"{parent}/") for parent in swept):
+            continue
+        # Deepest wins here too, and for a directory the config that governs it
+        # is its own: it is the thing about to be swept.
+        #
+        # _trash_candidates selected this path using the workspace config, which
+        # is all it can see while walking. Everything that governs *whether* a
+        # candidate may be swept is therefore re-checked here against the config
+        # that actually applies to it — not one setting at a time, which is how
+        # this was got wrong repeatedly.
+        governs = path if path.is_dir() else path.parent
+        here = resolver.for_path(governs)["trash"] if resolver is not None else trash
+        junk, why, sensitive = (
+            classify_trash(path, here, now)
+            if _sweepable(path, here, workspace)
+            else (False, "", False)
+        )
         if not junk:
             continue
-        relative = path.relative_to(workspace).as_posix()
-        # A file that might hold the only copy of a credential is never deleted
-        # outright, whatever the quarantine setting says.
-        use_quarantine = trash["quarantine"] or sensitive
+        if path.is_dir():
+            swept.append(relative)
+        sensitive, why = _credential_check(path, here, sensitive, why)
+        use_quarantine = here["quarantine"] or sensitive
         detail = f"sweep: {why}" + (" — sensitive, quarantined" if sensitive else "")
-        action = Action("trash", "workspace", relative, detail)
+        action = Action("trash", "workspace", relative, detail, quarantined=use_quarantine)
         try:
             action.size = directory_size(path) if path.is_dir() else path.stat().st_size
         except OSError:
@@ -2002,7 +2694,54 @@ def sweep_trash(
         except (OSError, Failure) as exc:
             action.error = str(exc)
         actions.append(action)
-    return actions
+
+
+def tracked_from_outside(workspace: Path, timeout: int = 300) -> set[str]:
+    """Tracked paths of the repository the workspace sits inside, if any.
+
+    Returned relative to the workspace. No repository *below* the workspace
+    claims these files, so without this they look like they belong to nobody —
+    and sweeping or cleaning one would take committed content.
+    """
+    outer = enclosing_repo(workspace)
+    if outer is None:
+        return set()
+    prefix = workspace.resolve().relative_to(outer.resolve()).as_posix()
+    return {
+        entry[len(prefix) + 1 :]
+        for entry in tracked_paths(Git(outer, timeout=timeout))
+        if entry.startswith(f"{prefix}/")
+    }
+
+
+def _credential_check(
+    path: Path, trash: dict[str, Any], sensitive: bool, why: str
+) -> tuple[bool, str]:
+    """Whether this path must be quarantined rather than deleted, and why.
+
+    A file that might hold the only copy of a credential is never deleted
+    outright, whatever the quarantine setting says — and a directory holding one
+    counts, since deleting it takes the credential with it.
+    """
+    buried = _holds_protected(path, trash["sensitive"]) if path.is_dir() else None
+    if buried is None:
+        return sensitive, why
+    return True, f"{why}, contains {buried}"
+
+
+def _sweepable(path: Path, trash: dict[str, Any], workspace: Path) -> bool:
+    """Whether the config governing this path allows it to be swept at all.
+
+    Kept apart from classify_trash, which answers "is this junk". This answers
+    the prior question: is sweeping switched on here, and does this kind of thing
+    count — a directory only when trash.dirs says so, and anything below the
+    workspace root only when the scope reaches that far.
+    """
+    if not trash["enabled"]:
+        return False
+    if path.is_dir() and not trash["dirs"]:
+        return False
+    return not (trash["scope"] == "root" and path.parent != workspace)
 
 
 def _trash_candidates(workspace: Path, trash: dict[str, Any], repos: set[Path]) -> Iterator[Path]:
@@ -2019,9 +2758,13 @@ def _trash_candidates(workspace: Path, trash: dict[str, Any], repos: set[Path]) 
         if here.resolve() in repos or ".git" in here.parts:
             dirnames[:] = []
             continue
-        dirnames[:] = [
+        keep_walking = [
             d for d in sorted(dirnames) if d != QUARANTINE_DIRNAME and not is_repo(here / d)
         ]
+        dirnames[:] = keep_walking
+        if trash["dirs"]:
+            for name in keep_walking:
+                yield here / name
         for name in sorted(filenames):
             yield here / name
 
@@ -2160,13 +2903,17 @@ class Printer:
         """Print one repository's worth of work, rolled up unless -v is on."""
         if self.quiet:
             return
-        rolled: dict[tuple[str, str, bool], list[Action]] = {}
+        # Grouped by outcome as well as by kind: a batch that quarantined some
+        # paths and deleted others must not be summarised with whichever verb
+        # happened to come first.
+        rolled: dict[tuple[str, str, bool, bool], list[Action]] = {}
         for action in actions:
             if self.verbose or action.kind not in ROLLED_UP or action.error:
                 self.action(action)
                 continue
-            rolled.setdefault((action.kind, action.scope, action.skipped), []).append(action)
-        for (kind, scope, skipped), group in rolled.items():
+            key = (action.kind, action.scope, action.skipped, action.quarantined)
+            rolled.setdefault(key, []).append(action)
+        for (kind, scope, skipped, quarantined), group in rolled.items():
             if len(group) == 1:
                 self.action(group[0])
                 continue
@@ -2181,6 +2928,7 @@ class Printer:
                     size=size,
                     applied=group[0].applied,
                     skipped=skipped,
+                    quarantined=quarantined,
                 )
             )
 
@@ -2221,6 +2969,10 @@ DID: tuple[tuple[str, str, str], ...] = (
     ("fetch", "repositories fetched", "repositories to fetch"),
     ("switch", "branches switched", "branches to switch"),
     ("update", "repositories fast-forwarded", "repositories to fast-forward"),
+    ("stash+update", "stashed and fast-forwarded", "to stash and fast-forward"),
+    ("rebase", "repositories rebased", "repositories to rebase"),
+    ("stash+rebase", "stashed and rebased", "to stash and rebase"),
+    ("stash+switch", "stashed and switched", "to stash and switch"),
     ("submodules", "submodules updated", "submodules to update"),
     ("branch", "branches deleted", "branches to delete"),
     ("remove", "artefacts removed", "artefacts to remove"),
@@ -2248,6 +3000,12 @@ def summarise(report: Report, mode: str, printer: Printer, forced: bool = False)
     freed = report.bytes_found if mode == DRY else report.bytes_freed
     if freed:
         printer.line(f"  {human_size(freed):>6}  {'to free' if mode == DRY else 'freed'}")
+    held = report.bytes_found_quarantined if mode == DRY else report.bytes_quarantined
+    if held:
+        # Still on the disk, deliberately. Calling it freed would be a lie the
+        # next `df` would expose.
+        moved = "would move to quarantine" if mode == DRY else "moved to quarantine"
+        printer.line(f"  {human_size(held):>6}  {moved}, not reclaimed")
 
     _summarise_held_back(report, printer, forced)
     _summarise_errors(report, printer)
@@ -2293,6 +3051,7 @@ NOT_HELD_BACK = (
     "already deleted",
     "nothing to fast-forward",
     "linked worktree",
+    "staying on",
 )
 REASONS: tuple[tuple[str, str], ...] = (
     ("uncommitted changes", "uncommitted changes — left on their branch"),
@@ -2350,12 +3109,22 @@ class Context:
     printer: Printer
     repos: list[Path]
     quarantine: Quarantine
+    # Which repositories actually fetched in this run, so prune knows whether
+    # the [gone] marks it is about to act on were observed now or long ago. One
+    # flag for the whole run would let a repository that never fetched inherit
+    # another one's freshness.
+    fetched: set[Path] = field(default_factory=set)
 
     def name_of(self, repo: Path) -> str:
         return repo.relative_to(self.workspace).as_posix()
 
     def config_for(self, repo: Path) -> dict[str, Any]:
         return self.resolver.for_path(repo)
+
+    @property
+    def timeout(self) -> int:
+        """Applies to every git call, not only the ones sync makes."""
+        return int(self.config_for(self.workspace)["sync"]["timeout"])
 
     @property
     def jobs(self) -> int:
@@ -2365,7 +3134,7 @@ class Context:
         return worker_count(self.config_for(self.workspace)["jobs"])
 
 
-def _families(repos: Sequence[Path]) -> list[list[Path]]:
+def _families(repos: Sequence[Path], timeout: int = 300) -> list[list[Path]]:
     """Group checkouts that share one .git, so they never run at the same time.
 
     A linked worktree shares its parent's object store, index lock and refs.
@@ -2376,9 +3145,15 @@ def _families(repos: Sequence[Path]) -> list[list[Path]]:
     """
     families: dict[str, list[Path]] = {}
     for repo in repos:
-        shared = Git(repo).out(
-            "rev-parse", "--path-format=absolute", "--git-common-dir", check=False
-        )
+        try:
+            shared = Git(repo, timeout=timeout).out(
+                "rev-parse", "--path-format=absolute", "--git-common-dir", check=False
+            )
+        except Failure:
+            # A hung or broken repository gets a family of its own rather than
+            # stopping the grouping for everything else. Whatever is wrong with
+            # it will be reported when its own turn comes.
+            shared = ""
         families.setdefault(shared or str(repo), []).append(repo)
     return list(families.values())
 
@@ -2400,7 +3175,8 @@ def _in_parallel(context: Context, work: Callable[[Path], list[Action]], report:
         return found
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
-        futures = [pool.submit(whole_family, family) for family in _families(context.repos)]
+        families = _families(context.repos, context.timeout)
+        futures = [pool.submit(whole_family, family) for family in families]
         try:
             for future in concurrent.futures.as_completed(futures):
                 results = future.result()
@@ -2416,9 +3192,18 @@ def _guarded(work: Callable[[Path], list[Action]], repo: Path, context: Context)
     """One repo's failure must not take the other two hundred down with it."""
     try:
         return work(repo)
+    except Quit as quit_now:
+        # Keep what this repository had already done; losing it would make the
+        # report claim less happened than did.
+        quit_now.done.append(
+            Action("error", context.name_of(repo), "-", "", error="interrupted before finishing")
+        )
+        raise
     except Failure as exc:
         return [Action("error", context.name_of(repo), "-", "", error=str(exc))]
-    except OSError as exc:  # pragma: no cover - filesystem level, hard to provoke
+    except (OSError, ValueError) as exc:
+        # Anything a single repository can do to itself — an unreadable config,
+        # a path that will not decode — stays that repository's problem.
         return [Action("error", context.name_of(repo), "-", "", error=str(exc))]
 
 
@@ -2432,6 +3217,12 @@ def cmd_sync(context: Context, report: Report) -> None:
         return sync_repo(repo, context.name_of(repo), cfg, context.decider)
 
     _in_parallel(context, work, report)
+    by_name = {context.name_of(repo): repo for repo in context.repos}
+    context.fetched = {
+        by_name[a.scope]
+        for a in report.actions
+        if a.kind == "fetch" and a.applied and a.scope in by_name
+    }
 
 
 def cmd_prune(context: Context, report: Report) -> None:
@@ -2449,7 +3240,9 @@ def cmd_prune(context: Context, report: Report) -> None:
         cfg = context.config_for(repo)
         if not cfg["branches"]["enabled"]:
             return []
-        return prune_branches(repo, context.name_of(repo), cfg, context.decider)
+        return prune_branches(
+            repo, context.name_of(repo), cfg, context.decider, fetched=repo in context.fetched
+        )
 
     _in_parallel(context, work, report)
 
@@ -2463,14 +3256,29 @@ def cmd_clean(context: Context, report: Report) -> None:
         if not cfg["clean"]["enabled"]:
             return []
         holding = context.quarantine if cfg["clean"]["quarantine"] else None
-        git = Git(repo)
+        git = Git(repo, timeout=int(cfg["sync"]["timeout"]))
         name = context.name_of(repo)
         actions: list[Action] = []
         # Ignored paths first: it removes whole directories in one step, which
         # leaves the pattern walk below far less ground to cover.
+        already: set[str] = set()
         if cfg["clean"]["ignored"]:
-            actions += clean_ignored(repo, name, cfg, context.decider, holding, git)
-        actions += clean_tree(repo, name, cfg, context.decider, git, holding)
+            ignored = clean_ignored(
+                repo, name, cfg, context.decider, holding, git, context.quarantine
+            )
+            actions += ignored
+            already = {a.target for a in ignored}
+        actions += clean_tree(
+            repo,
+            name,
+            cfg,
+            context.decider,
+            git,
+            holding,
+            already=already,
+            sensitive=cfg["trash"]["sensitive"],
+            holding=context.quarantine,
+        )
         return actions
 
     _in_parallel(context, work, report)
@@ -2479,8 +3287,7 @@ def cmd_clean(context: Context, report: Report) -> None:
     # the __pycache__ of scripts that were never committed anywhere.
     if root_cfg["clean"]["enabled"]:
         context.printer.heading("Artefacts outside repositories")
-        holding = context.quarantine if root_cfg["clean"]["quarantine"] else None
-        loose = _outside_repos(context, root_cfg, holding)
+        loose = _outside_repos(context, root_cfg, context.quarantine)
         report.extend(loose)
         context.printer.batch(loose)
 
@@ -2499,33 +3306,66 @@ def _outside_repos(
     if not candidates:
         return []
     workspace = context.workspace
-    regenerable = cfg["clean"]["regenerable"]
 
-    def handle(item: tuple[Path, bool]) -> Action:
-        path, is_dir = item
+    def handle(item: tuple[Path, bool, dict[str, Any]]) -> Action:
+        path, is_dir, here_cfg = item
+        # Both the quarantine decision and the regenerable list come from the
+        # config that governs *this* path, not the workspace root's.
         return _remove(
             path,
             workspace,
             "workspace",
             context.decider,
-            quarantine,
+            quarantine if here_cfg["quarantine"] else None,
             is_dir,
-            protect_nested=not _matches(path.name, regenerable),
+            protect_nested=not _matches(path.name, here_cfg["regenerable"]),
+            sensitive=here_cfg["sensitive_here"],
+            holding=quarantine,
         )
 
     return _map_parallel(handle, candidates, context.jobs)
 
 
-def _loose_artefacts(context: Context, cfg: dict[str, Any]) -> Iterator[tuple[Path, bool]]:
-    """Every artefact path outside a repository, as (path, is_directory)."""
+def enclosing_repo(workspace: Path) -> Path | None:
+    """The repository the workspace sits inside, if it sits inside one.
+
+    Nothing below the workspace claims those files, so without this they look
+    like loose artefacts belonging to nobody — and tracked content would be
+    deleted by the pass that cleans the gaps between repositories.
+    """
+    for parent in workspace.parents:
+        if is_repo(parent):
+            return parent
+    return None
+
+
+def _loose_artefacts(
+    context: Context, cfg: dict[str, Any]
+) -> Iterator[tuple[Path, bool, dict[str, Any]]]:
+    """Every artefact path outside a repository, with the config that governs it.
+
+    Config is resolved per directory, not once for the workspace: deepest wins
+    applies out here as much as it does inside a repository, and a
+    .git-tidy.yaml in a loose directory has to be able to protect it.
+    """
     repo_set = {p.resolve() for p in context.repos}
-    dir_patterns, file_patterns = clean_patterns(cfg["clean"])
-    keep = cfg["clean"]["keep"]
+    tracked = (
+        set()
+        if cfg["clean"]["tracked"]
+        else tracked_from_outside(context.workspace, context.timeout)
+    )
     for dirpath, dirnames, filenames in os.walk(context.workspace, followlinks=False):
         here = Path(dirpath)
         if here.resolve() in repo_set or ".git" in here.parts:
             dirnames[:] = []
             continue
+        governing = context.config_for(here)
+        here_cfg = {**governing["clean"], "sensitive_here": governing["trash"]["sensitive"]}
+        if not here_cfg["enabled"]:
+            dirnames[:] = []
+            continue
+        dir_patterns, file_patterns = clean_patterns(here_cfg)
+        keep = here_cfg["keep"]
         descend: list[str] = []
         for name in sorted(dirnames):
             candidate = here / name
@@ -2537,9 +3377,30 @@ def _loose_artefacts(context: Context, cfg: dict[str, Any]) -> Iterator[tuple[Pa
             ):
                 continue
             if _matches(name, dir_patterns) and not _protected(
-                candidate, context.workspace, keep, set()
+                candidate, context.workspace, keep, tracked
             ):
-                yield candidate, True  # removed whole, so it is not descended into
+                # It is about to go whole, so its own config gets the last word:
+                # a .git-tidy.yaml inside it would otherwise be deleted along
+                # with everything it was written to protect.
+                governing_own = context.config_for(candidate)
+                own = {
+                    **governing_own["clean"],
+                    "sensitive_here": governing_own["trash"]["sensitive"],
+                }
+                own_dirs, _ = clean_patterns(own)
+                if (
+                    not own["enabled"]
+                    or _matches(name, own["keep"])
+                    or not _matches(name, own_dirs)
+                ):
+                    # Its own config decides whether it is an artefact at all,
+                    # not only whether it is protected.
+                    continue
+                if _holds_protected(candidate, own["keep"], base=context.workspace):
+                    # Something inside is kept, so walk in rather than take it all.
+                    descend.append(name)
+                    continue
+                yield candidate, True, own  # whole, so not descended into
             else:
                 descend.append(name)
         dirnames[:] = descend
@@ -2547,9 +3408,9 @@ def _loose_artefacts(context: Context, cfg: dict[str, Any]) -> Iterator[tuple[Pa
             candidate = here / name
             if candidate.is_symlink() or not _matches(name, file_patterns):
                 continue
-            if _protected(candidate, context.workspace, keep, set()):
+            if _protected(candidate, context.workspace, keep, tracked):
                 continue
-            yield candidate, False
+            yield candidate, False, here_cfg
 
 
 def _map_parallel(work: Callable[[Any], Action], items: Sequence[Any], jobs: int) -> list[Action]:
@@ -2566,7 +3427,14 @@ def cmd_trash(context: Context, report: Report) -> None:
     if not cfg["trash"]["enabled"]:
         context.printer.line("  trash is off; set trash.enabled: true to sweep loose files")
         return
-    swept = sweep_trash(context.workspace, cfg, context.decider, context.quarantine, context.repos)
+    swept = sweep_trash(
+        context.workspace,
+        cfg,
+        context.decider,
+        context.quarantine,
+        context.repos,
+        context.resolver,
+    )
     report.extend(swept)
     context.printer.batch(swept)
 
@@ -2643,10 +3511,12 @@ def cmd_init(
         raise Failure(f"{target} already exists; pass --force to overwrite it")
 
     chosen: dict[str, Any] = {}
-    # Asking is the point of init, so it asks whenever there is someone to ask —
-    # not only under --ask. -n writes the plain commented template, and so does a
-    # pipe or a CI job, where there is nobody at the other end.
-    interactive = mode != DRY and (prompt_input is not None or sys.stdin.isatty())
+    # init does not inherit the global dry-run: every other command defaults to
+    # changing nothing, but an init that neither asks nor writes is useless. It
+    # asks whenever there is somebody to ask; -q and a pipe write the plain
+    # commented template instead.
+    del mode
+    interactive = prompt_input is not None or (sys.stdin.isatty() and not printer.quiet)
     if interactive:
         printer.line(f"Writing {target}. Enter accepts the default in brackets.\n")
         chosen = _interview(printer, prompt_input)
@@ -2853,6 +3723,14 @@ def resolve_workspace(raw: str) -> Path:
     workspace = Path(raw).expanduser().resolve()
     if not workspace.is_dir():
         raise Failure(f"{workspace} is not a directory")
+    # find_repos only looks *below* the root, so a root that is itself a
+    # repository would have its own tracked files cleaned as if they belonged to
+    # nobody. Point at the directory that holds the checkouts instead.
+    if is_repo(workspace):
+        raise Failure(
+            f"{workspace} is itself a git repository. Point --workspace at the directory "
+            "that holds your checkouts, not at one of them"
+        )
     # Cleaning $HOME or / would walk the entire machine, and almost certainly is
     # not what was meant.
     if workspace == Path(workspace.anchor) or workspace == Path.home():
@@ -2863,9 +3741,32 @@ def resolve_workspace(raw: str) -> Path:
     return workspace
 
 
-def select_repos(root: Path, cfg: dict[str, Any], args: argparse.Namespace) -> list[Path]:
+def _excludes_itself(repo: Path, root: Path, resolver: ConfigResolver) -> bool:
+    """Whether a repository's own config asks to be left out.
+
+    A config this cannot read is not an answer either way, so the repository
+    stays in the list and its worker reports the problem against it — rather
+    than one unreadable file ending the run before any work has started.
+    """
+    try:
+        return _excluded(repo, root, resolver.for_path(repo)["exclude"])
+    except Failure:
+        return False
+
+
+def select_repos(
+    root: Path,
+    cfg: dict[str, Any],
+    args: argparse.Namespace,
+    resolver: ConfigResolver | None = None,
+) -> list[Path]:
     exclude = [*cfg["exclude"], *args.exclude]
     repos = find_repos(root, exclude)
+    if resolver is not None:
+        # A repository can exclude itself. Discovery cannot know that — it has
+        # not read the repository's own config yet — so the check happens here,
+        # where deepest-wins has actually been applied.
+        repos = [repo for repo in repos if not _excludes_itself(repo, root, resolver)]
     if args.include:
         repos = [
             repo
@@ -2912,7 +3813,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "restore":
         return _restore_command(args, root_cfg, quarantine_root, decider, printer)
 
-    repos = select_repos(workspace, root_cfg, args)
+    repos = select_repos(workspace, root_cfg, args, resolver)
     suffix = {DRY: "  (dry run — nothing will be changed)", ASK: "  (asking before each change)"}
     printer.line(f"{workspace}: {plural(len(repos), 'repository')}{suffix.get(args.mode, '')}")
     quarantine = Quarantine(quarantine_root, workspace)
@@ -2927,10 +3828,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         "doctor": [cmd_doctor],
         "run": [cmd_sync, cmd_prune, cmd_clean, cmd_trash, cmd_doctor],
     }
+    interrupted = False
     try:
         for step in steps[args.command]:
             step(context, report)
-    except Quit:
+    except Quit as quit_now:
+        interrupted = True
+        report.extend(quit_now.done)
+        for action in quit_now.done:
+            printer.action(action)
         printer.line("\n  stopped at your request; everything already done is kept")
 
     manifest = quarantine.write_manifest()
@@ -2945,6 +3851,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "version": __version__,
                     "workspace": str(workspace),
                     "mode": args.mode,
+                    "interrupted": interrupted,
                     "repositories": len(repos),
                     "bytes": report.bytes_found if args.mode == DRY else report.bytes_freed,
                     "actions": [a.as_dict() for a in report.actions],
@@ -2954,7 +3861,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     else:
         summarise(report, args.mode, printer, forced=getattr(args, "force", False))
-    return 1 if report.errors else 0
+    return 1 if report.errors or interrupted else 0
 
 
 def _restore_command(
@@ -2969,24 +3876,43 @@ def _restore_command(
             printer.line("no quarantines")
             return 0
         for entry in sorted(quarantine_root.iterdir()):
-            manifest = entry / MANIFEST_NAME
-            if manifest.is_file():
-                data = json.loads(manifest.read_text(encoding="utf-8"))
-                printer.line(f"  {entry.name}  {len(data['entries'])} entries")
+            if not (entry / MANIFEST_NAME).is_file() and not (entry / JOURNAL_NAME).is_file():
+                continue
+            data = _read_manifest(entry)
+            # A sweep that was killed has only its journal, and is still listed:
+            # it is restorable, so hiding it would be the wrong kind of tidy.
+            unfinished = "" if (entry / MANIFEST_NAME).is_file() else "  (unfinished)"
+            printer.line(f"  {entry.name}  {plural(len(data['entries']), 'entry')}{unfinished}")
         return 0
+    interrupted = False
     try:
         actions = (
             expire_quarantines(quarantine_root, cfg["trash"]["retention_days"], decider)
             if args.expire
             else restore(quarantine_root, args.stamp, decider)
         )
-    except Quit:
-        actions = []
+    except Quit as quit_now:
+        interrupted = True
+        actions = quit_now.done
     report = Report(list(actions))
     for action in actions:
         printer.action(action)
-    summarise(report, args.mode, printer)
-    return 1 if report.errors else 0
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "version": __version__,
+                    "mode": args.mode,
+                    "interrupted": interrupted,
+                    "actions": [a.as_dict() for a in report.actions],
+                },
+                indent=2,
+            )
+        )
+    else:
+        summarise(report, args.mode, printer)
+    # A run that stopped part way through did not do what was asked of it.
+    return 1 if report.errors or interrupted else 0
 
 
 def entrypoint() -> NoReturn:
