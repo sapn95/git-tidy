@@ -58,6 +58,19 @@ Y (everything), q (stop). Runs single-threaded so the prompts do not interleave.
 Carry every change out without asking.
 .SH OPTIONS
 .TP
+.B \-\-force
+The only flag here that can lose work, and it does exactly two things: it
+deletes a branch whose upstream is gone even when its commits are not in the
+trunk (still only after a fetch succeeded in the same run), and it stashes
+uncommitted changes so a repository can be switched and fast-forwarded. Nothing
+is discarded \(em the report says which stash holds the work.
+.IP
+It deliberately cannot delete a directory containing a git repository, cannot
+hard-delete anything matching
+.IR trash.sensitive ,
+and cannot remove a tracked file, follow a symlink or reach outside the
+workspace. Pair it with \-\-ask the first time.
+.TP
 .BR \-C ", " \-\-workspace " " \fIDIR\fR
 The directory holding the repositories. Defaults to the current one.
 .TP
