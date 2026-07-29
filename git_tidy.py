@@ -1436,9 +1436,14 @@ def _switch(
         action.error = f"{last_line(result)}{undone}"
         return _Outcome([action], stop=True)
     action.applied = True
+    if action.kind == "stash+switch" and not stashed:
+        # There was dirt git could not stash, so nothing was put aside. The kind
+        # is what the summary counts, and "stashed and switched" would be as
+        # untrue there as it would be on the line itself.
+        action.kind = "switch"
     action.detail = (
         f"stashed and switched from {where}, recover it with git stash pop"
-        if action.kind == "stash+switch" and stashed
+        if action.kind == "stash+switch"
         else f"switched from {where}"
     )
     return _Outcome([action])
@@ -1803,6 +1808,10 @@ def _finish(action: Action, result: Any, git: Git, stashed: bool, done: str) -> 
         action.error = f"{last_line(result)}{undone}"
         return
     action.applied = True
+    if not stashed:
+        # Nothing was put aside, so the summary must not count this among the
+        # ones that were. See _stash on why exit 0 does not mean a stash exists.
+        action.kind = action.kind.removeprefix("stash+")
     action.detail = f"stashed and {done}, recover it with git stash pop" if stashed else done
 
 

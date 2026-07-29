@@ -3820,3 +3820,19 @@ def test_up_to_date_is_not_asserted_after_a_declined_fetch(
     actions = gt.sync_repo(repo, "repo", config(), decider)
     update = [a for a in actions if a.kind == "update"]
     assert update and "as of the last fetch" in update[0].detail
+
+
+def test_the_summary_does_not_count_a_stash_that_never_happened(
+    workspace: Path, tmp_path: Path, capsys
+):
+    """The line said "switched"; the summary said "stashed and switched"."""
+    repo = submodule_repo(workspace, tmp_path)
+    git(repo, "switch", "-q", "-c", "side")
+    (workspace / ".git-tidy.yaml").write_text(
+        "sync:\n  stash: true\n  switch: always\n", encoding="utf-8"
+    )
+
+    gt.main(["-C", str(workspace), "sync", "--apply"])
+    out = capsys.readouterr().out
+    assert "stashed and switched" not in out
+    assert "branches switched" in out
