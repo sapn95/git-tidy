@@ -295,7 +295,7 @@ def test_render_config_writes_the_chosen_values():
 
 def test_init_writes_a_loadable_file(tmp_path: Path, capsys):
     target = tmp_path / ".git-tidy.yaml"
-    assert gt.cmd_init(target, gt.DRY, force=False, printer=quiet_printer()) == 0
+    assert gt.cmd_init(target, gt.AUTO, force=False, printer=quiet_printer()) == 0
     assert target.is_file()
     gt.ConfigResolver(tmp_path).for_path(tmp_path)  # must not raise
 
@@ -304,8 +304,8 @@ def test_init_refuses_to_overwrite(tmp_path: Path):
     target = tmp_path / ".git-tidy.yaml"
     target.write_text("jobs: 1\n", encoding="utf-8")
     with pytest.raises(gt.Failure, match="already exists"):
-        gt.cmd_init(target, gt.DRY, force=False, printer=quiet_printer())
-    assert gt.cmd_init(target, gt.DRY, force=True, printer=quiet_printer()) == 0
+        gt.cmd_init(target, gt.AUTO, force=False, printer=quiet_printer())
+    assert gt.cmd_init(target, gt.AUTO, force=True, printer=quiet_printer()) == 0
 
 
 def quiet_printer() -> gt.Printer:
@@ -589,8 +589,10 @@ def test_default_branch_can_be_forced(workspace: Path):
 def test_sync_rejects_an_unknown_switch_policy(workspace: Path):
     repo = workspace / "repo"
     git(repo, "switch", "-q", "-c", "side")
-    with pytest.raises(gt.Failure, match=r"sync\.switch"):
-        gt.sync_repo(repo, "repo", config(sync={"switch": "sideways"}), run())
+    # Reported against the repository rather than raised: the fetch has already
+    # happened, and losing it would report nothing for a run that pruned refs.
+    actions = gt.sync_repo(repo, "repo", config(sync={"switch": "sideways"}), run())
+    assert any(a.error and "sync.switch" in a.error for a in actions)
 
 
 def test_sync_rejects_an_unknown_submodule_mode(workspace: Path):
@@ -1462,7 +1464,7 @@ def test_main_restore_lists_quarantines(workspace: Path, capsys):
 
 
 def test_main_init_writes_a_config(workspace: Path, capsys):
-    assert gt.main(["-C", str(workspace), "init"]) == 0
+    assert gt.main(["-C", str(workspace), "init", "--apply"]) == 0
     assert (workspace / ".git-tidy.yaml").is_file()
 
 
@@ -1606,10 +1608,14 @@ def test_init_asks_without_needing_the_ask_flag(tmp_path: Path):
     assert parsed["trash"] == {"enabled": True, "min_age_days": 30}
 
 
-def test_init_dry_run_writes_the_plain_template(tmp_path: Path):
+def test_init_dry_run_prints_the_template_and_writes_nothing(tmp_path: Path, capsys):
+    """-n means change nothing, for init as for everything else."""
     target = tmp_path / ".git-tidy.yaml"
-    gt.cmd_init(target, gt.DRY, force=False, printer=quiet_printer())
-    assert gt._parse_yaml_subset(target.read_text(encoding="utf-8"), "<init>") is None
+    gt.main(["-C", str(tmp_path), "init", "-n", "--path", str(tmp_path)])
+    assert not target.exists()
+    out = capsys.readouterr().out
+    assert "git-tidy configuration" in out
+    assert gt._parse_yaml_subset(out.split("  Not written")[0], "<init>") is None
 
 
 # --------------------------------------------------------------------------- #
@@ -1859,8 +1865,8 @@ def test_single_quoted_apostrophes_match_pyyaml():
 def test_an_unknown_worktrees_mode_is_refused(workspace: Path):
     repo = workspace / "repo"
     git(repo, "switch", "-q", "-c", "side")
-    with pytest.raises(gt.Failure, match=r"sync\.worktrees"):
-        gt.sync_repo(repo, "repo", config(sync={"worktrees": "skpi"}), run())
+    actions = gt.sync_repo(repo, "repo", config(sync={"worktrees": "skpi"}), run())
+    assert any(a.error and "sync.worktrees" in a.error for a in actions)
 
 
 def test_all_of_these_does_not_leak_consent_into_stashing(workspace: Path):
@@ -4206,3 +4212,212 @@ def test_a_home_that_does_not_exist_is_a_message_not_a_traceback():
 )
 def test_an_ambiguous_message_resolves_to_the_right_category(message, expected):
     assert gt._reason_of(message) == expected
+
+
+# --------------------------------------------------------------------------- #
+# Claude review, round six
+# --------------------------------------------------------------------------- #
+
+
+def test_local_state_is_never_deleted_by_the_pattern_walk(workspace: Path):
+    """clean.ignored refused this directory; clean.dirs took it minutes later."""
+    repo = workspace / "repo"
+    cache = repo / ".terraform"
+    cache.mkdir()
+    (cache / "provider.bin").write_bytes(b"0" * 32)
+    (cache / "terraform.tfstate").write_text("the only copy", encoding="utf-8")
+    (cache / "id_rsa").write_text("PRIVATE KEY", encoding="utf-8")
+    holding = gt.Quarantine(workspace / gt.QUARANTINE_DIRNAME, workspace, stamp="stamp")
+
+    gt.clean_tree(
+        repo,
+        "repo",
+        config(),
+        run(),
+        gt.Git(repo),
+        None,
+        sensitive=gt._never_delete_outright(config()),
+        holding=holding,
+    )
+    kept = holding.dir / gt.CONTENT_DIRNAME / "repo" / ".terraform"
+    assert (kept / "terraform.tfstate").read_text(encoding="utf-8") == "the only copy"
+    assert (kept / "id_rsa").is_file()
+
+
+def test_a_default_run_does_not_hard_delete_terraform_state(workspace: Path):
+    """.terraform is in the default clean.dirs, with no config file at all."""
+    repo = workspace / "repo"
+    (repo / ".terraform").mkdir()
+    (repo / ".terraform" / "terraform.tfstate").write_text("state", encoding="utf-8")
+
+    gt.main(["-C", str(workspace), "clean", "--apply"])
+    found = list(
+        (workspace / gt.QUARANTINE_DIRNAME).glob("*/files/repo/.terraform/terraform.tfstate")
+    )
+    assert found and found[0].read_text(encoding="utf-8") == "state"
+
+
+def test_a_switch_sees_an_env_inside_an_ignored_directory(workspace: Path):
+    """--directory collapses the parent, so the guard never looked inside."""
+    repo = workspace / "repo"
+    (repo / "config").mkdir()
+    (repo / "config" / ".env").write_text("MAIN_VERSION", encoding="utf-8")
+    git(repo, "add", "-f", "config/.env")
+    git(repo, "commit", "-q", "-m", "track it on main")
+    git(repo, "switch", "-q", "-c", "feature")
+    git(repo, "rm", "-q", "--cached", "config/.env")
+    (repo / ".gitignore").write_text("config/\n", encoding="utf-8")
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-q", "-m", "ignore it here")
+    (repo / "config" / ".env").write_text("MY-ONLY-LOCAL-SECRET", encoding="utf-8")
+
+    actions = gt.sync_repo(repo, "repo", config(), run())
+    assert (repo / "config" / ".env").read_text(encoding="utf-8") == "MY-ONLY-LOCAL-SECRET"
+    assert any("would be replaced" in a.detail for a in actions)
+
+
+def test_the_clobber_guard_uses_the_ref_the_switch_will_take(workspace: Path, remote: Path):
+    """With no local trunk, `cat-file -e main:.env` fails and waved it through."""
+    repo = workspace / "repo"
+    (repo / ".env").write_text("FROM_MAIN", encoding="utf-8")
+    git(repo, "add", "-f", ".env")
+    git(repo, "commit", "-q", "-m", "track .env")
+    git(repo, "push", "-q")
+    git(repo, "switch", "-q", "-c", "feature")
+    git(repo, "rm", "-q", "--cached", ".env")
+    (repo / ".gitignore").write_text(".env\n", encoding="utf-8")
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-q", "-m", "ignore")
+    git(repo, "branch", "-D", "main")  # only origin/main is left
+    (repo / ".env").write_text("MY-ONLY-LOCAL-SECRET", encoding="utf-8")
+
+    actions = gt.sync_repo(repo, "repo", config(), run())
+    assert (repo / ".env").read_text(encoding="utf-8") == "MY-ONLY-LOCAL-SECRET"
+    assert any("would be replaced" in a.detail for a in actions)
+
+
+def test_doctor_reports_unpushed_commits_on_a_gone_branch(workspace: Path, remote: Path):
+    """The one case where they exist nowhere else."""
+    repo = workspace / "repo"
+    make_gone_branch(repo, remote, "feature", extra_commit=True)
+    actions = gt.doctor_repo(repo, "repo", config())
+    assert any("not pushed" in a.detail for a in actions)
+
+
+def test_clean_ignored_matches_git_clean_xd(workspace: Path):
+    """--directory hides ignored files inside an untracked directory."""
+    repo = workspace / "repo"
+    (repo / ".gitignore").write_text("*.log\n", encoding="utf-8")
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-q", "-m", "ignore logs")
+    (repo / "build").mkdir()
+    (repo / "build" / "out.o").write_text("untracked", encoding="utf-8")
+    (repo / "build" / "x.log").write_text("ignored", encoding="utf-8")
+
+    assert "build/x.log" in gt.ignored_paths(gt.Git(repo))
+    gt.clean_ignored(repo, "repo", config(clean={"ignored": True}), run(), None, gt.Git(repo))
+    assert not (repo / "build" / "x.log").exists(), "git clean -Xd would take it"
+    assert (repo / "build" / "out.o").is_file(), "and would leave this"
+
+
+def test_a_closed_pipe_is_not_a_traceback(workspace: Path):
+    """`| head` closes stdout while the run is still printing."""
+    (workspace / "repo" / "__pycache__").mkdir()
+    result = subprocess.run(
+        [sys.executable, str(Path(gt.__file__)), "-C", str(workspace), "clean", "-v"],
+        capture_output=True,
+        text=True,
+        env={**os.environ, **GIT_ENV},
+        stdin=subprocess.DEVNULL,
+    )
+    assert "Traceback" not in result.stderr
+
+
+def test_config_with_no_path_inside_a_checkout_sees_the_configs_above(
+    workspace: Path, capsys, monkeypatch
+):
+    (workspace / ".git-tidy.yaml").write_text("jobs: 7\n", encoding="utf-8")
+    monkeypatch.chdir(workspace / "repo")
+    gt.main(["config"])
+    assert json.loads(capsys.readouterr().out)["jobs"] == 7
+
+
+def test_a_bad_setting_after_the_fetch_still_reports_the_fetch(workspace: Path):
+    repo = workspace / "repo"
+    actions = gt.sync_repo(repo, "repo", config(sync={"submodules": "updat"}), run())
+    assert any(a.kind == "fetch" and a.applied for a in actions)
+    assert any(a.error for a in actions)
+
+
+def test_two_yaml_documents_are_refused():
+    """Merging them silently dropped whichever key came first."""
+    with pytest.raises(gt.Failure, match="more than one YAML document"):
+        gt._parse_yaml_subset("clean:\n  ignored: true\n---\nclean:\n  builds: true\n", "<t>")
+
+
+def test_a_date_shaped_value_is_refused_the_way_pyyaml_reads_it():
+    with pytest.raises(gt.Failure, match="reads as a date"):
+        gt._parse_yaml_subset("exclude:\n  - 2024-01-01\n", "<t>")
+    assert gt._parse_yaml_subset('exclude:\n  - "2024-01-01"\n', "<t>") == {
+        "exclude": ["2024-01-01"]
+    }
+
+
+def test_a_rolled_up_line_keeps_the_reason_it_was_grouped_by(workspace: Path):
+    stream = io.StringIO()
+    printer = gt.Printer(stream, quiet=False, color=False)
+    printer.batch(
+        [
+            gt.Action(
+                "ignored", "r", "a", "kept: a dependency tree, clean.dependencies", skipped=True
+            ),
+            gt.Action(
+                "ignored", "r", "b", "kept: a dependency tree, clean.dependencies", skipped=True
+            ),
+            gt.Action("ignored", "r", "c", "kept: build output, clean.builds", skipped=True),
+            gt.Action("ignored", "r", "d", "kept: build output, clean.builds", skipped=True),
+        ]
+    )
+    out = stream.getvalue()
+    assert "dependency trees" in out and "build output" in out
+    assert out.count("2 paths") == 2
+
+
+def test_one_unpushed_commit_against_a_non_origin_trunk_is_categorised():
+    assert gt._reason_of("kept: 1 commit not in upstream/main") == (
+        "branches with commits not in the trunk"
+    )
+    assert gt._reason_of("kept: 1 commit not in main") == ("branches with commits not in the trunk")
+
+
+def test_init_refuses_a_jobs_value_the_tool_would_reject(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    answers = iter(["-3"])
+    monkeypatch.setattr("builtins.input", lambda _: next(answers))
+    with pytest.raises(gt.Failure, match="negative"):
+        gt.main(["-C", str(tmp_path), "init", "--ask", "--path", str(tmp_path)])
+    assert not (tmp_path / ".git-tidy.yaml").exists()
+
+
+def test_quiet_still_says_where_the_quarantine_is(workspace: Path, capsys):
+    junk = workspace / "lalalalala.log"
+    junk.write_text("x", encoding="utf-8")
+    age(junk, 30)
+    (workspace / ".git-tidy.yaml").write_text("trash:\n  enabled: true\n", encoding="utf-8")
+
+    gt.main(["-C", str(workspace), "trash", "--apply", "-q"])
+    out = capsys.readouterr().out
+    assert "Quarantined files are under" in out
+    assert "restore" in out
+
+
+def test_restore_list_honours_json(workspace: Path, capsys):
+    root = workspace / gt.QUARANTINE_DIRNAME / "stamp"
+    root.mkdir(parents=True)
+    (root / gt.MANIFEST_NAME).write_text(
+        '{"entries": [{"from": "/a", "to": "/b"}]}', encoding="utf-8"
+    )
+
+    gt.main(["-C", str(workspace), "restore", "--list", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["quarantines"] == [{"stamp": "stamp", "entries": 1, "complete": True}]
