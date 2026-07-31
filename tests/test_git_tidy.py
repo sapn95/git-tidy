@@ -5083,3 +5083,58 @@ def test_a_clone_of_an_empty_repository_is_fast_forwarded(tmp_path: Path):
 
     gt.main(["-C", str(space), "sync", "--apply"])
     assert (space / "fresh" / "README.md").read_text(encoding="utf-8") == "hello\n"
+
+
+def test_the_generated_config_documents_the_real_defaults(tmp_path: Path):
+    """`git-tidy init` writes documentation, so it has to be true documentation.
+
+    Three separate review rounds found a default in this template that the code
+    did not use, or a setting missing from it. Uncomment every setting the
+    template ships and the result must be the defaults, exactly, and must merge
+    against the schema.
+    """
+    assert gt.main(["-C", str(tmp_path), "init", "-q", "--path", str(tmp_path)]) == 0
+    body = (tmp_path / gt.CONFIG_NAMES[0]).read_text(encoding="utf-8")
+
+    keys = set(gt.DEFAULTS)
+    for value in gt.DEFAULTS.values():
+        if isinstance(value, dict):
+            keys |= set(value)
+    setting = re.compile(r"^(\s*)# ([a-z_]+):(.*)$")
+    item = re.compile(r"^(\s*)#(\s+- .*)$")
+
+    lines: list[str] = []
+    in_setting = False
+    for line in body.splitlines():
+        if (m := setting.match(line)) and m.group(2) in keys:
+            lines.append(f"{m.group(1)}{m.group(2)}:{m.group(3)}")
+            in_setting = True
+        elif in_setting and (m := item.match(line)):
+            lines.append(m.group(1) + m.group(2))
+        else:
+            in_setting = False
+            if not line.lstrip().startswith("#"):
+                lines.append(line)
+
+    parsed = gt.load_yaml("\n".join(lines) + "\n", "<generated>")
+    assert parsed == gt.DEFAULTS
+    gt._merge(gt.DEFAULTS, parsed, "<generated>")
+
+
+def test_no_comment_line_reads_like_a_setting_it_is_not():
+    """A prose line starting `switch:` sat four lines from the real `switch:`.
+
+    The template is a file people edit by uncommenting lines, so two lines that
+    look the same and mean different things is a trap.
+    """
+    keys = set(gt.DEFAULTS)
+    for value in gt.DEFAULTS.values():
+        if isinstance(value, dict):
+            keys |= set(value)
+    collisions = [
+        f"{name}: {line.strip()}"
+        for name, text in gt.COMMENTS.items()
+        for line in text.splitlines()
+        if (m := re.match(r"^\s*([a-z_]+):", line)) and m.group(1) in keys
+    ]
+    assert collisions == []

@@ -292,11 +292,11 @@ COMMENTS: dict[str, str] = {
     "        submodule with uncommitted work is left alone and reported.",
     "sync.gc": "Repack loose objects when git itself thinks it is worth it.",
     "sync.worktrees": "What to do with a linked worktree (one made by `git worktree add`).\n"
-    "skip:   leave it on its branch — holding a branch of its own is the entire\n"
-    "        reason it exists, and git allows one worktree per branch anyway\n"
-    "switch: treat it like any other checkout. git allows one worktree per\n"
-    "        branch, so whichever one does not get the default branch first is\n"
-    "        reported as already checked out elsewhere, and left alone",
+    "  skip   — leave it on its branch: holding a branch of its own is the\n"
+    "           entire reason it exists, and git allows one worktree per branch\n"
+    "  switch — treat it like any other checkout. Since git allows one worktree\n"
+    "           per branch, whichever one does not get the default branch first\n"
+    "           is reported as already checked out elsewhere, and left alone",
     "sync.diverged": "A branch with local commits *and* commits upstream.\n"
     "report: say so and change nothing\n"
     "rebase: replay the local commits on top of the upstream ones. The originals\n"
