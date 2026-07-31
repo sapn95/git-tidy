@@ -5428,3 +5428,68 @@ def test_the_fallback_parser_refuses_what_pyyaml_refuses_in_flow(text: str):
         yaml.safe_load(text)
     with pytest.raises(gt.Failure):
         gt._parse_yaml_subset(text, "<t>")
+
+
+def test_skipping_a_quarantine_kind_does_not_skip_the_deletes(workspace: Path):
+    """The mirror of the `a` case: `s` must not silence a different decision.
+
+    Answering "skip these" to a reversible quarantine kept the irreversible
+    deletes from ever being asked about — the same conflation, in the direction
+    that quietly does less rather than more.
+    """
+    repo = workspace / "repo"
+    for name, holds in (("cache-creds", True), ("cache-plain", False)):
+        (repo / name).mkdir()
+        (repo / name / ("id_rsa" if holds else "a.bin")).write_bytes(b"0" * 64)
+    asked: list[str] = []
+
+    def answer(question: str) -> str:
+        asked.append(question)
+        return "s" if len(asked) == 1 else "y"
+
+    decider = gt.Decider(gt.ASK, prompt_input=answer)
+    gt.clean_tree(
+        repo,
+        "repo",
+        config(clean={"extra_dirs": ["cache-creds", "cache-plain"]}),
+        decider,
+        gt.Git(repo),
+        None,
+        sensitive=gt.DEFAULTS["trash"]["sensitive"],
+        local_state=gt.DEFAULTS["clean"]["ignored_keep"],
+        holding=gt.Quarantine(workspace / gt.QUARANTINE_DIRNAME, workspace, stamp="stamp"),
+    )
+    assert len(asked) == 2, "the second kind was still asked about"
+    assert (repo / "cache-creds").exists(), "skipped"
+    assert not (repo / "cache-plain").exists(), "consented to separately"
+
+
+def test_yes_to_all_is_asked_once_and_covers_everything(workspace: Path):
+    """Y is the one answer that spans kinds, and the prompt says so."""
+    repo = workspace / "repo"
+    for name in ("cache-creds", "cache-plain"):
+        (repo / name).mkdir()
+        (repo / name / ("id_rsa" if name.endswith("creds") else "a.bin")).write_bytes(b"0" * 64)
+    asked: list[str] = []
+
+    def answer(question: str) -> str:
+        asked.append(question)
+        return "Y"
+
+    decider = gt.Decider(gt.ASK, prompt_input=answer)
+    gt.clean_tree(
+        repo,
+        "repo",
+        config(clean={"extra_dirs": ["cache-creds", "cache-plain"]}),
+        decider,
+        gt.Git(repo),
+        None,
+        sensitive=gt.DEFAULTS["trash"]["sensitive"],
+        local_state=gt.DEFAULTS["clean"]["ignored_keep"],
+        holding=gt.Quarantine(workspace / gt.QUARANTINE_DIRNAME, workspace, stamp="stamp"),
+    )
+    assert len(asked) == 1
+    assert not (repo / "cache-creds").exists()
+    assert not (repo / "cache-plain").exists()
+    kept = workspace / gt.QUARANTINE_DIRNAME / "stamp" / gt.CONTENT_DIRNAME
+    assert (kept / "repo" / "cache-creds" / "id_rsa").is_file(), "still never hard-deleted"
