@@ -36,7 +36,16 @@ Report what needs a human: credentials in remote URLs, detached HEADs,
 unpushed commits, repositories with no remote. Changes nothing.
 .TP
 .B run
-sync, prune, clean, trash and doctor, in that order.
+sync, prune, clean, trash and doctor, in that order. A run that applies
+anything also drops quarantines older than \fItrash.retention_days\fR.
+.IP
+If three repositories in a row cannot be reached, the run stops rather than
+working through the rest on the same timeout, and points at the VPN, the proxy,
+DNS and the SSH agent.
+.B clean
+and
+.B trash
+do not need the network.
 .TP
 .B init
 Write a commented configuration file:

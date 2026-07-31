@@ -1604,7 +1604,7 @@ def test_a_failed_rebase_leaves_nothing_half_applied(workspace: Path, remote: Pa
 def test_init_asks_without_needing_the_ask_flag(tmp_path: Path):
     """Answering questions is the point of init, not a mode you have to opt into."""
     target = tmp_path / ".git-tidy.yaml"
-    answers = iter(["4", "y", "n", "n", "y", "n", "y", "30"])
+    answers = iter(["4", "y", "n", "n", "y", "n", "n", "y", "30"])
     gt.cmd_init(
         target, gt.AUTO, force=False, printer=quiet_printer(), prompt_input=lambda _: next(answers)
     )
@@ -3657,7 +3657,7 @@ def test_a_rolled_up_dry_run_says_quarantine_when_it_means_it(workspace: Path):
 def test_init_reads_answers_from_a_pipe(tmp_path: Path, monkeypatch, capsys):
     """--ask was accepted and then ignored when stdin was not a terminal."""
     monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
-    answers = iter(["4", "y", "n", "n", "y", "n", "y", "30"])
+    answers = iter(["4", "y", "n", "n", "y", "n", "n", "y", "30"])
     monkeypatch.setattr("builtins.input", lambda _: next(answers))
 
     target = tmp_path / ".git-tidy.yaml"
@@ -4038,6 +4038,8 @@ def test_no_message_the_tool_can_produce_lands_in_other():
         if found not in category_names
         and " " in found  # a message is a sentence; "kept_size" is a dict key
         and found != "{why}, contains {buried}"  # only ever on an applied action
+        # git's own words, matched against a fetch error — never a detail line.
+        and found not in gt.OFFLINE_SIGNS
         and any(word in found for word in interesting)
     }
     assert messages, "the sweep found nothing, so it is not testing anything"
@@ -5784,3 +5786,119 @@ def test_restoring_twice_is_not_an_error_the_second_time(tmp_path: Path):
     assert not [a for a in second if a.applied]
     assert gt._reason_of(second[0].detail) != "other, see the lines marked -"
     assert (space / "a.bin").read_bytes() == b"x"
+
+
+def test_a_run_clears_quarantines_past_their_retention(workspace: Path, capsys):
+    """Expiring only ever happened by hand, so a daily run grew without bound."""
+    old = workspace / gt.QUARANTINE_DIRNAME / "20240101T000000Z"
+    (old / gt.CONTENT_DIRNAME).mkdir(parents=True)
+    (old / gt.MANIFEST_NAME).write_text('{"entries": []}', encoding="utf-8")
+    (old / gt.CONTENT_DIRNAME / "old.bin").write_bytes(b"0" * 4096)
+    os.utime(old, (0, 0))
+
+    assert gt.main(["-C", str(workspace), "run", "--apply"]) == 0
+    assert not old.exists()
+    assert "quarantines deleted" in capsys.readouterr().out
+
+
+def test_a_fresh_quarantine_is_left_alone_by_a_run(workspace: Path):
+    fresh = workspace / gt.QUARANTINE_DIRNAME / "20990101T000000Z"
+    (fresh / gt.CONTENT_DIRNAME).mkdir(parents=True)
+    (fresh / gt.MANIFEST_NAME).write_text('{"entries": []}', encoding="utf-8")
+
+    gt.main(["-C", str(workspace), "run", "--apply"])
+    assert fresh.exists()
+
+
+def test_doctor_never_expires_anything(workspace: Path):
+    """It reports; it does not remove, and that has to stay true."""
+    old = workspace / gt.QUARANTINE_DIRNAME / "20240101T000000Z"
+    (old / gt.CONTENT_DIRNAME).mkdir(parents=True)
+    (old / gt.MANIFEST_NAME).write_text('{"entries": []}', encoding="utf-8")
+    os.utime(old, (0, 0))
+
+    gt.main(["-C", str(workspace), "doctor", "--apply"])
+    assert old.exists()
+
+
+def test_retention_days_zero_switches_the_sweep_off(workspace: Path):
+    old = workspace / gt.QUARANTINE_DIRNAME / "20240101T000000Z"
+    (old / gt.CONTENT_DIRNAME).mkdir(parents=True)
+    (old / gt.MANIFEST_NAME).write_text('{"entries": []}', encoding="utf-8")
+    os.utime(old, (0, 0))
+    (workspace / gt.CONFIG_NAMES[0]).write_text("trash:\n  retention_days: 0\n", encoding="utf-8")
+
+    gt.main(["-C", str(workspace), "run", "--apply"])
+    assert old.exists(), "0 means never, not immediately"
+
+
+# --------------------------------------------------------------------------- #
+# Stopping when it is the network
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    ("message", "network"),
+    [
+        ("fatal: unable to access 'https://x/': Could not resolve host: x", True),
+        ("ssh: connect to host x port 22: Operation timed out", True),
+        ("fatal: unable to access 'https://x/': Failed to connect to proxy", True),
+        ("ssh: connect to host x port 22: Connection refused", True),
+        ("fatal: repository 'https://x/y.git/' not found", False),
+        ("remote: Permission to x denied to y", False),
+        ("fatal: Authentication failed for 'https://x/'", False),
+        ("error: cannot lock ref 'refs/remotes/origin/main'", False),
+    ],
+)
+def test_only_network_errors_count_as_unreachable(message: str, network: bool):
+    """A wrong guess here abandons a whole run over one broken remote URL."""
+    assert gt.looks_unreachable(message) is network
+
+
+def _offline_workspace(root: Path, count: int) -> Path:
+    origin = root / "origin.git"
+    git(root, "init", "--bare", "-q", "-b", "main", str(origin))
+    seed = root / "seed"
+    seed.mkdir()
+    git(seed, "init", "-q", "-b", "main")
+    commit(seed, "README.md", "hello\n")
+    git(seed, "remote", "add", "origin", str(origin))
+    git(seed, "push", "-q", "-u", "origin", "main")
+    space = root / "space"
+    space.mkdir()
+    for number in range(count):
+        git(space, "clone", "-q", str(origin), f"r{number}")
+        git(space / f"r{number}", "remote", "set-url", "origin", "https://x.invalid/r.git")
+    return space
+
+
+def test_a_run_stops_once_the_network_is_clearly_the_problem(tmp_path: Path, capsys):
+    """256 repositories times a 120-second timeout is most of a working day."""
+    space = _offline_workspace(tmp_path, 6)
+
+    assert gt.main(["-C", str(space), "sync", "--apply", "-j", "1"]) == 1
+    out = capsys.readouterr().out
+    assert "could not reach the remote for 3 repositories" in out
+    assert "VPN" in out and "proxy" in out
+    attempted = [line for line in out.splitlines() if line.lstrip().startswith("! r")]
+    assert len(attempted) == gt.OFFLINE_AFTER, attempted
+
+
+def test_clean_still_works_with_no_network(tmp_path: Path):
+    """The message says so, so it had better be true."""
+    space = _offline_workspace(tmp_path, 4)
+    (space / "r0" / "__pycache__").mkdir()
+    (space / "r0" / "__pycache__" / "m.pyc").write_bytes(b"0" * 64)
+
+    assert gt.main(["-C", str(space), "clean", "--apply"]) == 0
+    assert not (space / "r0" / "__pycache__").exists()
+
+
+def test_one_broken_remote_does_not_abandon_the_run(tmp_path: Path, capsys):
+    space = _offline_workspace(tmp_path, 1)
+    git(tmp_path, "clone", "-q", str(tmp_path / "origin.git"), str(space / "fine"))
+
+    assert gt.main(["-C", str(space), "sync", "--apply", "-j", "1"]) == 1
+    out = capsys.readouterr().out
+    assert "could not reach the remote for" not in out
+    assert "fine" in out
