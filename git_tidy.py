@@ -382,7 +382,9 @@ COMMENTS: dict[str, str] = {
     "trash.dirs": "Consider directories too. A directory of junk is much more often a\n"
     "project somebody forgot about, so this is off.",
     "trash.quarantine": "Move to quarantine instead of deleting. Strongly recommended.",
-    "trash.retention_days": "How long a quarantine survives `git-tidy restore --expire`.",
+    "trash.retention_days": "How long a quarantine is kept. Anything older goes at the end\n"
+    "of a clean, trash or run that applied something, or straight away with\n"
+    "`git-tidy restore --expire`. 0 keeps them for ever.",
     "doctor": "Reporting the things that need a decision rather than a command.",
     "doctor.enabled": "Turn the whole doctor step off for this directory.",
     "doctor.credentials_in_url": "Warn when a clone's remote URL carries a password or\na token.",
@@ -464,6 +466,21 @@ def _strip_comment(line: str) -> str:
     return "".join(out).rstrip()
 
 
+def _refuse_control_characters(text: str, source: str, number: int) -> None:
+    """PyYAML refuses these outright, so this has to as well.
+
+    A tab anywhere outside a quoted scalar is a ScannerError there — `jobs: 4\t`
+    is fatal with PyYAML installed and ran normally without it, which is the
+    "works from a checkout, fails on every shipped build" shape in the other
+    direction. NUL and the other C0 controls are the same.
+    """
+    for char in text:
+        if char == "\t":
+            raise Failure(f"{source}:{number}: a tab on this line; YAML wants spaces")
+        if ord(char) < 0x20 and char not in "\n\r":
+            raise Failure(f"{source}:{number}: control character {ord(char):#04x} on this line")
+
+
 def _tokenize(text: str, source: str) -> list[_Line]:
     # PyYAML strips this; an editor on Windows writes it. Without this the first
     # key becomes "\ufeffjobs" and the whole config is refused — but only where
@@ -474,6 +491,7 @@ def _tokenize(text: str, source: str) -> list[_Line]:
     for number, raw in enumerate(text.splitlines(), start=1):
         if "\t" in raw[: len(raw) - len(raw.lstrip())]:
             raise Failure(f"{source}:{number}: tabs cannot be used for YAML indentation")
+        _refuse_control_characters(raw, source, number)
         content = _strip_comment(raw)
         if not content.strip():
             continue
@@ -530,6 +548,11 @@ def _parse_mapping(lines: list[_Line], index: int, indent: int, source: str) -> 
         key, sep, rest = line.text.partition(": ")
         if not sep and line.text.endswith(":"):
             key, sep, rest = line.text[:-1], ":", ""
+        if key.startswith(("[", "{")):
+            # _scalar would hand back a list or a dict, and an unhashable dict
+            # key is a bare TypeError rather than anything a person can act on.
+            # PyYAML refuses it too, so refusing is also the agreeing answer.
+            raise Failure(f"{source}:{line.number}: a list or mapping cannot be a key")
         if not sep:
             raise Failure(
                 f"{source}:{line.number}: expected 'key: value' — a colon needs a space "
@@ -1036,6 +1059,11 @@ def _check_scalar(default: Any, value: Any, key: str, where: str) -> None:
         raise Failure(
             f"{where}: {key!r} takes {expected.__name__}, not {type(value).__name__} ({value!r})"
         )
+    if isinstance(value, int) and not isinstance(value, bool) and value < 0:
+        # None of the numbers here has a meaning below zero, and a negative
+        # retention_days moved the expiry cutoff into the *future*, which took
+        # the quarantine the running command had just written.
+        raise Failure(f"{where}: {key!r} cannot be negative ({value!r})")
 
 
 def read_config_file(path: Path) -> dict[str, Any]:
@@ -1641,6 +1669,10 @@ def sync_repo(path: Path, name: str, cfg: dict[str, Any], decider: Decider) -> l
 # Substrings of git's own message that mean "this is the network, not this
 # repository". Kept narrow on purpose: a wrong guess here would abandon a run
 # over one broken remote URL.
+# NOT "unable to access": git prefixes every HTTP failure with it, including
+# `The requested URL returned error: 403`, which is a repository you cannot read
+# rather than a network you cannot reach. The README promises that one carries
+# on, and abandoning the run also meant clean, trash and doctor never ran.
 OFFLINE_SIGNS = (
     "could not resolve host",
     "could not resolve hostname",
@@ -1655,7 +1687,6 @@ OFFLINE_SIGNS = (
     "ssl connect error",
     "timed out after",
     "temporary failure in name resolution",
-    "unable to access",
     "kex_exchange_identification",
     "port 22: ",
 )
@@ -2926,7 +2957,7 @@ def _sensitive_within(directory: Path, sensitive: Sequence[str]) -> str | None:
     return None
 
 
-def _thin_out(directory: Path, keep: Sequence[Path]) -> int:
+def _thin_out(directory: Path, keep: Sequence[Path]) -> tuple[int, str]:
     """Remove everything under `directory` except `keep`, and say how much went.
 
     The directory itself survives, holding only the protected entries. That is
@@ -2941,11 +2972,16 @@ def _thin_out(directory: Path, keep: Sequence[Path]) -> int:
     A kept *directory* is kept whole, contents and all — `credentials/` is
     protected as a unit — and the count is of bytes that actually went, measured
     after the fact, so a file that could not be removed is not reported as freed.
+
+    Returns that count and the first error, if anything refused to go. Swallowing
+    those and reporting the prediction meant a directory holding an unreadable
+    subtree said "emptied out" and named the full size as freed.
     """
     kept = {one.resolve() for one in keep}
     # Every directory on the way down to something kept has to survive too.
     needed = {parent for one in kept for parent in one.parents}
     freed = 0
+    trouble = ""
 
     def protected(path: Path) -> bool:
         resolved = path.resolve()
@@ -2957,7 +2993,9 @@ def _thin_out(directory: Path, keep: Sequence[Path]) -> int:
             candidate = here / name
             if protected(candidate):
                 continue
-            freed += _unlink_and_count(candidate)
+            gone, problem = _unlink_and_count(candidate)
+            freed += gone
+            trouble = trouble or problem
         stay = []
         for name in sorted(dirnames):
             candidate = here / name
@@ -2965,30 +3003,34 @@ def _thin_out(directory: Path, keep: Sequence[Path]) -> int:
             if candidate.is_symlink():
                 # Not followed and not counted: a symlink holds nothing, and
                 # unlinking it cannot destroy what it points at.
-                with contextlib.suppress(OSError):
+                try:
                     candidate.unlink()
+                except OSError as exc:
+                    trouble = trouble or str(exc)
                 continue
             if protected(candidate) or resolved in needed:
                 stay.append(name)
                 continue
             before = _measure(candidate)[0]
-            with contextlib.suppress(OSError):
+            try:
                 shutil.rmtree(candidate)
+            except OSError as exc:
+                trouble = trouble or str(exc)
             after = _measure(candidate)[0] if candidate.exists() else 0
             freed += before - after
         # Walked into only what has something kept below it; the rest is gone.
         dirnames[:] = [name for name in stay if not protected(here / name)]
-    return freed
+    return freed, trouble
 
 
-def _unlink_and_count(path: Path) -> int:
-    """Remove one file and return the bytes that actually went."""
+def _unlink_and_count(path: Path) -> tuple[int, str]:
+    """Remove one file, returning the bytes that actually went and any error."""
     try:
         size = 0 if path.is_symlink() else path.stat().st_size
         path.unlink()
-    except OSError:
-        return 0
-    return size
+    except OSError as exc:
+        return 0, str(exc)
+    return size, ""
 
 
 def _holds_protected(
@@ -3404,7 +3446,15 @@ def _remove(
             # Thinned out rather than removed: the protected entries stay
             # exactly where they are, because a .env is not a copy of anything
             # and an application reads it from that path.
-            _thin_out(path, rescue)
+            #
+            # The returned count is of bytes that actually went. Discarding it
+            # and keeping the prediction meant a directory holding an unreadable
+            # subtree reported "emptied out" and the full size freed, with no
+            # error, while 97.7 KB of it was still on the disk.
+            action.size, failed = _thin_out(path, rescue)
+            if failed:
+                action.error = failed
+                return action
         elif is_dir:
             shutil.rmtree(path)
         else:
@@ -3708,6 +3758,14 @@ def expire_quarantines(
     both the too-young case and the misspelt-stamp case used to print an empty
     summary and exit 0, so the quarantine looked expired when it was still there.
     """
+    if days <= 0:
+        # 0 means never, in both callers. It used to mean "cutoff = now", so
+        # `restore --expire` deleted every quarantine including one made seconds
+        # earlier — while the automatic path, added later, read the same value as
+        # "off". A negative one moved the cutoff into the future and took the
+        # quarantine the current run had just written, before its manifest was
+        # even flushed. Refused in _check_number as well; this is the backstop.
+        return []
     if not quarantine_root.is_dir():
         if only is not None:
             raise Failure(f"no quarantine at {quarantine_root}")
@@ -4592,20 +4650,39 @@ class Context:
     report_orphans: bool = False
     # Fetches that failed for a reason that is about the network rather than
     # about the repository, and the lock that guards the count.
-    unreachable: list[str] = field(default_factory=list)
+    unreachable: set[str] = field(default_factory=set)
+    reached_since: bool = False
     last_unreachable: str = ""
     _offline_lock: threading.Lock = field(default_factory=threading.Lock)
 
-    def note_unreachable(self, name: str, message: str) -> None:
+    def note_unreachable(self, url: str, message: str) -> None:
         """Record a fetch that failed for a reason that is about the network.
 
         Recorded, not raised: _guarded turns a Failure from one repository into
         that repository's error line, which is exactly right for a broken remote
         and exactly wrong for this. giving_up is read between items instead.
+
+        Keyed on the remote URL, because a repository and its linked worktrees
+        are separate entries in context.repos and all fetch the same remote —
+        one dead URL with two `git worktree add` checkouts reached the threshold
+        on its own, which is the false positive this whole guard is supposed to
+        avoid. And it is what gets counted in the message: three checkouts of
+        one unreachable remote is one unreachable remote.
         """
         with self._offline_lock:
-            self.unreachable.append(name)
+            self.unreachable.add(url)
             self.last_unreachable = message
+
+    def note_reachable(self) -> None:
+        """A fetch that worked, which means the network is not the problem.
+
+        Without this, "three in a row" was "three ever": three dead remotes
+        scattered anywhere in a 256-repository workspace abandoned every run
+        from then on, and `run` never reached clean or trash.
+        """
+        with self._offline_lock:
+            self.unreachable.clear()
+            self.reached_since = True
 
     @property
     def giving_up(self) -> bool:
@@ -4618,17 +4695,27 @@ class Context:
         with self._offline_lock:
             return len(self.unreachable) >= OFFLINE_AFTER
 
-    def offline_failure(self) -> Failure:
+    def offline_failure(self, done: bool) -> Failure:
         with self._offline_lock:
             count, message = len(self.unreachable), self.last_unreachable
+        # "Nothing needing the network was changed" was printed two lines above
+        # a summary reading "3 repositories fast-forwarded". Whatever landed
+        # before the network went is still there, and saying otherwise is the
+        # one line somebody reads before deciding whether to go and look.
+        already = (
+            "What had already been fetched or fast-forwarded is done and is listed above; "
+            "nothing was left half-applied.\n  "
+            if done
+            else "Nothing was changed.\n  "
+        )
         return Failure(
-            f"could not reach the remote for {plural(count, 'repository')}, so the rest "
-            f"were left alone rather than waiting on the same timeout.\n"
+            f"could not reach {plural(count, 'remote')} in a row, so the rest were left "
+            f"alone rather than waiting on the same timeout.\n"
             f"  Last error: {message}\n"
-            "  Check the VPN, the proxy (http_proxy, https_proxy and git's own "
+            f"  {already}"
+            "Check the VPN, the proxy (http_proxy, https_proxy and git's own "
             "http.proxy), DNS, and your SSH agent.\n"
-            "  Nothing needing the network was changed. `git-tidy clean` and "
-            "`git-tidy trash` do not need it."
+            "  `git-tidy clean` and `git-tidy trash` do not need the network."
         )
 
     def name_of(self, repo: Path) -> str:
@@ -4674,6 +4761,12 @@ def _families(repos: Sequence[Path], timeout: int = 300) -> list[list[Path]]:
     return list(families.values())
 
 
+def _remote_url(repo: Path, remote: str) -> str:
+    """What this checkout would fetch from, for counting unreachable *remotes*."""
+    url = Git(repo).out("remote", "get-url", remote, check=False)
+    return url or str(repo)
+
+
 def _in_parallel(context: Context, work: Callable[[Path], list[Action]], report: Report) -> None:
     """Run `work(repo)` over every repo, printing results as they land."""
     jobs = context.jobs
@@ -4685,7 +4778,7 @@ def _in_parallel(context: Context, work: Callable[[Path], list[Action]], report:
             report.extend(results)
             context.printer.batch(results)
         if context.giving_up:
-            raise context.offline_failure()
+            raise context.offline_failure(context.reached_since)
         return
 
     def whole_family(family: list[Path]) -> list[Action]:
@@ -4709,7 +4802,7 @@ def _in_parallel(context: Context, work: Callable[[Path], list[Action]], report:
                 future.cancel()
             raise
     if context.giving_up:
-        raise context.offline_failure()
+        raise context.offline_failure(context.reached_since)
 
 
 def _guarded(work: Callable[[Path], list[Action]], repo: Path, context: Context) -> list[Action]:
@@ -4757,12 +4850,15 @@ def cmd_sync(context: Context, report: Report) -> None:
         name = context.name_of(repo)
         actions = sync_repo(repo, name, cfg, context.decider)
         # Checked here rather than inside sync_repo, which knows nothing about
-        # the run as a whole. note_unreachable raises once enough of them agree,
-        # and that unwinds the pool the same way a Failure from anywhere else
-        # does — with everything already done reported.
+        # the run as a whole. context.giving_up is read between items, which is
+        # what stops the rest.
         for action in actions:
-            if action.kind == "fetch" and action.error and looks_unreachable(action.error):
-                context.note_unreachable(name, action.error)
+            if action.kind != "fetch":
+                continue
+            if action.applied:
+                context.note_reachable()
+            elif action.error and looks_unreachable(action.error):
+                context.note_unreachable(_remote_url(repo, cfg["sync"]["remote"]), action.error)
         return actions
 
     _in_parallel(context, work, report)
@@ -5501,17 +5597,25 @@ def _expire_old_quarantines(
     if command not in ("clean", "trash", "run"):
         return
     days = cfg["trash"]["retention_days"]
-    if not days:
-        return
     root = context.workspace / QUARANTINE_DIRNAME
-    if not root.is_dir():
+    if days <= 0 or not root.is_dir():
+        return
+    if not any(action.applied for action in report.actions) and not context.decider.dry:
+        # The README and the man page both say "a clean, trash or run that
+        # applies anything". Keying off the command name alone meant a
+        # `clean --apply` in a workspace with clean switched off still deleted
+        # quarantines — the one thing that command had been told not to do.
         return
     expired = expire_quarantines(root, days, context.decider)
-    fresh = [a for a in expired if not a.skipped or a.error]
-    if fresh:
-        context.printer.heading("Quarantines past their retention")
-        report.extend(fresh)
-        context.printer.batch(fresh)
+    if not expired:
+        return
+    # Heading first: the --ask prompt for these was printed under whatever
+    # heading the previous step had left behind. And a declined one belongs in
+    # the report like every other declined action — dropping it left an empty
+    # summary and no sign the question had been asked at all.
+    context.printer.heading("Quarantines past their retention")
+    report.extend(expired)
+    context.printer.batch(expired)
 
 
 def _excludes_itself(repo: Path, root: Path, resolver: ConfigResolver) -> bool:
