@@ -111,14 +111,19 @@ Two mechanisms, and the first is usually all you need:
   directory holding one is moved to quarantine rather than deleted, so the file
   survives even when its parent goes.
 
-  With one exception, and it is the one that decides whether the tool reclaims
-  anything at all: inside a path listed in `clean.regenerable` (`.terraform`,
-  `.gradle`, `.next` …) `ignored_keep` does not apply, because those are caches
-  a tool rebuilds. Every `.terraform` holds a `terraform.tfstate` — the backend
-  pointer, not your state — and every `.venv` holds a `certifi/cacert.pem`, so
-  honouring the list there would turn practically every cache into a rename
-  into `.git-tidy-trash/` in the same workspace and free nothing.
-  `trash.sensitive` still holds there: nothing rebuilds a private key.
+  Two things stop that from swallowing the space this tool exists to reclaim.
+  Inside a path listed in `clean.regenerable` (`.terraform`, `.gradle`, `.next`
+  …) `ignored_keep` does not apply at all, because those are caches a tool
+  rebuilds — every `.terraform` holds a `terraform.tfstate`, which is the
+  backend pointer, not your state. And anywhere else, a directory holding a
+  protected file is **not** moved whole: the protected files are lifted out
+  into quarantine and the directory around them is removed. A 400 MB
+  `node_modules` with one `id_rsa` in it gives back 400 MB and keeps the key.
+
+  `trash.sensitive` holds everywhere, but not for source code: a `tokenizer.js`
+  or a `pygments/token.py` matches `*token*` and is not a secret, so anything
+  with a source-code extension is exempt. If it really is source, it is
+  committed, and `clean` does not touch tracked files.
 - **`clean.dirs` / `clean.files`** — names removed wherever they appear, ignored
   or not: `.terraform`, `.terragrunt-cache`, `__pycache__`, `.pytest_cache`,
   `.scannerwork`, `*.pyc`, `.coverage`, and so on.
@@ -203,7 +208,7 @@ What `--force` deliberately cannot do:
   for every module, and keeping those would make a gigabyte unreclaimable
 - hard-delete anything matching `trash.sensitive`; a credential is quarantined
   whatever else is set, wherever it turns up — including inside a cache that is
-  otherwise deleted outright
+  otherwise deleted outright, where it is lifted out before the cache goes
 - remove a tracked file, follow a symlink, or reach outside the workspace
 
 Pair it with `--ask` the first time, so you see what it selects before it acts.

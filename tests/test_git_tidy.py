@@ -2687,8 +2687,13 @@ def test_a_directory_can_turn_trash_off_for_itself(workspace: Path):
     assert junk.is_file(), "the directory said no"
 
 
-def test_a_credential_inside_a_disposable_directory_is_moved_not_deleted(workspace: Path):
-    """The promise trash makes, kept by clean too."""
+def test_a_credential_inside_a_disposable_directory_is_lifted_out_of_it(workspace: Path):
+    """The promise trash makes, kept by clean — without keeping the cache too.
+
+    The credential goes to quarantine and the directory around it really goes:
+    moving a whole node_modules aside because one file in it matched reclaimed
+    nothing at all, which is the one thing the tool exists to do.
+    """
     repo = workspace / "repo"
     cache = repo / ".terraform"
     cache.mkdir()
@@ -2706,9 +2711,11 @@ def test_a_credential_inside_a_disposable_directory_is_moved_not_deleted(workspa
         sensitive=gt.DEFAULTS["trash"]["sensitive"],
         holding=holding,
     )
-    assert not cache.exists()
-    assert (holding.dir / gt.CONTENT_DIRNAME / "repo" / ".terraform" / "client.pem").is_file()
-    assert any("contains" in a.detail and a.quarantined for a in actions)
+    assert not cache.exists(), "the cache is reclaimed"
+    kept = holding.dir / gt.CONTENT_DIRNAME / "repo" / ".terraform" / "client.pem"
+    assert kept.read_text(encoding="utf-8") == "PRIVATE KEY"
+    assert not (holding.dir / gt.CONTENT_DIRNAME / "repo" / ".terraform" / "provider.bin").exists()
+    assert any("keeping client.pem in quarantine" in a.detail for a in actions), actions
 
 
 # --------------------------------------------------------------------------- #
@@ -2834,8 +2841,8 @@ def test_an_ignored_credential_file_is_quarantined_not_deleted(workspace: Path):
 def test_a_credential_matched_by_a_file_pattern_is_quarantined(workspace: Path):
     """The guarantee cannot depend on which mechanism found the file."""
     repo = workspace / "repo"
-    (repo / "api-token.pyc").write_text("the only copy", encoding="utf-8")
-    (repo / "module.pyc").write_text("disposable", encoding="utf-8")
+    (repo / "api-token.tfplan").write_text("the only copy", encoding="utf-8")
+    (repo / "module.tfplan").write_text("disposable", encoding="utf-8")
     holding = gt.Quarantine(workspace / gt.QUARANTINE_DIRNAME, workspace, stamp="stamp")
 
     gt.clean_tree(
@@ -2848,8 +2855,8 @@ def test_a_credential_matched_by_a_file_pattern_is_quarantined(workspace: Path):
         sensitive=gt.DEFAULTS["trash"]["sensitive"],
         holding=holding,
     )
-    assert not (repo / "module.pyc").exists()
-    assert (holding.dir / gt.CONTENT_DIRNAME / "repo" / "api-token.pyc").read_text(
+    assert not (repo / "module.tfplan").exists()
+    assert (holding.dir / gt.CONTENT_DIRNAME / "repo" / "api-token.tfplan").read_text(
         encoding="utf-8"
     ) == "the only copy"
 
@@ -2857,10 +2864,10 @@ def test_a_credential_matched_by_a_file_pattern_is_quarantined(workspace: Path):
 def test_a_loose_credential_is_quarantined_too(workspace: Path):
     loose = workspace / "loose"
     loose.mkdir()
-    (loose / "api-token.pyc").write_text("the only copy", encoding="utf-8")
+    (loose / "api-token.tfplan").write_text("the only copy", encoding="utf-8")
 
     gt.main(["-C", str(workspace), "clean", "--apply"])
-    found = list((workspace / gt.QUARANTINE_DIRNAME).glob("*/files/loose/api-token.pyc"))
+    found = list((workspace / gt.QUARANTINE_DIRNAME).glob("*/files/loose/api-token.tfplan"))
     assert found and found[0].read_text(encoding="utf-8") == "the only copy"
 
 
@@ -2983,11 +2990,11 @@ def test_a_deeper_sensitive_list_protects_a_loose_credential(workspace: Path):
     """The guarantee has to follow the config that governs the path."""
     loose = workspace / "loose"
     loose.mkdir()
-    (loose / "vault.pyc").write_text("the only copy", encoding="utf-8")
+    (loose / "vault.tfplan").write_text("the only copy", encoding="utf-8")
     (loose / ".git-tidy.yaml").write_text('trash:\n  sensitive: ["vault*"]\n', encoding="utf-8")
 
     gt.main(["-C", str(workspace), "clean", "--apply"])
-    found = list((workspace / gt.QUARANTINE_DIRNAME).glob("*/files/loose/vault.pyc"))
+    found = list((workspace / gt.QUARANTINE_DIRNAME).glob("*/files/loose/vault.tfplan"))
     assert found and found[0].read_text(encoding="utf-8") == "the only copy"
 
 
@@ -3118,7 +3125,7 @@ def test_a_dry_run_says_quarantine_when_it_means_quarantine(workspace: Path):
     """ "would remove" for something that would only be moved is the wrong word."""
     loose = workspace / "loose"
     loose.mkdir()
-    (loose / "api-token.pyc").write_text("the only copy", encoding="utf-8")
+    (loose / "api-token.tfplan").write_text("the only copy", encoding="utf-8")
 
     context = gt.Context(
         workspace,
@@ -3778,14 +3785,28 @@ def test_home_is_refused_even_when_it_is_a_symlink(tmp_path: Path, monkeypatch):
 
 
 def test_the_summary_does_not_call_a_quarantined_path_removed(workspace: Path, capsys):
+    """*.tfplan is disposable, but this one is named like a credential."""
     repo = workspace / "repo"
-    (repo / "__pycache__").mkdir()
-    (repo / "__pycache__" / "deploy.pem").write_text("KEY", encoding="utf-8")
+    (repo / "api-token.tfplan").write_text("KEY", encoding="utf-8")
 
     gt.main(["-C", str(workspace), "clean", "--apply"])
     out = capsys.readouterr().out
     assert "artefacts quarantined" in out
     assert "artefacts removed" not in out
+
+
+def test_a_cache_holding_a_credential_is_removed_and_the_credential_kept(workspace: Path, capsys):
+    """Both halves in one summary: the space back, the key still there."""
+    repo = workspace / "repo"
+    (repo / "__pycache__").mkdir()
+    (repo / "__pycache__" / "deploy.pem").write_text("KEY", encoding="utf-8")
+    (repo / "__pycache__" / "m.pyc").write_bytes(b"0" * 4096)
+
+    gt.main(["-C", str(workspace), "clean", "--apply"])
+    assert "artefacts removed" in capsys.readouterr().out
+    assert not (repo / "__pycache__").exists()
+    found = list((workspace / gt.QUARANTINE_DIRNAME).glob("*/files/repo/__pycache__/deploy.pem"))
+    assert found and found[0].read_text(encoding="utf-8") == "KEY"
 
 
 @pytest.mark.parametrize(
@@ -4243,7 +4264,9 @@ def test_local_state_is_never_deleted_by_the_pattern_walk(workspace: Path):
         run(),
         gt.Git(repo),
         None,
-        sensitive=gt._never_delete_outright(config()),
+        sensitive=gt.outright_guard(
+            gt.DEFAULTS["trash"]["sensitive"], gt.DEFAULTS["clean"]["ignored_keep"], False
+        ),
         holding=holding,
     )
     kept = holding.dir / gt.CONTENT_DIRNAME / "repo" / ".terraform"
@@ -4462,7 +4485,7 @@ def test_restore_list_honours_json(workspace: Path, capsys):
 
 
 def test_a_directory_named_like_a_credential_is_quarantined(workspace: Path):
-    """A file called api-token.pyc was; a directory called tokens/ was not."""
+    """A file called api-token.tfplan was; a directory called tokens/ was not."""
     repo = workspace / "repo"
     (repo / ".gitignore").write_text("creds/\ntokens/\n", encoding="utf-8")
     git(repo, "add", ".gitignore")
@@ -4880,3 +4903,183 @@ def test_expire_refuses_a_stamp_that_is_not_there(tmp_path: Path):
     root.mkdir()
     with pytest.raises(gt.Failure, match="no quarantine 'NOPE'"):
         expire_now(root, only="NOPE")
+
+
+def test_a_repository_probe_answers_yes_when_it_cannot_tell(tmp_path: Path):
+    """Path.is_dir() raises before 3.12 and returns False from 3.12 on.
+
+    Both are wrong for a guard that decides whether deleting something would
+    destroy a repository: the same workspace behaved differently depending on
+    which interpreter the tool happened to be running under.
+    """
+    locked = tmp_path / "locked"
+    (locked / "maybe").mkdir(parents=True)
+    locked.chmod(0o000)
+    try:
+        assert gt.holds_git_data(locked / "maybe") is True
+        assert gt.cannot_look(locked / "maybe") is True
+        # is_repo stays strict: a checkout that cannot be read is not one to sync.
+        assert gt.is_repo(locked / "maybe") is False
+    finally:
+        locked.chmod(0o755)
+
+
+# --------------------------------------------------------------------------- #
+# Claude review, round ten
+# --------------------------------------------------------------------------- #
+
+
+def test_a_rebase_does_not_replace_an_ignored_local_file(workspace: Path, remote: Path):
+    """The switch and the fast-forward both guard this; the rebase did not.
+
+    A rebase checks the upstream out as surely as they do, so an uncommitted
+    .env that the incoming commits happen to track was replaced — never
+    committed, never stashed, never quarantined.
+    """
+    repo = workspace / "repo"
+    (repo / ".gitignore").write_text(".env\n", encoding="utf-8")
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-q", "-m", "ignore .env")
+    git(repo, "push", "-q", "origin", "main")
+
+    other = workspace.parent / "other"
+    git(workspace.parent, "clone", "-q", str(remote), str(other))
+    (other / ".env").write_text("UPSTREAM=theirs", encoding="utf-8")
+    git(other, "add", "-f", ".env")
+    git(other, "commit", "-q", "-m", "track .env upstream")
+    git(other, "push", "-q", "origin", "main")
+
+    commit(repo, "mine.txt")  # local commit as well: diverged
+    (repo / ".env").write_text("MY_SECRET=do-not-lose-me", encoding="utf-8")
+    git(repo, "fetch", "-q", "origin")
+
+    actions = gt.sync_repo(repo, "repo", config(sync={"diverged": "rebase"}), run())
+    assert any("would be replaced" in a.detail for a in actions), actions
+    assert (repo / ".env").read_text(encoding="utf-8") == "MY_SECRET=do-not-lose-me"
+
+
+def test_a_dependency_tree_is_reclaimed_and_its_credential_lifted_out(workspace: Path):
+    """Renaming 400 MB into the workspace's own quarantine reclaims nothing."""
+    repo = workspace / "repo"
+    modules = repo / "node_modules"
+    (modules / "acorn" / "dist").mkdir(parents=True)
+    (modules / "acorn" / "dist" / "tokenizer.js").write_bytes(b"0" * 40960)
+    (modules / "id_rsa").write_text("PRIVATE", encoding="utf-8")
+
+    (workspace / ".git-tidy.yaml").write_text("clean:\n  dependencies: true\n", encoding="utf-8")
+    gt.main(["-C", str(workspace), "clean", "--apply"])
+    assert not modules.exists(), "the tree is really gone"
+    quarantined = workspace / gt.QUARANTINE_DIRNAME
+    found = list(quarantined.glob("*/files/repo/node_modules/id_rsa"))
+    assert found and found[0].read_text(encoding="utf-8") == "PRIVATE"
+    assert not list(quarantined.glob("*/files/repo/node_modules/acorn/dist/tokenizer.js"))
+
+
+@pytest.mark.parametrize(
+    ("name", "protected"),
+    [
+        ("tokenizer.js", False),
+        ("token.py", False),
+        ("phystokens.py", False),
+        ("tokens.pyc", False),
+        ("id_rsa", True),
+        ("cacert.pem", True),
+        ("api-token.txt", True),
+        ("creds.json", True),
+        ("deploy.key", True),
+    ],
+)
+def test_source_code_is_not_mistaken_for_a_credential(name: str, protected: bool):
+    """trash.sensitive casts a wide net, and *token* caught half of every venv."""
+    assert gt._protects(name, gt.DEFAULTS["trash"]["sensitive"]) is protected
+
+
+def test_clean_ignored_does_not_keep_and_remove_the_same_path(workspace: Path, capsys):
+    """One run said "kept: contains terraform.tfstate" and "removed", of one path."""
+    repo = workspace / "repo"
+    (repo / ".gitignore").write_text(".terraform/\n", encoding="utf-8")
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-q", "-m", "ignore")
+    (repo / ".terraform").mkdir()
+    (repo / ".terraform" / "terraform.tfstate").write_text("backend", encoding="utf-8")
+
+    (workspace / ".git-tidy.yaml").write_text(
+        "clean:\n  ignored: true\n  dirs: []\n", encoding="utf-8"
+    )
+    gt.main(["-C", str(workspace), "clean", "--apply", "-v"])
+    lines = [line for line in capsys.readouterr().out.splitlines() if ".terraform" in line]
+    assert len(lines) == 1, lines
+    assert not (repo / ".terraform").exists()
+
+
+def test_an_unreadable_subtree_is_not_called_a_git_repository(workspace: Path, capsys):
+    """It said "contains a git repository" for a tree with no git anywhere in it."""
+    loose = workspace / "project.old"
+    (loose / "locked").mkdir(parents=True)
+    (loose / "locked").chmod(0o000)
+    (workspace / ".git-tidy.yaml").write_text(
+        "trash:\n  enabled: true\n  scope: workspace\n  dirs: true\n  min_age_days: 0\n",
+        encoding="utf-8",
+    )
+    try:
+        gt.main(["-C", str(workspace), "trash", "-v"])
+        out = capsys.readouterr().out
+        assert "cannot be read" in out
+        assert "contains a git repository" not in out
+    finally:
+        (loose / "locked").chmod(0o755)
+
+
+def test_a_rebase_in_progress_is_an_operation_in_progress(workspace: Path):
+    """git sets none of the *_HEAD markers during a rebase, only a directory."""
+    repo = workspace / "repo"
+    commit(repo, "a.txt", "one\n")
+    git(repo, "switch", "-q", "-c", "side")
+    commit(repo, "a.txt", "side\n")
+    git(repo, "switch", "-q", "main")
+    commit(repo, "a.txt", "main\n")
+    subprocess.run(["git", "-C", str(repo), "rebase", "side"], capture_output=True, check=False)
+
+    assert gt._operation_in_progress(gt.Git(repo)) == "a rebase"
+    actions = gt.sync_repo(repo, "repo", config(sync={"switch": "always"}), run())
+    assert any("in progress" in a.detail for a in actions), actions
+    assert not any(a.error for a in actions), actions
+
+
+def test_a_character_class_in_a_pattern_is_not_a_broken_flow_list():
+    """fixtures/[0-9] is legal fnmatch and a plain string to PyYAML."""
+    yaml = pytest.importorskip("yaml")
+    text = "clean:\n  keep:\n    - fixtures/[0-9]\n    - a{b\n"
+    assert gt._parse_yaml_subset(text, "<t>") == yaml.safe_load(text)
+
+
+def test_init_dry_run_keeps_its_advice_off_stdout(tmp_path: Path, capsys):
+    """`git-tidy init -n > .git-tidy.yaml` is the documented recipe."""
+    target = tmp_path / ".git-tidy.yaml"
+    target.write_text("", encoding="utf-8")  # the redirect creates it first
+    assert gt.main(["-C", str(tmp_path), "init", "-n", "--path", str(tmp_path)]) == 0
+    captured = capsys.readouterr()
+    assert "Not written" in captured.err
+    assert "Not written" not in captured.out
+    # The template is all comments, so it parses to nothing — but it parses,
+    # which the advice line on stdout used to stop it doing.
+    assert gt.load_yaml(captured.out, "<stdout>") is None
+
+
+def test_a_clone_of_an_empty_repository_is_fast_forwarded(tmp_path: Path):
+    """An unborn HEAD has nothing to count, and it was left behind for ever."""
+    origin = tmp_path / "origin.git"
+    git(tmp_path, "init", "--bare", "-q", "-b", "main", str(origin))
+    space = tmp_path / "space"
+    space.mkdir()
+    git(space, "clone", "-q", str(origin), "fresh")
+
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    git(seed, "init", "-q", "-b", "main")
+    commit(seed, "README.md", "hello\n")
+    git(seed, "remote", "add", "origin", str(origin))
+    git(seed, "push", "-q", "-u", "origin", "main")
+
+    gt.main(["-C", str(space), "sync", "--apply"])
+    assert (space / "fresh" / "README.md").read_text(encoding="utf-8") == "hello\n"
