@@ -2896,28 +2896,58 @@ def _thin_out(directory: Path, keep: Sequence[Path]) -> int:
 
     Nothing protected is deleted, so nothing needs a quarantine to fall back on:
     "never hard-deleted" is kept by not removing it at all.
+
+    A kept *directory* is kept whole, contents and all — `credentials/` is
+    protected as a unit — and the count is of bytes that actually went, measured
+    after the fact, so a file that could not be removed is not reported as freed.
     """
-    keep_set = {one.resolve() for one in keep}
-    ancestors = {parent for one in keep for parent in one.resolve().parents}
+    kept = {one.resolve() for one in keep}
+    # Every directory on the way down to something kept has to survive too.
+    needed = {parent for one in kept for parent in one.parents}
     freed = 0
-    for dirpath, dirnames, filenames in os.walk(directory, topdown=False, followlinks=False):
+
+    def protected(path: Path) -> bool:
+        resolved = path.resolve()
+        return resolved in kept or any(one in resolved.parents for one in kept)
+
+    for dirpath, dirnames, filenames in os.walk(directory, followlinks=False):
         here = Path(dirpath)
-        for name in filenames:
+        for name in sorted(filenames):
             candidate = here / name
-            if candidate.resolve() in keep_set:
+            if protected(candidate):
                 continue
-            with contextlib.suppress(OSError):
-                freed += 0 if candidate.is_symlink() else candidate.stat().st_size
-                candidate.unlink()
-        for name in dirnames:
+            freed += _unlink_and_count(candidate)
+        stay = []
+        for name in sorted(dirnames):
             candidate = here / name
             resolved = candidate.resolve()
-            if resolved in keep_set or resolved in ancestors or candidate.is_symlink():
+            if candidate.is_symlink():
+                # Not followed and not counted: a symlink holds nothing, and
+                # unlinking it cannot destroy what it points at.
+                with contextlib.suppress(OSError):
+                    candidate.unlink()
                 continue
+            if protected(candidate) or resolved in needed:
+                stay.append(name)
+                continue
+            before = _measure(candidate)[0]
             with contextlib.suppress(OSError):
-                freed += _measure(candidate)[0]
                 shutil.rmtree(candidate)
+            after = _measure(candidate)[0] if candidate.exists() else 0
+            freed += before - after
+        # Walked into only what has something kept below it; the rest is gone.
+        dirnames[:] = [name for name in stay if not protected(here / name)]
     return freed
+
+
+def _unlink_and_count(path: Path) -> int:
+    """Remove one file and return the bytes that actually went."""
+    try:
+        size = 0 if path.is_symlink() else path.stat().st_size
+        path.unlink()
+    except OSError:
+        return 0
+    return size
 
 
 def _holds_protected(
