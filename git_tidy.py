@@ -325,8 +325,13 @@ COMMENTS: dict[str, str] = {
     "the same set as `git clean -Xd`. Thorough, and the fastest way to reclaim\n"
     "space, but it also catches local-only files that are ignored on purpose,\n"
     "which is what ignored_keep below is for.",
-    "clean.ignored_keep": "Never deleted by clean.ignored: local state and credentials\n"
-    "that are ignored precisely because they must not be committed.",
+    "clean.ignored_keep": "Never deleted, by any of the clean steps: local state and\n"
+    "credentials that are ignored precisely because they must not be\n"
+    "committed. A directory holding one is emptied of it first — the file goes\n"
+    "to quarantine, the directory around it is still reclaimed.\n"
+    "The source-code exemption that applies to trash.sensitive does not apply\n"
+    "here: a secrets.py that is gitignored is not committed source, and being\n"
+    "local and untracked is exactly why this list names it.",
     "clean.dirs": "Directory names removed wherever they appear, ignored or not.\nGlobs allowed.",
     "clean.extra_dirs": "Appended to dirs instead of replacing it, so one repository\n"
     "can add a name without restating the whole list.",
@@ -587,6 +592,13 @@ def _looks_like_mapping(item: str) -> bool:
     return bool(sep) and " " not in key.strip()
 
 
+# Indicators PyYAML refuses at the start of a plain scalar *inside* a flow
+# collection, where it applies stricter rules than at block level. `?` is an
+# ordinary fnmatch wildcard, so `keep: [conf?.yaml]` is a natural thing to
+# write — and it parsed here and was a ParserError with PyYAML installed.
+_FLOW_INDICATORS = "?:"
+
+
 def _split_flow(body: str, source: str, number: int) -> list[str]:
     """Split `a, b, [c, d]` on top-level commas only."""
     parts: list[str] = []
@@ -790,7 +802,18 @@ def _flow_collection(token: str, source: str, number: int) -> Any:
     if token.startswith("{") and not token.endswith("}"):
         raise Failure(f"{source}:{number}: unbalanced {{ }} in {token!r}")
     if token.startswith("["):
-        return [_scalar(p, source, number) for p in _split_flow(token[1:-1], source, number)]
+        items = _split_flow(token[1:-1], source, number)
+        for item in items:
+            plain = not item.startswith(("[", "{", '"', "'"))
+            special = ("?", "[", "]", "{", "}")
+            if plain and (
+                any(ch in item for ch in special) or item[:1] == ":" or item.endswith(":")
+            ):
+                raise Failure(
+                    f"{source}:{number}: {item!r} means something special inside [ ]; "
+                    f'quote it, as "{item}"'
+                )
+        return [_scalar(item, source, number) for item in items]
     if token.startswith("{"):
         mapping: dict[str, Any] = {}
         for part in _split_flow(token[1:-1], source, number):
@@ -813,6 +836,14 @@ def _plain_scalar(token: str, source: str = "<config>", number: int = 0) -> Any:
         raise Failure(
             f"{source}:{number}: a value cannot start with '-' on its own; quote it, "
             "or put the list on its own lines"
+        )
+    if token.endswith(":"):
+        # PyYAML reads a trailing colon as the start of a mapping and refuses it
+        # where a scalar belongs, so `remote: upstream:` was an error there and
+        # the string "upstream:" here — a remote name that matches nothing.
+        raise Failure(
+            f"{source}:{number}: {token!r} ends in a colon; quote it if the colon "
+            "is part of the value"
         )
     if ": " in token:
         # `enabled: a: b` is a ScannerError in PyYAML and was a string here, so
@@ -1123,7 +1154,7 @@ class Decider:
         with self._lock:
             answer = self._everything
             if answer is None:
-                answer = self._per_kind.get(action.kind)
+                answer = self._per_kind.get(action.consent_key)
             if answer is None:
                 answer = self._prompt(action)
         if not answer:
@@ -1151,10 +1182,10 @@ class Decider:
             if choice == "n":
                 return False
             if choice == "a":
-                self._per_kind[action.kind] = True
+                self._per_kind[action.consent_key] = True
                 return True
             if choice == "s":
-                self._per_kind[action.kind] = False
+                self._per_kind[action.consent_key] = False
                 return False
             if choice == "q":
                 raise Quit()
@@ -1388,6 +1419,22 @@ class Action:
     # Moved to the quarantine rather than deleted, so its bytes are still on
     # disk and must not be counted as reclaimed.
     quarantined: bool = False
+    # The part of `size` that was lifted into the quarantine instead of being
+    # deleted, when only part of a directory was. Without it a node_modules that
+    # gave back 9 KB and moved 98 KB reported 107 KB freed.
+    kept_size: int = 0
+
+    @property
+    def consent_key(self) -> str:
+        """What "all of these" and "skip these" mean, for this action.
+
+        The kind alone is not enough: answering `a` to "quarantine directory
+        because it is cache-creds" then hard-deleted every later artefact
+        without asking, because both were kind "remove". The code already splits
+        stash+switch from switch for exactly this reason, and the summary
+        already counts remove+quarantined separately.
+        """
+        return f"{self.kind}+quarantined" if self.quarantined else self.kind
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -1396,6 +1443,7 @@ class Action:
             "target": self.target,
             "detail": self.detail,
             "size": self.size,
+            "kept_size": self.kept_size,
             "applied": self.applied,
             "skipped": self.skipped,
             "quarantined": self.quarantined,
@@ -1417,17 +1465,19 @@ class Report:
     @property
     def bytes_freed(self) -> int:
         """Bytes actually reclaimed. Quarantined files are still on the disk."""
-        return sum(a.size for a in self.actions if a.applied and not a.quarantined)
+        return sum(a.size - a.kept_size for a in self.actions if a.applied and not a.quarantined)
 
     @property
     def bytes_quarantined(self) -> int:
-        return sum(a.size for a in self.actions if a.applied and a.quarantined)
+        return sum(a.size if a.quarantined else a.kept_size for a in self.actions if a.applied)
 
     @property
     def bytes_found(self) -> int:
         """Bytes a dry run would actually reclaim. Quarantined ones only move."""
         return sum(
-            a.size for a in self.actions if not a.error and not a.skipped and not a.quarantined
+            a.size - a.kept_size
+            for a in self.actions
+            if not a.error and not a.skipped and not a.quarantined
         )
 
     @property
@@ -2018,7 +2068,10 @@ def _would_clobber_ignored(git: Git, branch: str, protect: Sequence[str]) -> str
         ref = branch
     for relative in ignored_paths(git, collapse="never"):
         name = Path(relative).name
-        if not (_protects(name, protect) or any(fnmatch.fnmatch(relative, p) for p in protect)):
+        # _matches, not _protects: `protect` here is clean.ignored_keep on its
+        # own, and a gitignored config/secrets.py is by definition not committed
+        # source — being local and untracked is why the list names it.
+        if not (_matches(name, protect) or any(fnmatch.fnmatch(relative, p) for p in protect)):
             continue
         if git.ok("cat-file", "-e", f"{ref}:{relative}"):
             return relative
@@ -2688,15 +2741,23 @@ def _remove_ignored(
                 is_dir=path.is_dir(),
                 kind="ignored",
                 protect_nested=not regenerable,
-                sensitive=outright_guard(
-                    cfg["trash"]["sensitive"], clean["ignored_keep"], regenerable
-                ),
+                sensitive=(
+                    guard := outright_guard(
+                        cfg["trash"]["sensitive"], clean["ignored_keep"], regenerable
+                    )
+                )[0],
+                local_state=guard[1],
                 holding=holding,
             )
         )
 
 
-def _protected_within(directory: Path, protect: Sequence[str]) -> list[Path] | None:
+def _protected_within(
+    directory: Path,
+    sensitive: Sequence[str],
+    local_state: Sequence[str] = (),
+    base: Path | None = None,
+) -> tuple[list[Path] | None, str]:
     """Every path inside `directory` that must not be deleted outright.
 
     _holds_protected answers "is there one", which is all a refusal needs. This
@@ -2707,26 +2768,54 @@ def _protected_within(directory: Path, protect: Sequence[str]) -> list[Path] | N
     Directories are returned whole and not descended into, so a `credentials/`
     arrives in the quarantine intact.
 
-    None means the directory cannot be emptied out safely and has to stay. Two
-    ways that happens: a subtree nobody can list, and a *symlink* whose name is
+    The second return value is why, when the answer is "it cannot be emptied out
+    safely and has to stay". Two ways that happens, and they are not the same
+    sentence: a subtree nobody can list, and a *symlink* whose name is
     protected. The quarantine refuses to take a symlink pointing outside the
     workspace, as it should — but the refusal surfaced as a raw relative_to()
     message against an action whose target was "-", so the run reported a
     failure that named neither the file nor the directory.
     """
+    root = base or directory
     found: list[Path] = []
     unreadable = _Unreadable()
+
+    def wanted(entry: Path) -> bool:
+        # Against the path as well as the name, as _holds_protected does and its
+        # docstring promises: `build/config/*.pem` protects as surely as `*.pem`.
+        # Testing only the name meant the file that produced a "kept" line was
+        # not among the ones lifted out, and went with the directory.
+        #
+        # Through _protects both times, so the source exemption applies to the
+        # path too — fnmatch's * crosses a /, so `*token*` matches
+        # acorn/dist/tokenizer.js and the exemption would have been lost here.
+        relative = None
+        with contextlib.suppress(ValueError):
+            relative = entry.relative_to(root).as_posix()
+        return _protects(entry.name, sensitive, local_state, relative)
+
     for dirpath, dirnames, filenames in os.walk(directory, followlinks=False, onerror=unreadable):
         here = Path(dirpath)
-        keep = [d for d in dirnames if _protects(d, protect)]
-        for name in (*keep, *(f for f in filenames if _protects(f, protect))):
+        keep = [d for d in dirnames if wanted(here / d)]
+        for name in (*keep, *(f for f in filenames if wanted(here / f))):
             if (here / name).is_symlink():
-                return None
+                return None, "kept: holds a protected symlink"
             found.append(here / name)
         dirnames[:] = [d for d in dirnames if d not in keep and not (here / d).is_symlink()]
     if unreadable.hit:
-        return None
-    return sorted(found)
+        return None, "kept: something in here cannot be read"
+    return sorted(found), ""
+
+
+def _sensitive_within(directory: Path, sensitive: Sequence[str]) -> str | None:
+    """_holds_protected for trash.sensitive, which does exempt source code."""
+    for dirpath, dirnames, filenames in os.walk(directory, followlinks=False):
+        here = Path(dirpath)
+        for entry in (*dirnames, *filenames):
+            if _protects(entry, sensitive):
+                return (here / entry).relative_to(directory).as_posix()
+        dirnames[:] = [d for d in dirnames if not (here / d).is_symlink()]
+    return None
 
 
 def _holds_protected(
@@ -2741,6 +2830,12 @@ def _holds_protected(
     is not the same as having looked and found nothing, and this decides whether
     something is moved or deleted outright.
     """
+    if not protect:
+        # Nothing can match, so nothing in there is protected — including the
+        # part nobody can read. Answering "cannot tell" for an empty list made
+        # the sweep descend into an artefact directory instead of removing it,
+        # and print no line at all about why.
+        return None
     root = base or directory
     unreadable = _Unreadable()
     for dirpath, dirnames, filenames in os.walk(directory, followlinks=False, onerror=unreadable):
@@ -2748,7 +2843,7 @@ def _holds_protected(
         for entry in (*dirnames, *filenames):
             candidate = here / entry
             relative = candidate.relative_to(root).as_posix()
-            if _protects(entry, protect) or any(fnmatch.fnmatch(relative, p) for p in protect):
+            if _matches(entry, protect) or any(fnmatch.fnmatch(relative, p) for p in protect):
                 return candidate.relative_to(directory).as_posix()
         # Pruned only after their names have been considered: a symlink whose
         # own name is protected still protects its parent from removal.
@@ -2844,7 +2939,10 @@ def _walk_and_remove(plan: _Sweep, actions: list[Action]) -> None:
                     plan.quarantine,
                     is_dir=True,
                     protect_nested=(guarded := not _matches(name, plan.clean["regenerable"])),
-                    sensitive=outright_guard(plan.sensitive, plan.local_state, not guarded),
+                    sensitive=(
+                        guard := outright_guard(plan.sensitive, plan.local_state, not guarded)
+                    )[0],
+                    local_state=guard[1],
                     holding=plan.holding,
                 )
             )
@@ -2859,7 +2957,10 @@ def _walk_and_remove(plan: _Sweep, actions: list[Action]) -> None:
                         plan.decider,
                         plan.quarantine,
                         is_dir=False,
-                        sensitive=outright_guard(plan.sensitive, plan.local_state, False),
+                        sensitive=(
+                            guard := outright_guard(plan.sensitive, plan.local_state, False)
+                        )[0],
+                        local_state=guard[1],
                         holding=plan.holding,
                     )
                 )
@@ -2969,13 +3070,27 @@ SOURCE_SUFFIXES = frozenset(
 )
 
 
-def _protects(name: str, patterns: Sequence[str]) -> bool:
+def _protects(
+    name: str,
+    sensitive: Sequence[str],
+    local_state: Sequence[str] = (),
+    relative: str | None = None,
+) -> bool:
     """Whether `name` is something a removal must not take with it.
 
-    The same globs as _matches, minus anything with a source-code extension:
-    those are what the file is, not what it holds.
+    Two lists, because the source-code exemption belongs to exactly one of them.
+    trash.sensitive casts a wide net — *token*, *creds*, *password* — so a
+    tokenizer.js matches it and is plainly not a secret. clean.ignored_keep is
+    the opposite: every entry is there because the user said "this file is local
+    and is not in git", and `.env.sh` or `secrets.py` is the whole point of it.
+    Exempting source from that list deleted exactly the files it names.
     """
-    return Path(name).suffix.lower() not in SOURCE_SUFFIXES and _matches(name, patterns)
+    names = (name,) if relative is None else (name, relative)
+    if Path(name).suffix.lower() not in SOURCE_SUFFIXES and any(
+        _matches(one, sensitive) for one in names
+    ):
+        return True
+    return any(_matches(one, local_state) for one in names)
 
 
 def _protected(path: Path, root: Path, keep: Sequence[str], tracked: set[str]) -> bool:
@@ -2991,19 +3106,21 @@ def _protected(path: Path, root: Path, keep: Sequence[str], tracked: set[str]) -
 
 def _what_to_keep(
     path: Path,
+    root: Path,
     is_dir: bool,
     quarantine: Quarantine | None,
     holding: Quarantine | None,
     sensitive: Sequence[str],
-) -> tuple[Quarantine | None, list[Path], str] | None:
+    local_state: Sequence[str] = (),
+) -> tuple[Quarantine | None, list[Path], str] | str:
     """Where this path goes, what has to be lifted out of it first, and why.
 
-    None means it cannot be emptied out safely and has to stay whole — see
-    _protected_within.
+    A plain string instead means it cannot be emptied out safely and has to stay
+    whole, and is the reason to report — see _protected_within.
     """
-    if quarantine is not None or holding is None or not sensitive:
+    if quarantine is not None or holding is None or not (sensitive or local_state):
         return quarantine, [], ""
-    if _protects(path.name, sensitive):
+    if _protects(path.name, sensitive, local_state):
         # The name first, and for a directory as much as for a file: a directory
         # called credentials/ or tokens/ *is* the thing being protected, so it
         # goes whole rather than being emptied out. _protected_within walks the
@@ -3013,9 +3130,9 @@ def _what_to_keep(
         return holding, [], f" because it is {path.name}"
     if not is_dir:
         return quarantine, [], ""
-    rescue = _protected_within(path, sensitive)
+    rescue, why = _protected_within(path, sensitive, local_state, base=root)
     if rescue is None:
-        return None
+        return why
     if not rescue:
         return quarantine, [], ""
     # Not the whole directory. Moving a 3.8 MB node_modules aside because one
@@ -3038,6 +3155,7 @@ def _remove(
     kind: str = "remove",
     protect_nested: bool = True,
     sensitive: Sequence[str] = (),
+    local_state: Sequence[str] = (),
     holding: Quarantine | None = None,
 ) -> Action:
     relative = path.relative_to(root).as_posix()
@@ -3050,16 +3168,21 @@ def _remove(
         size = 0
     action = Action(kind, scope, relative, f"remove {'directory' if is_dir else 'file'}", size=size)
     action.quarantined = quarantine is not None
-    plan = _what_to_keep(path, is_dir, quarantine, holding, sensitive)
-    if plan is None:
-        # Cannot be emptied out safely, so it stays whole. _measure has already
-        # said so for the unreadable case; this is the protected symlink.
-        action.detail = "kept: holds a protected symlink"
+    plan = _what_to_keep(path, root, is_dir, quarantine, holding, sensitive, local_state)
+    if isinstance(plan, str):
+        # Cannot be emptied out safely, so it stays whole, and plan says which
+        # of the two reasons it is. Reporting one as the other is how a
+        # .terraform with an unreadable subdirectory and no symlink anywhere
+        # came to be "kept: holds a protected symlink".
+        action.detail = plan
         action.skipped = True
         action.size = 0
         return action
     quarantine, rescue, because = plan
     action.quarantined = quarantine is not None
+    action.kept_size = sum(
+        _measure(one)[0] if one.is_dir() else one.stat().st_size for one in rescue
+    )
     # Said before the decision, so a dry run names the outcome it is predicting.
     action.detail = (
         f"{'quarantine' if action.quarantined else 'remove'} "
@@ -3700,7 +3823,7 @@ def _credential_check(
     outright, whatever the quarantine setting says — and a directory holding one
     counts, since deleting it takes the credential with it.
     """
-    buried = _holds_protected(path, trash["sensitive"]) if path.is_dir() else None
+    buried = _sensitive_within(path, trash["sensitive"]) if path.is_dir() else None
     if buried is None:
         return sensitive, why
     return True, f"{why}, contains {buried}"
@@ -4095,7 +4218,7 @@ def summarise(report: Report, mode: str, printer: Printer, forced: bool = False)
         if action.applied or (mode == DRY and not action.skipped and not action.error):
             # A quarantined path was moved, not removed, and the disk line below
             # says exactly that in bytes. Counting it as removed contradicted it.
-            key = f"{action.kind}+quarantined" if action.quarantined else action.kind
+            key = action.consent_key
             done[key] = done.get(key, 0) + 1
 
     printer.heading("Summary")
@@ -4430,7 +4553,7 @@ def cmd_clean(context: Context, report: Report) -> None:
 
 def outright_guard(
     sensitive: Sequence[str], local_state: Sequence[str], regenerable: bool
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
     """The patterns that turn a deletion into a move, for one particular path.
 
     Split because the two halves answer different questions. trash.sensitive is
@@ -4443,7 +4566,7 @@ def outright_guard(
     every cache into a rename into .git-tidy-trash/ in the same workspace —
     which reclaims nothing, while the README opens by promising 40 GB back.
     """
-    return list(sensitive) if regenerable else [*sensitive, *local_state]
+    return list(sensitive), [] if regenerable else list(local_state)
 
 
 def _clean_repo(
@@ -4462,10 +4585,19 @@ def _clean_repo(
     if cfg["clean"]["ignored"]:
         ignored = clean_ignored(repo, name, cfg, context.decider, holding, git, context.quarantine)
         actions += ignored
-        # Only the ones that went: a path clean.ignored *kept* is still fair game
-        # for clean.dirs, and putting it here made turning clean.ignored on make
-        # the tool clean less.
-        already = {a.target for a in ignored if not a.skipped}
+        # The ones that went, and the ones held back because of what is *inside*
+        # them. Those two are settled; anything else clean.ignored merely
+        # declined to match — "build output, clean.builds is off" — is still
+        # fair game for clean.dirs, and putting those here made turning
+        # clean.ignored on make the tool clean less.
+        #
+        # "kept: contains …" is a decision about that path. Letting clean.dirs
+        # take it anyway meant a run that printed "kept: contains
+        # config/prod.json", counted it under "held back", and destroyed it on
+        # the next line.
+        already = {
+            a.target for a in ignored if not a.skipped or a.detail.startswith("kept: contains ")
+        }
     actions += clean_tree(
         repo,
         name,
@@ -4509,9 +4641,12 @@ def _outside_repos(
             quarantine if here_cfg["quarantine"] else None,
             is_dir,
             protect_nested=(guarded := not _matches(path.name, here_cfg["regenerable"])),
-            sensitive=outright_guard(
-                here_cfg["sensitive_names"], here_cfg["ignored_keep"], not guarded
-            ),
+            sensitive=(
+                guard := outright_guard(
+                    here_cfg["sensitive_names"], here_cfg["ignored_keep"], not guarded
+                )
+            )[0],
+            local_state=guard[1],
             holding=quarantine,
         )
 
