@@ -80,8 +80,16 @@ jobs:
           uv run --python "${PYTHON_VERSION}" --with nuitka --with patchelf \
             python -m nuitka \
             --standalone --remove-output --assume-yes-for-downloads \
+            --nofollow-import-to=yaml \
             --output-filename=git-tidy --output-dir=dist git_tidy.py
           ./dist/git_tidy.dist/git-tidy --version
+          # PyYAML is optional and gets bundled if it happens to be in the build
+          # environment — which it is, via the dev dependency group. That made
+          # the config parser the binary uses depend on how the binary was
+          # built. Excluded, so every shipped binary reads a config exactly the
+          # same way, using the parser this project maintains and tests.
+          ! grep -qr "yaml" dist/git_tidy.dist/ --include="*.py" 2>/dev/null
+          test ! -e dist/git_tidy.dist/yaml
       - name: package
         run: |
           cp man/git-tidy.1 dist/git_tidy.dist/
@@ -107,8 +115,16 @@ jobs:
         run: |
           uv run --python "${PYTHON_VERSION}" --with nuitka python -m nuitka \
             --standalone --remove-output --assume-yes-for-downloads \
+            --nofollow-import-to=yaml \
             --output-filename=git-tidy --output-dir=dist git_tidy.py
           ./dist/git_tidy.dist/git-tidy --version
+          # PyYAML is optional and gets bundled if it happens to be in the build
+          # environment — which it is, via the dev dependency group. That made
+          # the config parser the binary uses depend on how the binary was
+          # built. Excluded, so every shipped binary reads a config exactly the
+          # same way, using the parser this project maintains and tests.
+          ! grep -qr "yaml" dist/git_tidy.dist/ --include="*.py" 2>/dev/null
+          test ! -e dist/git_tidy.dist/yaml
       - name: package
         run: |
           cp man/git-tidy.1 dist/git_tidy.dist/
