@@ -49,10 +49,20 @@ Still a dry run until \fB\-\-apply\fR.
 .IP
 A detached HEAD is only moved when its commit is already contained in the trunk;
 otherwise that HEAD is the work, and switching away would leave it reachable
-from the reflog alone. Not moved either with uncommitted changes, or when the
-trunk is checked out in another worktree. Unpushed commits and local-only
+from the reflog alone. Nor with uncommitted changes, nor when a merge, rebase,
+cherry-pick or bisect is in progress, nor when the trunk is checked out in
+another worktree, nor in a linked worktree, nor when the trunk tracks a file
+that is gitignored here and would be replaced. Unpushed commits and local-only
 branches are never touched: only you know whether they should be pushed or
 dropped.
+.IP
+Credentials are read straight out of
+.IR .git/config ,
+not through
+.BR "git remote get-url" ,
+which expands \fIinsteadOf\fR \(em a token in
+.I ~/.gitconfig
+is not this repository's. \fIpushurl\fR and additional \fIurl\fR values count.
 .TP
 .B run
 sync, prune, clean, trash and doctor, in that order. A

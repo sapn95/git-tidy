@@ -61,6 +61,15 @@ def git(path: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
+# Permission bits mean nothing to root, and CI runs the tests in a container as
+# root. Skipping is honest: the behaviour these cover is real and is verified on
+# any ordinary machine, and pretending otherwise would need a fake filesystem
+# that proves nothing about the real one.
+needs_permissions = pytest.mark.skipif(
+    os.geteuid() == 0, reason="root ignores permission bits, so nothing is unreadable"
+)
+
+
 def commit(path: Path, name: str, text: str = "x") -> None:
     (path / name).write_text(text, encoding="utf-8")
     git(path, "add", "-A")
@@ -4674,6 +4683,7 @@ def test_dry_run_init_prints_even_on_a_terminal(tmp_path: Path, capsys, monkeypa
     assert "git-tidy configuration" in capsys.readouterr().out
 
 
+@needs_permissions
 def test_init_reports_a_target_it_cannot_write(tmp_path: Path):
     locked = tmp_path / "locked"
     locked.mkdir()
@@ -4822,6 +4832,7 @@ def test_a_bisect_in_progress_survives_sync(workspace: Path):
     assert (repo / ".git" / "BISECT_LOG").exists()
 
 
+@needs_permissions
 def test_an_unreadable_subtree_does_not_read_as_an_empty_one(workspace: Path):
     """os.walk swallows PermissionError, so the guards answered "nothing here"."""
     repo = workspace / "repo"
@@ -4915,6 +4926,7 @@ def test_expire_refuses_a_stamp_that_is_not_there(tmp_path: Path):
         expire_now(root, only="NOPE")
 
 
+@needs_permissions
 def test_a_repository_probe_answers_yes_when_it_cannot_tell(tmp_path: Path):
     """Path.is_dir() raises before 3.12 and returns False from 3.12 on.
 
@@ -5019,6 +5031,7 @@ def test_clean_ignored_does_not_keep_and_remove_the_same_path(workspace: Path, c
     assert not (repo / ".terraform").exists()
 
 
+@needs_permissions
 def test_an_unreadable_subtree_is_not_called_a_git_repository(workspace: Path, capsys):
     """It said "contains a git repository" for a tree with no git anywhere in it."""
     loose = workspace / "project.old"
@@ -5355,6 +5368,7 @@ def test_bytes_left_in_place_are_not_called_freed(workspace: Path, capsys):
     assert (cache / "id_rsa").stat().st_size == 50_000
 
 
+@needs_permissions
 def test_an_unreadable_subtree_is_not_reported_as_a_symlink(workspace: Path, capsys):
     """Round ten fixed this wording in _measure; the rescue reintroduced it."""
     repo = workspace / "repo"
@@ -5398,6 +5412,7 @@ def test_saying_all_to_a_quarantine_does_not_consent_to_deletes(workspace: Path)
     assert (repo / "cache-plain").exists(), "never consented to, so never deleted"
 
 
+@needs_permissions
 def test_an_artefact_directory_with_an_unreadable_subtree_is_reported(workspace: Path, capsys):
     """It was descended into instead of removed, and no line was printed."""
     repo = workspace / "repo"
@@ -5699,6 +5714,7 @@ def test_thinning_does_not_follow_a_symlink_out_of_the_tree(tmp_path: Path):
     assert not (root / "junk.bin").exists()
 
 
+@needs_permissions
 def test_thinning_reports_what_it_could_not_remove(tmp_path: Path):
     """A read-only parent stops one unlink; the rest still goes and nothing lies."""
     root = tmp_path / "tree"
@@ -6031,6 +6047,7 @@ def test_a_partly_finished_run_does_not_claim_nothing_changed(tmp_path: Path, ca
     assert "already been fetched" in out
 
 
+@needs_permissions
 def test_a_thin_out_that_could_not_finish_says_so(workspace: Path, capsys):
     """It reported "emptied out" and the full size freed, with 97 KB still there."""
     repo = workspace / "repo"
@@ -6175,3 +6192,155 @@ def test_run_takes_fix_too(workspace: Path):
 
     assert gt.main(["-C", str(workspace), "run", "--fix", "--apply"]) == 0
     assert git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip() == "main"
+
+
+# --------------------------------------------------------------------------- #
+# Claude review, round fourteen — doctor --fix, an hour after it shipped
+# --------------------------------------------------------------------------- #
+
+
+def test_fix_does_not_replace_an_ignored_local_file(workspace: Path, remote: Path):
+    """is_dirty ignores ignored files, so a local .env was invisible to it.
+
+    In one `run --fix --apply` the tool printed sync's refusal, did the thing it
+    had refused, and then summarised it as held back.
+    """
+    repo = workspace / "repo"
+    (repo / ".gitignore").write_text(".env\n", encoding="utf-8")
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-q", "-m", "ignore .env")
+    git(repo, "add", "-f", ".env") if False else None
+    (repo / ".env").write_text("PLACEHOLDER", encoding="utf-8")
+    git(repo, "add", "-f", ".env")
+    git(repo, "commit", "-q", "-m", "track a template")
+    git(repo, "push", "-q", "origin", "main")
+    git(repo, "switch", "-q", "--detach", "HEAD~1")
+    (repo / ".env").write_text("SECRET_TOKEN=real", encoding="utf-8")
+
+    gt.main(["-C", str(workspace), "doctor", "--fix", "--apply"])
+    assert (repo / ".env").read_text(encoding="utf-8") == "SECRET_TOKEN=real"
+    assert git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip() == "HEAD"
+
+
+def test_fix_leaves_a_bisect_alone(workspace: Path):
+    """The BISECT_* files survive a switch, so the next `good` marks the trunk."""
+    repo = workspace / "repo"
+    for number in range(5):
+        commit(repo, f"c{number}.txt")
+    git(repo, "push", "-q", "origin", "main")
+    oldest = git(repo, "rev-parse", "HEAD~4").strip()
+    git(repo, "bisect", "start")
+    git(repo, "bisect", "bad")
+    git(repo, "bisect", "good", oldest)
+
+    gt.main(["-C", str(workspace), "doctor", "--fix", "--apply"])
+    assert git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip() == "HEAD"
+    assert (repo / ".git" / "BISECT_LOG").exists()
+
+
+def test_fix_leaves_a_linked_worktree_on_its_own_head(workspace: Path):
+    """Holding its own HEAD is the entire reason a linked worktree exists."""
+    repo = workspace / "repo"
+    commit(repo, "second.txt")
+    linked = workspace / "wt"
+    git(repo, "worktree", "add", "--detach", "-q", str(linked), "HEAD~1")
+
+    gt.main(["-C", str(workspace), "doctor", "--fix", "--apply"])
+    assert git(linked, "rev-parse", "--abbrev-ref", "HEAD").strip() == "HEAD"
+
+
+def test_a_quit_keeps_the_fixes_already_made(workspace: Path):
+    """ "everything already done is kept" has to be true of doctor too."""
+    repo = workspace / "repo"
+    git(repo, "switch", "-q", "--detach", "HEAD")
+    git(repo, "remote", "set-url", "origin", "https://a:tok@example.invalid/r.git")
+    answers = iter(["y", "q"])
+
+    decider = gt.Decider(gt.ASK, prompt_input=lambda _: next(answers))
+    try:
+        gt.doctor_repo(repo, "repo", config(), decider)
+    except gt.Quit as quit_now:
+        assert any(a.applied for a in quit_now.done), quit_now.done
+    else:  # pragma: no cover - the second answer is q
+        pytest.fail("q should raise Quit")
+
+
+def test_each_remedy_asks_for_its_own_consent(workspace: Path):
+    """One `a` to a HEAD switch used to rewrite remote URLs workspace-wide."""
+    kinds = {"switch back", "strip credential", "pack"}
+    seen = {gt.Action(kind, "repo", "target", "detail").consent_key for kind in kinds}
+    assert len(seen) == len(kinds), seen
+
+
+def test_a_credential_from_insteadof_is_not_this_repositorys(workspace: Path, tmp_path: Path):
+    """`git remote get-url` expands insteadOf; .git/config was already clean."""
+    repo = workspace / "repo"
+    git(repo, "remote", "set-url", "origin", "https://example.invalid/org/r.git")
+    git(
+        repo,
+        "config",
+        "url.https://u:s3cr3t@example.invalid/.insteadOf",
+        "https://example.invalid/",
+    )
+
+    actions = gt.doctor_repo(repo, "repo", config())
+    assert not [a for a in actions if "credential" in a.detail], actions
+
+
+def test_a_credential_in_a_pushurl_is_found(workspace: Path):
+    """get-url returns the first fetch URL only, so this sat there unmentioned."""
+    repo = workspace / "repo"
+    git(repo, "config", "remote.origin.pushurl", "https://a:pushtok@example.invalid/r.git")
+
+    actions = gt.doctor_repo(repo, "repo", config())
+    assert [a for a in actions if "credential" in a.detail], actions
+
+    gt.main(["-C", str(workspace), "doctor", "--fix", "--apply"])
+    assert git(repo, "config", "--get", "remote.origin.pushurl").strip() == (
+        "https://example.invalid/r.git"
+    )
+
+
+@pytest.mark.parametrize(
+    ("url", "credential"),
+    [
+        ("https://a:tok@host/r.git", True),
+        ("https://ghp_abc123@github.com/o/r.git", True),
+        ("https://:tok@host/r.git", True),
+        ("HTTPS://ghp_x@host/r.git", True),
+        ("ssh://u:p@host/r.git", True),
+        ("ssh://git@host/r.git", False),
+        ("ssh://git@host:7999/x.git", False),
+        ("git@host:o/r.git", False),
+        ("https://host/r.git", False),
+    ],
+)
+def test_what_counts_as_a_credential_in_a_url(url: str, credential: bool):
+    """A bare token@ is a PAT over https and an ordinary username over ssh."""
+    assert bool(gt.CREDENTIAL_IN_URL.match(url)) is credential
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "jobs: 4  # workers\there\n",
+        "# a\tcomment\njobs: 4\n",
+        'clean:\n  keep:\n    - "a\tb"\n',
+        "jobs: 4\n",
+        "a: b   \n",
+    ],
+)
+def test_a_tab_where_yaml_allows_one_is_allowed(text: str):
+    """The check scanned the raw line, so a tab in a comment killed the config.
+
+    `git-tidy init` writes a comment-heavy file that people then edit, and it
+    loaded from a checkout while refusing on every shipped binary.
+    """
+    yaml = pytest.importorskip("yaml")
+    assert gt._parse_yaml_subset(text, "<t>") == yaml.safe_load(text)
+
+
+@pytest.mark.parametrize("text", ["jobs: 4\t\n", "a: b\x0c\n", "a: 4\x0cclean:\n  ignored: true\n"])
+def test_a_tab_where_yaml_forbids_one_is_refused(text: str):
+    with pytest.raises(gt.Failure):
+        gt._parse_yaml_subset(text, "<t>")

@@ -69,7 +69,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NoReturn
 
-__version__ = "3.0.0"
+__version__ = "3.0.1"
 
 CONFIG_NAMES = (".git-tidy.yaml", ".git-tidy.yml")
 QUARANTINE_DIRNAME = ".git-tidy-trash"
@@ -85,8 +85,15 @@ JOURNAL_NAME = "journal.jsonl"
 # A URL with a password or token in it, e.g. https://user:token@host/repo.git.
 # Bitbucket and GitLab hand these out from their web UI, and a clone made that way
 # leaves the secret sitting in .git/config in plain text.
+# Two shapes. Any scheme with `user:secret@` is a credential. A *bare* `token@`
+# is one only over http and https, which is how every GitHub and GitLab personal
+# access token is pasted — over ssh a bare username is `ssh://git@host`, which is
+# how everyone's SSH remote looks and is not a secret at all.
+# Case-insensitive, because HTTPS:// is a URL too.
 CREDENTIAL_IN_URL = re.compile(
-    r"^(?P<scheme>[a-z][a-z0-9+.-]*)://(?P<user>[^/@:]+):(?P<secret>[^/@]+)@"
+    r"^(?:(?P<scheme>[a-z][a-z0-9+.-]*)://(?P<user>[^/@:]*):(?P<secret>[^/@]*)@"
+    r"|(?P<webscheme>https?)://(?P<token>[^/@:]+)@)",
+    re.IGNORECASE,
 )
 
 # Vowel-free stretches and short repeated units are what a hand mashed on a
@@ -463,7 +470,23 @@ def _strip_comment(line: str) -> str:
         if ch == "#" and (i == 0 or line[i - 1] in " \t"):
             break
         out.append(ch)
-    return "".join(out).rstrip()
+    return "".join(out)
+
+
+def _outside_quotes(text: str) -> str:
+    """The parts of a line that are not inside a quoted scalar."""
+    out: list[str] = []
+    quote: str | None = None
+    for char in text:
+        if quote:
+            if char == quote:
+                quote = None
+            continue
+        if char in "\"'":
+            quote = char
+            continue
+        out.append(char)
+    return "".join(out)
 
 
 def _refuse_control_characters(text: str, source: str, number: int) -> None:
@@ -474,7 +497,7 @@ def _refuse_control_characters(text: str, source: str, number: int) -> None:
     "works from a checkout, fails on every shipped build" shape in the other
     direction. NUL and the other C0 controls are the same.
     """
-    for char in text:
+    for char in _outside_quotes(text):
         if char == "\t":
             raise Failure(f"{source}:{number}: a tab on this line; YAML wants spaces")
         if ord(char) < 0x20 and char not in "\n\r":
@@ -486,13 +509,21 @@ def _tokenize(text: str, source: str) -> list[_Line]:
     # key becomes "\ufeffjobs" and the whole config is refused — but only where
     # PyYAML is absent, which is every shipped binary.
     text = text.lstrip("\ufeff")
+    # split("\n"), not splitlines(): the latter also breaks on \x0b, \x0c and
+    # \x1c-\x1e, so `a: 4\x0cclean:` became two keys here and a hard error
+    # under PyYAML — the same file meaning two different things again.
     lines: list[_Line] = []
     ended = False
-    for number, raw in enumerate(text.splitlines(), start=1):
+    for number, raw in enumerate(text.replace("\r\n", "\n").split("\n"), start=1):
         if "\t" in raw[: len(raw) - len(raw.lstrip())]:
             raise Failure(f"{source}:{number}: tabs cannot be used for YAML indentation")
-        _refuse_control_characters(raw, source, number)
         content = _strip_comment(raw)
+        # After the comment is gone, and before the trailing whitespace is: a
+        # tab in `jobs: 4  # workers\t(one per core)` is fine to PyYAML and used
+        # to refuse the whole config on every shipped binary, while a tab *after*
+        # the value is a ScannerError there and used to be stripped away here.
+        _refuse_control_characters(content, source, number)
+        content = content.rstrip()
         if not content.strip():
             continue
         if content.strip() == "...":
@@ -4201,7 +4232,8 @@ def without_credential(url: str) -> str | None:
     match = CREDENTIAL_IN_URL.match(url)
     if not match:
         return None
-    return f"{match.group('scheme')}://" + url[match.end() :]
+    scheme = match.group("scheme") or match.group("webscheme")
+    return f"{scheme}://" + url[match.end() :]
 
 
 def redact(url: str) -> str:
@@ -4209,7 +4241,10 @@ def redact(url: str) -> str:
     match = CREDENTIAL_IN_URL.match(url)
     if not match:
         return url
-    return f"{match.group('scheme')}://{match.group('user')}:***@" + url[match.end() :]
+    scheme = match.group("scheme") or match.group("webscheme")
+    who = match.group("user") if match.group("scheme") else match.group("token")
+    hidden = f"{who}:***" if match.group("scheme") else "***"
+    return f"{scheme}://{hidden}@" + url[match.end() :]
 
 
 def doctor_repo(
@@ -4229,6 +4264,22 @@ def doctor_repo(
     checks = cfg["doctor"]
     git = Git(path, timeout=int(cfg["sync"]["timeout"]))
     actions: list[Action] = []
+    # doctor is the only other step that writes now, and every step that
+    # accumulates needs this: answering 'q' half way through made the report
+    # claim less had happened than had, while the HEAD really had moved.
+    with keeping(actions):
+        _doctor_checks(git, name, cfg, checks, fix, actions)
+    return actions
+
+
+def _doctor_checks(
+    git: Git,
+    name: str,
+    cfg: dict[str, Any],
+    checks: dict[str, Any],
+    fix: Decider | None,
+    actions: list[Action],
+) -> None:
 
     # Neither of these needs a remote, and a repository without one is where
     # they matter most: nothing in it is pushed anywhere, and sync leaves it
@@ -4264,29 +4315,12 @@ def _detached(git: Git, name: str, cfg: dict[str, Any], fix: Decider | None) -> 
     if fix is None:
         return Action("doctor", name, "HEAD", detail, skipped=True)
 
+    refused = _cannot_leave_a_detached_head(git, name, cfg, detail)
+    if refused is not None:
+        return refused
     trunk = default_branch(git, cfg["sync"], readonly=True)
-    if trunk is None:
-        return Action(
-            "doctor", name, "HEAD", f"{detail}, and no branch to go back to", skipped=True
-        )
-    if is_dirty(git):
-        return Action("doctor", name, "HEAD", f"{detail}, with uncommitted changes", skipped=True)
-    head = f"refs/heads/{trunk}"
-    if not git.ok("merge-base", "--is-ancestor", "HEAD", head):
-        return Action(
-            "doctor", name, "HEAD", f"{detail}, and those commits are not in {trunk}", skipped=True
-        )
-    elsewhere = _checked_out_elsewhere(git, trunk)
-    if elsewhere is not None:
-        return Action(
-            "doctor",
-            name,
-            "HEAD",
-            f"{detail}, and {trunk} is in use by the worktree {elsewhere}",
-            skipped=True,
-        )
 
-    action = Action("fix", name, "HEAD", f"switch back to {trunk} from a detached {commit}")
+    action = Action("switch back", name, "HEAD", f"switch back to {trunk} from a detached {commit}")
     if not fix.allow(action):
         return action
     result = git.run("switch", trunk, check=False)
@@ -4298,25 +4332,98 @@ def _detached(git: Git, name: str, cfg: dict[str, Any], fix: Decider | None) -> 
     return action
 
 
+def _cannot_leave_a_detached_head(
+    git: Git, name: str, cfg: dict[str, Any], detail: str
+) -> Action | None:
+    """Every reason not to move this HEAD, checked before anything is written.
+
+    All four of these are gates _switch, _fast_forward and _diverged have had
+    for several rounds each. --fix went round the outside of them, which is what
+    happens when a fourth thing learns to move a HEAD and does not reuse the
+    list of reasons not to.
+    """
+
+    def no(why: str) -> Action:
+        return Action("doctor", name, "HEAD", f"{detail}, {why}", skipped=True)
+
+    busy = _operation_in_progress(git)
+    if busy:
+        # A clean tree mid-bisect is the case _cannot_switch names in its own
+        # comment: switching resets HEAD, the BISECT_* files survive, and the
+        # next `git bisect good` marks the trunk tip. Nothing warns you.
+        return no(f"and {busy} is in progress")
+    if cfg["sync"]["worktrees"] == "skip" and is_linked_worktree(git):
+        # Holding its own HEAD is the entire reason a linked worktree exists,
+        # and sync.worktrees says so. --fix was overriding that setting in
+        # silence, leaving the worktree holding the trunk the main checkout
+        # then could never be switched onto.
+        return no("and it is a linked worktree, which sync.worktrees keeps out of this")
+    trunk = default_branch(git, cfg["sync"], readonly=True)
+    if trunk is None:
+        return no("and no branch to go back to")
+    if is_dirty(git):
+        return no("with uncommitted changes")
+    head = f"refs/heads/{trunk}"
+    if not git.ok("show-ref", "--verify", "--quiet", head):
+        # The trunk exists only on the remote, which is what a fresh clone whose
+        # local main was deleted looks like. _switch creates and tracks it;
+        # saying "those commits are not in main" was simply untrue.
+        return no(f"and there is no local {trunk} to go back to")
+    if not git.ok("merge-base", "--is-ancestor", "HEAD", head):
+        holding = _commits_on_no_branch(git)
+        where = "are on no branch" if holding else f"are not in {trunk}"
+        return no(f"and those commits {where}")
+    if _would_clobber_ignored(git, trunk, cfg["clean"]["ignored_keep"]) is not None:
+        # The hole this whole function was written after: is_dirty deliberately
+        # ignores ignored files, so a local .env is invisible to it, and
+        # `git switch` replaces one the target branch tracks without a word. In
+        # one run --fix --apply the tool printed sync's refusal, did the thing
+        # it had refused, and summarised it as held back.
+        clobbered = _would_clobber_ignored(git, trunk, cfg["clean"]["ignored_keep"])
+        return no(f"and {trunk} tracks {clobbered}, which is ignored here and would be replaced")
+    elsewhere = _checked_out_elsewhere(git, trunk)
+    if elsewhere is not None:
+        return no(f"and {trunk} is in use by the worktree {elsewhere}")
+    return None
+
+
 def _check_credentials(
     git: Git, name: str, remotes: Sequence[str], fix: Decider | None = None
 ) -> list[Action]:
     """A token in a remote URL is a secret sitting in plain text in .git/config."""
     found: list[Action] = []
     for remote in remotes:
-        url = git.out("remote", "get-url", remote, check=False)
-        if not CREDENTIAL_IN_URL.match(url):
-            continue
-        detail = f"credential in the remote URL — {redact(url)}"
-        if fix is None:
-            found.append(Action("doctor", name, remote, detail, skipped=True))
-            continue
-        found.append(_strip_credential(git, name, remote, url, detail, fix))
+        for setting, url in _configured_urls(git, remote):
+            if not CREDENTIAL_IN_URL.match(url):
+                continue
+            detail = f"credential in the remote URL — {redact(url)}"
+            if fix is None:
+                found.append(Action("doctor", name, remote, detail, skipped=True))
+                continue
+            found.append(_strip_credential(git, name, remote, setting, url, detail, fix))
+    return found
+
+
+def _configured_urls(git: Git, remote: str) -> list[tuple[str, str]]:
+    """Every URL actually written in .git/config for this remote.
+
+    `git remote get-url` expands url.<base>.insteadOf, so a credential living in
+    somebody's ~/.gitconfig was reported as a credential in *this* repository's
+    config and then "fixed" by writing the already-clean value back — the same
+    finding, every run, for ever. It also returns only the first fetch URL, so a
+    pushurl and any second url= were never looked at: two secrets sitting in
+    plaintext exactly where doctor promises to look.
+    """
+    found: list[tuple[str, str]] = []
+    for setting in (f"remote.{remote}.url", f"remote.{remote}.pushurl"):
+        for url in git.out("config", "--get-all", setting, check=False).splitlines():
+            if url.strip():
+                found.append((setting, url.strip()))
     return found
 
 
 def _strip_credential(
-    git: Git, name: str, remote: str, url: str, detail: str, fix: Decider
+    git: Git, name: str, remote: str, setting: str, url: str, detail: str, fix: Decider
 ) -> Action:
     """Rewrite the remote without the credential in it.
 
@@ -4324,19 +4431,24 @@ def _strip_credential(
     before and after, and git's credential helper or the SSH agent is what
     should have been holding it anyway. It does not touch a single commit.
     """
-    action = Action("fix", name, remote, f"take the credential out of the {remote} URL")
+    action = Action(
+        "strip credential", name, remote, f"take the credential out of the {remote} URL"
+    )
     if not fix.allow(action):
         return action
     stripped = without_credential(url)
     if stripped is None or stripped == url:  # pragma: no cover - it matched to get here
         action.error = "could not work out the URL without the credential"
         return action
-    result = git.run("remote", "set-url", remote, stripped, check=False)
+    # The exact setting, replaced in place: `remote set-url` rewrites the first
+    # fetch URL whatever was asked for, which is the wrong one for a pushurl or
+    # a second url=.
+    result = git.run("config", "--replace-all", setting, stripped, url, check=False)
     if result.returncode != 0:
         action.error = last_line(result)
         return action
     action.applied = True
-    action.detail = f"credential taken out of the {remote} URL, now {stripped}"
+    action.detail = f"credential taken out of {setting}, now {stripped}"
     return action
 
 
@@ -4418,12 +4530,13 @@ def _check_git_size(git: Git, name: str, limit_mb: int, fix: Decider | None = No
         return []
     if fix is None:
         return [Action("doctor", name, ".git", f"{megabytes} MB — consider git gc", skipped=True)]
-    action = Action("fix", name, ".git", f"pack .git with git gc, {megabytes} MB")
+    action = Action("pack", name, ".git", f"pack .git with git gc, {megabytes} MB")
     if not fix.allow(action):
         return [action]
-    # --prune=now only drops what is already unreachable, and never a reflog
-    # entry younger than gc.reflogExpire, which is how an accidental reset stays
-    # recoverable. Deliberately not --aggressive: minutes per repository.
+    # Plain gc, so gc.pruneExpire applies: nothing unreachable goes until it is
+    # two weeks old, and no reflog entry younger than gc.reflogExpire goes at
+    # all, which is how an accidental reset stays recoverable. Deliberately not
+    # --aggressive, which costs minutes per repository and gains little.
     result = git.run("gc", "--quiet", check=False)
     if result.returncode != 0:
         action.error = last_line(result)
@@ -4570,7 +4683,9 @@ class Printer:
 # How each kind of action reads in the summary, in the order it is listed.
 DID: tuple[tuple[str, str, str], ...] = (
     # kind, what happened, what would happen
-    ("fix", "repositories put right", "repositories to put right"),
+    ("switch back", "detached HEADs put back on the trunk", "detached HEADs to put back"),
+    ("strip credential", "credentials taken out of remote URLs", "credentials to take out"),
+    ("pack", "repositories packed", "repositories to pack"),
     ("fetch", "repositories fetched", "repositories to fetch"),
     ("switch", "branches switched", "branches to switch"),
     ("update", "repositories fast-forwarded", "repositories to fast-forward"),
@@ -4703,8 +4818,11 @@ REASONS: tuple[tuple[str, str], ...] = (
     ("a dependency tree", "dependency trees — clean.dependencies is off"),
     ("build output", "build output — clean.builds is off"),
     ("orphaned worktree", "orphaned worktrees — the parent pruned them away"),
-    ("are not in", "detached HEADs holding commits that are on no branch"),
+    ("are on no branch", "detached HEADs holding commits that are on no branch"),
+    ("are not in", "detached HEADs ahead of the trunk"),
     ("no branch to go back to", "detached HEADs with no branch to return to"),
+    ("no local", "detached HEADs whose trunk is only on the remote"),
+    ("linked worktree, which sync.worktrees", "linked worktrees, which sync.worktrees skips"),
     ("nothing in the quarantine", "nothing left to restore"),
     ("cannot be read", "directories with something in them nobody can read"),
     ("protected symlink", "directories holding a symlink named like a credential"),
