@@ -5245,9 +5245,15 @@ def _restore_command(
     return 1 if report.errors or interrupted else 0
 
 
-def entrypoint() -> NoReturn:
+def entrypoint(argv: Sequence[str] | None = None) -> NoReturn:
+    """The console script: main(), plus the mapping from Failure to exit 2.
+
+    `argv` exists so that mapping can be tested. The man page states the
+    contract — 0 on success, 1 if anything failed, 2 on a usage or
+    configuration error — and scripts branch on it.
+    """
     try:
-        sys.exit(main())
+        sys.exit(main(argv))
     except Failure as exc:
         print(f"git-tidy: {exc}", file=sys.stderr)
         sys.exit(2)
