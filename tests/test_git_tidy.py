@@ -6077,3 +6077,101 @@ def test_the_parser_refuses_what_pyyaml_refuses_here_too(text: str):
         yaml.safe_load(text)
     with pytest.raises(gt.Failure):
         gt._parse_yaml_subset(text, "<t>")
+
+
+# --------------------------------------------------------------------------- #
+# doctor --fix
+# --------------------------------------------------------------------------- #
+
+
+def test_doctor_still_changes_nothing_without_fix(workspace: Path):
+    """It has reported and only reported since the first version."""
+    repo = workspace / "repo"
+    git(repo, "switch", "-q", "--detach", "HEAD")
+    git(repo, "remote", "set-url", "origin", "https://a:tok@example.invalid/r.git")
+
+    gt.main(["-C", str(workspace), "doctor", "--apply"])
+    assert git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip() == "HEAD"
+    assert "tok" in git(repo, "remote", "get-url", "origin")
+
+
+def test_fix_puts_a_detached_head_back_on_the_trunk(workspace: Path):
+    repo = workspace / "repo"
+    git(repo, "switch", "-q", "--detach", "HEAD")
+
+    gt.main(["-C", str(workspace), "doctor", "--fix", "--apply"])
+    assert git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip() == "main"
+
+
+def test_fix_refuses_a_detached_head_that_is_holding_the_work(workspace: Path):
+    """Switching away would leave those commits reachable from the reflog only."""
+    repo = workspace / "repo"
+    git(repo, "switch", "-q", "--detach", "HEAD")
+    commit(repo, "only-here.txt")
+    detached = git(repo, "rev-parse", "HEAD").strip()
+
+    gt.main(["-C", str(workspace), "doctor", "--fix", "--apply"])
+    assert git(repo, "rev-parse", "HEAD").strip() == detached
+    assert git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip() == "HEAD"
+
+
+def test_fix_refuses_a_detached_head_with_uncommitted_changes(workspace: Path):
+    repo = workspace / "repo"
+    git(repo, "switch", "-q", "--detach", "HEAD")
+    (repo / "README.md").write_text("edited", encoding="utf-8")
+
+    gt.main(["-C", str(workspace), "doctor", "--fix", "--apply"])
+    assert git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip() == "HEAD"
+    assert (repo / "README.md").read_text(encoding="utf-8") == "edited"
+
+
+def test_fix_takes_the_credential_out_of_the_url(workspace: Path):
+    repo = workspace / "repo"
+    git(repo, "remote", "set-url", "origin", "https://alice:ghp_tok@example.invalid/r.git")
+
+    gt.main(["-C", str(workspace), "doctor", "--fix", "--apply"])
+    assert git(repo, "remote", "get-url", "origin").strip() == "https://example.invalid/r.git"
+
+
+@pytest.mark.parametrize(
+    ("url", "want"),
+    [
+        ("https://a:tok@host/r.git", "https://host/r.git"),
+        ("https://a:tok@host/deep/path/r.git", "https://host/deep/path/r.git"),
+        ("http://u:p@host:8443/r.git", "http://host:8443/r.git"),
+        ("ssh://git@host/r.git", None),
+        ("https://host/r.git", None),
+        ("git@host:org/r.git", None),
+    ],
+)
+def test_a_url_without_its_credential_is_still_a_url(url: str, want: str | None):
+    """sub(r"\\1", url) looked right and ate the :// with the credential."""
+    assert gt.without_credential(url) == want
+
+
+def test_fix_leaves_unpushed_work_alone(workspace: Path, capsys):
+    """The whole line between what --fix does and what it only reports."""
+    repo = workspace / "repo"
+    git(repo, "switch", "-q", "-c", "feature/mine")
+    commit(repo, "only-here.txt")
+
+    gt.main(["-C", str(workspace), "doctor", "--fix", "--apply"])
+    assert git(repo, "branch", "--list", "feature/mine").strip()
+    assert "not pushed" in capsys.readouterr().out
+
+
+def test_fix_is_a_dry_run_like_everything_else(workspace: Path, capsys):
+    repo = workspace / "repo"
+    git(repo, "switch", "-q", "--detach", "HEAD")
+
+    gt.main(["-C", str(workspace), "doctor", "--fix"])
+    assert git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip() == "HEAD"
+    assert "would switch back to main" in capsys.readouterr().out
+
+
+def test_run_takes_fix_too(workspace: Path):
+    repo = workspace / "repo"
+    git(repo, "switch", "-q", "--detach", "HEAD")
+
+    assert gt.main(["-C", str(workspace), "run", "--fix", "--apply"]) == 0
+    assert git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip() == "main"
