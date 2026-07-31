@@ -5712,3 +5712,75 @@ def test_thinning_reports_what_it_could_not_remove(tmp_path: Path):
         assert freed == 2048, "and was not counted as freed"
     finally:
         locked.chmod(0o755)
+
+
+# --------------------------------------------------------------------------- #
+# The quarantine round trip, over every shape of thing it can be handed
+# --------------------------------------------------------------------------- #
+
+QUARANTINE_SHAPES: list[tuple[str, list[str]]] = [
+    ("one file", ["a.bin"]),
+    ("several files", ["a.bin", "b.bin", "c.bin"]),
+    ("a directory", ["d/one.bin", "d/two.bin"]),
+    ("nested directories", ["d/e/f/deep.bin", "d/e/shallow.bin"]),
+    ("spaces in the name", ["a file.bin", "a dir/inside.bin"]),
+    ("unicode", ["ümlaut.bin", "日本/語.bin"]),
+    ("a newline in the name", ["we\nird.bin"]),
+    ("a dotfile", [".env", ".config/x.bin"]),
+    ("an empty file", ["empty.bin"]),
+    ("names that collide across directories", ["x/same.bin", "y/same.bin"]),
+]
+
+
+@pytest.mark.parametrize(
+    ("name", "files"), QUARANTINE_SHAPES, ids=[s[0] for s in QUARANTINE_SHAPES]
+)
+def test_taking_then_restoring_is_the_identity(tmp_path: Path, name: str, files: list[str]):
+    """Whatever went in comes back, at the same path with the same bytes.
+
+    This is the promise the whole quarantine exists to make, and it is the one
+    thing a user cannot check for themselves after the fact.
+    """
+    space = tmp_path / "space"
+    contents = {}
+    for index, relative in enumerate(files):
+        path = space / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        body = b"" if relative.endswith("empty.bin") else bytes([index % 256]) * (index * 7 + 1)
+        path.write_bytes(body)
+        contents[relative] = body
+
+    holding = gt.Quarantine(space / gt.QUARANTINE_DIRNAME, space, stamp="stamp")
+    # Top-level entries only, as the sweep hands them over.
+    for entry in sorted({Path(relative).parts[0] for relative in files}):
+        holding.take(space / entry)
+    holding.write_manifest()
+
+    for relative in files:
+        assert not (space / relative).exists(), f"{name}: {relative} did not move"
+
+    actions = gt.restore(space / gt.QUARANTINE_DIRNAME, "stamp", run())
+    assert not [a for a in actions if a.error], actions
+    for relative, body in contents.items():
+        assert (space / relative).read_bytes() == body, f"{name}: {relative} came back wrong"
+
+
+def test_restoring_twice_is_not_an_error_the_second_time(tmp_path: Path):
+    """The second one has nothing to do, and must not claim it did something."""
+    space = tmp_path / "space"
+    space.mkdir()
+    (space / "a.bin").write_bytes(b"x")
+    holding = gt.Quarantine(space / gt.QUARANTINE_DIRNAME, space, stamp="stamp")
+    holding.take(space / "a.bin")
+    holding.write_manifest()
+
+    first = gt.restore(space / gt.QUARANTINE_DIRNAME, "stamp", run())
+    assert [a for a in first if a.applied]
+    # A named stamp that is no longer there is worth an error naming it.
+    with pytest.raises(gt.Failure, match="no quarantine 'stamp'"):
+        gt.restore(space / gt.QUARANTINE_DIRNAME, "stamp", run())
+    # Asking for "whatever is there" when nothing is, is not an error at all.
+    second = gt.restore(space / gt.QUARANTINE_DIRNAME, None, run())
+    assert not [a for a in second if a.applied]
+    assert gt._reason_of(second[0].detail) != "other, see the lines marked -"
+    assert (space / "a.bin").read_bytes() == b"x"
