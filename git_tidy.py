@@ -2851,7 +2851,7 @@ def _remove_ignored(
                 protect_nested=not regenerable,
                 sensitive=(
                     guard := outright_guard(
-                        cfg["trash"]["sensitive"], clean["ignored_keep"], regenerable
+                        cfg["trash"]["sensitive"], local_state_of(clean), regenerable
                     )
                 )[0],
                 local_state=guard[1],
@@ -4824,6 +4824,18 @@ def cmd_clean(context: Context, report: Report) -> None:
         context.printer.batch(loose)
 
 
+def local_state_of(clean: dict[str, Any]) -> list[str]:
+    """The paths a removal must lift out rather than take with it.
+
+    clean.keep as well as clean.ignored_keep. switched_off_rules leaves both to
+    _remove on purpose — refusing the whole directory for them is what made
+    turning clean.ignored on reclaim nothing — but only ignored_keep was ever
+    handed over, so a file clean.keep named by hand, sitting inside an ignored
+    directory, was hard-deleted and did not even reach the quarantine.
+    """
+    return [*clean["ignored_keep"], *clean["keep"]]
+
+
 def outright_guard(
     sensitive: Sequence[str], local_state: Sequence[str], regenerable: bool
 ) -> tuple[list[str], list[str]]:
@@ -4873,7 +4885,7 @@ def _clean_repo(
         holding,
         already=already,
         sensitive=cfg["trash"]["sensitive"],
-        local_state=cfg["clean"]["ignored_keep"],
+        local_state=local_state_of(cfg["clean"]),
         holding=context.quarantine,
     )
 
@@ -4909,7 +4921,7 @@ def _outside_repos(
             protect_nested=(guarded := not _matches(path.name, here_cfg["regenerable"])),
             sensitive=(
                 guard := outright_guard(
-                    here_cfg["sensitive_names"], here_cfg["ignored_keep"], not guarded
+                    here_cfg["sensitive_names"], local_state_of(here_cfg), not guarded
                 )
             )[0],
             local_state=guard[1],
