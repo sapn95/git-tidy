@@ -107,18 +107,16 @@ Two mechanisms, and the first is usually all you need:
 - **`clean.ignored`** — remove everything `.gitignore` already calls disposable,
   the same set as `git clean -Xd`. Off by default, because "ignored" also covers
   local-only files that are ignored *on purpose*: `.env`, `*.tfstate`, `*.pem`.
-  Those are listed in `clean.ignored_keep` and are never removed — and a
-  directory holding one is moved to quarantine rather than deleted, so the file
-  survives even when its parent goes.
+  Those are listed in `clean.ignored_keep` and are never removed. A directory
+  holding one is **emptied out around it**: the file stays exactly where it is,
+  because an application reads it from that path, and everything else in the
+  directory is still reclaimed.
 
-  Two things stop that from swallowing the space this tool exists to reclaim.
-  Inside a path listed in `clean.regenerable` (`.terraform`, `.gradle`, `.next`
-  …) `ignored_keep` does not apply at all, because those are caches a tool
-  rebuilds — every `.terraform` holds a `terraform.tfstate`, which is the
-  backend pointer, not your state. And anywhere else, a directory holding a
-  protected file is **not** moved whole: the protected files are lifted out
-  into quarantine and the directory around them is removed. A 400 MB
-  `node_modules` with one `id_rsa` in it gives back 400 MB and keeps the key.
+  So a 400 MB `node_modules` with one `id_rsa` in it gives back 400 MB and
+  leaves the key where it was. Inside a path listed in `clean.regenerable`
+  (`.terraform`, `.gradle`, `.next` …) `ignored_keep` does not apply at all,
+  because those are caches a tool rebuilds — every `.terraform` holds a
+  `terraform.tfstate`, which is the backend pointer, not your state.
 
   `trash.sensitive` holds everywhere, but not for source code: a `tokenizer.js`
   or a `pygments/token.py` matches `*token*` and is not a secret, so anything
@@ -206,11 +204,11 @@ What `--force` deliberately cannot do:
   `clean.regenerable`, the short list of caches whose nested repository is
   itself a tool's clone: `terraform init` puts one under `.terraform/modules`
   for every module, and keeping those would make a gigabyte unreclaimable
-- hard-delete anything matching `trash.sensitive` or `clean.ignored_keep`; a
-  credential is quarantined whatever else is set, wherever it turns up —
-  including inside a cache that is otherwise deleted outright, where it is
-  lifted out before the cache goes. The source-code exemption below applies to
-  `trash.sensitive` alone
+- hard-delete anything matching `trash.sensitive` or `clean.ignored_keep`.
+  A directory holding one is emptied out around it: the file stays at its path
+  and the rest is reclaimed. Two carve-outs, both documented above —
+  `clean.ignored_keep` does not apply inside `clean.regenerable`, and the
+  source-code exemption applies to `trash.sensitive` alone
 - remove a tracked file, follow a symlink, or reach outside the workspace
 
 Pair it with `--ask` the first time, so you see what it selects before it acts.
@@ -315,7 +313,10 @@ git clone https://github.com/sapn95/git-tidy && ./git-tidy/git_tidy.py --help
 
 PyYAML is used when it happens to be installed; when it is not, a strict parser
 for the documented config subset stands in, so there is nothing to install
-alongside the script.
+alongside the script. The two agree — that is a test, not a hope — and where
+they cannot, both refuse rather than guess. The released binaries are built
+without PyYAML on purpose, so a config means the same thing on every one of
+them regardless of the machine that built it.
 
 Named `git-tidy`, so git finds it as a subcommand too:
 

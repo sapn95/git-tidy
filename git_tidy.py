@@ -44,7 +44,9 @@ single repo can opt out of a rule the workspace sets. `git-tidy config` prints
 the result of that merge for any path.
 
 Single file, standard library only: PyYAML is used when it is installed, and a
-strict parser for the documented subset stands in when it is not.
+strict parser for the documented subset stands in when it is not. The two agree,
+and where they cannot they both refuse. The released binaries carry no PyYAML,
+so they always use the second one.
 """
 
 from __future__ import annotations
@@ -325,12 +327,16 @@ COMMENTS: dict[str, str] = {
     "the same set as `git clean -Xd`. Thorough, and the fastest way to reclaim\n"
     "space, but it also catches local-only files that are ignored on purpose,\n"
     "which is what ignored_keep below is for.",
-    "clean.ignored_keep": "Never deleted, by any of the clean steps: local state and\n"
-    "credentials that are ignored precisely because they must not be\n"
-    "committed. A directory holding one is emptied of it first — the file goes\n"
-    "to quarantine, the directory around it is still reclaimed.\n"
-    "The source-code exemption that applies to trash.sensitive does not apply\n"
-    "here: a secrets.py that is gitignored is not committed source, and being\n"
+    "clean.ignored_keep": "Never deleted: local state and credentials that are ignored\n"
+    "precisely because they must not be committed. A directory holding one is\n"
+    "emptied out around it — the file stays exactly where it is, because an\n"
+    "application reads it from that path, and the rest of the directory is\n"
+    "still reclaimed.\n"
+    "Two things it does not cover. Inside a path named in clean.regenerable it\n"
+    "does not apply at all: those are caches a tool rebuilds, and every\n"
+    ".terraform holds a terraform.tfstate that `terraform init` writes again.\n"
+    "And the source-code exemption that applies to trash.sensitive does not\n"
+    "apply here: a gitignored secrets.py is not committed source, and being\n"
     "local and untracked is exactly why this list names it.",
     "clean.dirs": "Directory names removed wherever they appear, ignored or not.\nGlobs allowed.",
     "clean.extra_dirs": "Appended to dirs instead of replacing it, so one repository\n"
@@ -427,24 +433,31 @@ def _strip_comment(line: str) -> str:
     A '#' only starts a comment at the beginning of the content or after a space,
     so `url: http://x#y` keeps its fragment.
 
-    A quote only opens one where a value could begin — the start of the line, or
-    after whitespace or one of `:,[{`. Otherwise the apostrophe in
-    `name: it's fine  # note` would be read as an opening quote, and the comment
-    after it would survive into the value.
+    A quote only opens one where a value could actually begin: at the start, or
+    directly after one of `:,[{-` and any spaces. Otherwise the apostrophe in
+    `name: it's fine  # note` would be read as an opening quote and the comment
+    after it would survive into the value — and, the other way round, so would
+    the one in `a: x 'y # z`, which PyYAML reads as the plain scalar `x 'y`.
+    Merely "after a space" was not enough: it is only a place a value can begin
+    if nothing has been written since the last delimiter.
     """
     out: list[str] = []
     quote: str | None = None
-    openers = " \t:,[{-"
+    can_open = True  # nothing written yet, so a value could start here
     for i, ch in enumerate(line):
         if quote:
             out.append(ch)
             if ch == quote and not (quote == '"' and i and line[i - 1] == "\\"):
                 quote = None
             continue
-        if ch in "\"'" and (i == 0 or line[i - 1] in openers):
+        if ch in "\"'" and can_open:
             quote = ch
             out.append(ch)
             continue
+        if ch in ":,[{-":
+            can_open = True
+        elif ch not in " \t":
+            can_open = False
         if ch == "#" and (i == 0 or line[i - 1] in " \t"):
             break
         out.append(ch)
@@ -464,10 +477,10 @@ def _tokenize(text: str, source: str) -> list[_Line]:
         content = _strip_comment(raw)
         if not content.strip():
             continue
-        if content.lstrip().startswith("..."):
+        if content.strip() == "...":
             ended = True
             continue
-        if content.lstrip().startswith("---"):
+        if content.strip() == "---":
             if lines or ended:
                 # A second document. PyYAML refuses one outright; merging them
                 # here silently dropped whichever key came first.
@@ -475,6 +488,13 @@ def _tokenize(text: str, source: str) -> list[_Line]:
                     f"{source}:{number}: more than one YAML document; this reads only one"
                 )
             continue
+        if content.lstrip().startswith("---"):
+            # `--- {jobs: 4}` is one document with content on the marker line,
+            # and `---jobs: 4` is a key called ---jobs. Dropping the line
+            # outright threw the first away in silence and left the config
+            # empty; PyYAML reads both. Neither is worth supporting, but
+            # neither may pass quietly.
+            raise Failure(f"{source}:{number}: put the document on its own lines, not after ---")
         if ended:
             raise Failure(f"{source}:{number}: content after the end of the document")
         lines.append(_Line(len(content) - len(content.lstrip()), content.strip(), number))
@@ -592,11 +612,18 @@ def _looks_like_mapping(item: str) -> bool:
     return bool(sep) and " " not in key.strip()
 
 
-# Indicators PyYAML refuses at the start of a plain scalar *inside* a flow
-# collection, where it applies stricter rules than at block level. `?` is an
-# ordinary fnmatch wildcard, so `keep: [conf?.yaml]` is a natural thing to
-# write — and it parsed here and was a ParserError with PyYAML installed.
-_FLOW_INDICATORS = "?:"
+def _inside_quote(ch: str, quote: str, escaped: bool) -> tuple[str | None, bool]:
+    """Track a quoted run inside a flow collection, honouring \\" as an escape.
+
+    Without the escape, `keep: ["a\\"b", c]` was an unterminated quote here and
+    loaded fine with PyYAML — and _strip_comment, one function up, already knew
+    about it, so the two disagreed with each other.
+    """
+    if escaped:
+        return quote, False
+    if quote == '"' and ch == "\\":
+        return quote, True
+    return (None if ch == quote else quote), False
 
 
 def _split_flow(body: str, source: str, number: int) -> list[str]:
@@ -605,11 +632,11 @@ def _split_flow(body: str, source: str, number: int) -> list[str]:
     depth = 0
     quote: str | None = None
     current: list[str] = []
+    escaped = False
     for ch in body:
         if quote:
             current.append(ch)
-            if ch == quote:
-                quote = None
+            quote, escaped = _inside_quote(ch, quote, escaped)
             continue
         if ch in "\"'":
             quote = ch
@@ -1423,6 +1450,16 @@ class Action:
     # deleted, when only part of a directory was. Without it a node_modules that
     # gave back 9 KB and moved 98 KB reported 107 KB freed.
     kept_size: int = 0
+    # This path has been decided and no later step should look at it again —
+    # removed, quarantined, declined, or refused for what is inside it. Set by
+    # _remove, which is where all four of those happen.
+    #
+    # It exists because the alternative was reading the decision back out of the
+    # detail string, and that went wrong twice: once matching too little, so
+    # clean.dirs deleted a path clean.ignored had just refused, and once
+    # matching too much, so clean.ignored stopped clean.dirs reclaiming
+    # anything at all.
+    settled: bool = False
 
     @property
     def consent_key(self) -> str:
@@ -1465,24 +1502,37 @@ class Report:
     @property
     def bytes_freed(self) -> int:
         """Bytes actually reclaimed. Quarantined files are still on the disk."""
-        return sum(a.size - a.kept_size for a in self.actions if a.applied and not a.quarantined)
+        return sum(a.size for a in self.actions if a.applied and not a.quarantined)
 
     @property
     def bytes_quarantined(self) -> int:
-        return sum(a.size if a.quarantined else a.kept_size for a in self.actions if a.applied)
+        return sum(a.size for a in self.actions if a.applied and a.quarantined)
 
     @property
     def bytes_found(self) -> int:
         """Bytes a dry run would actually reclaim. Quarantined ones only move."""
         return sum(
-            a.size - a.kept_size
-            for a in self.actions
-            if not a.error and not a.skipped and not a.quarantined
+            a.size for a in self.actions if not a.error and not a.skipped and not a.quarantined
         )
 
     @property
     def bytes_found_quarantined(self) -> int:
+        """What a dry run predicts will move rather than go.
+
+        kept_size as well, or the dry run under-reports one of the two totals it
+        exists to predict: a directory thinned around a 200 KB key showed 300 KB
+        "to free" against a 500 KB line, with nothing accounting for the rest.
+        """
         return sum(a.size for a in self.actions if not a.error and not a.skipped and a.quarantined)
+
+    @property
+    def bytes_kept_in_place(self) -> int:
+        """Protected bytes left exactly where they were, inside a thinned tree.
+
+        Neither freed nor moved, so it belongs to neither total — and saying
+        nothing about it left a directory's size unaccounted for.
+        """
+        return sum(a.kept_size for a in self.actions if not a.error and not a.skipped)
 
     @property
     def errors(self) -> list[Action]:
@@ -2636,6 +2686,22 @@ def clean_patterns(clean: dict[str, Any]) -> tuple[list[str], list[str]]:
     return dirs, files
 
 
+def switched_off_rules(clean: dict[str, Any]) -> list[tuple[Sequence[str], str]]:
+    """The subset of protection_rules that names whole trees kept by a switch.
+
+    clean.ignored has to refuse a directory holding one of these, because git
+    collapses a wholly ignored directory into a single entry and removing it
+    would take the node_modules inside it with it — which is precisely what
+    clean.dependencies being off says not to do.
+
+    ignored_keep and clean.keep are deliberately *not* here. _remove lifts those
+    out and removes the directory around them, which is the whole promise;
+    refusing the directory for them instead meant turning clean.ignored on made
+    the tool reclaim nothing.
+    """
+    return protection_rules(clean)[2:]
+
+
 def protection_rules(clean: dict[str, Any]) -> list[tuple[Sequence[str], str]]:
     """Every rule that keeps a path, with the name of the rule that did it.
 
@@ -2712,19 +2778,20 @@ def _remove_ignored(
         if why is not None:
             actions.append(Action("ignored", scope, relative, why, skipped=True))
             continue
-        # git collapses a wholly ignored directory into one entry, so a
-        # build/ holding a .env or a *.pem arrives here as a single path.
-        # Testing only its name would delete the protected file with it.
+        # git collapses a wholly ignored directory into one entry, so a build/
+        # holding a node_modules arrives here as a single path, and removing it
+        # would take the tree clean.dependencies is switched off to keep.
         #
-        # Not for a path the user called regenerable, though: refusing .terraform
-        # here while clean.dirs removed the very same directory minutes later
-        # made one run report it both "kept: contains terraform.tfstate" and
-        # "removed". _remove decides that case, with the same split.
+        # Only for those. A .env or a *.pem inside it is _remove's business: it
+        # lifts them out and reclaims the rest, and refusing the directory for
+        # them instead is how turning clean.ignored on came to free nothing.
+        # Never for a path the user called regenerable.
         regenerable = _matches(name, clean["regenerable"])
-        protect = [pattern for patterns, _ in rules for pattern in patterns]
+        protect = [p for patterns, _ in switched_off_rules(clean) for p in patterns]
         if (
             path.is_dir()
             and not regenerable
+            and protect
             and (holds := _holds_protected(path, protect, base=repo))
         ):
             actions.append(
@@ -2816,6 +2883,41 @@ def _sensitive_within(directory: Path, sensitive: Sequence[str]) -> str | None:
                 return (here / entry).relative_to(directory).as_posix()
         dirnames[:] = [d for d in dirnames if not (here / d).is_symlink()]
     return None
+
+
+def _thin_out(directory: Path, keep: Sequence[Path]) -> int:
+    """Remove everything under `directory` except `keep`, and say how much went.
+
+    The directory itself survives, holding only the protected entries. That is
+    the difference between reclaiming a 400 MB node_modules and breaking the
+    .env the application reads out of it: the file is not a copy of something,
+    it is the thing, and moving it to a quarantine is not much better for its
+    owner than deleting it.
+
+    Nothing protected is deleted, so nothing needs a quarantine to fall back on:
+    "never hard-deleted" is kept by not removing it at all.
+    """
+    keep_set = {one.resolve() for one in keep}
+    ancestors = {parent for one in keep for parent in one.resolve().parents}
+    freed = 0
+    for dirpath, dirnames, filenames in os.walk(directory, topdown=False, followlinks=False):
+        here = Path(dirpath)
+        for name in filenames:
+            candidate = here / name
+            if candidate.resolve() in keep_set:
+                continue
+            with contextlib.suppress(OSError):
+                freed += 0 if candidate.is_symlink() else candidate.stat().st_size
+                candidate.unlink()
+        for name in dirnames:
+            candidate = here / name
+            resolved = candidate.resolve()
+            if resolved in keep_set or resolved in ancestors or candidate.is_symlink():
+                continue
+            with contextlib.suppress(OSError):
+                freed += _measure(candidate)[0]
+                shutil.rmtree(candidate)
+    return freed
 
 
 def _holds_protected(
@@ -3118,15 +3220,21 @@ def _what_to_keep(
     A plain string instead means it cannot be emptied out safely and has to stay
     whole, and is the reason to report — see _protected_within.
     """
-    if quarantine is not None or holding is None or not (sensitive or local_state):
+    if quarantine is not None or not (sensitive or local_state):
         return quarantine, [], ""
-    if _protects(path.name, sensitive, local_state):
+    if holding is not None and _protects(path.name, sensitive, local_state):
         # The name first, and for a directory as much as for a file: a directory
         # called credentials/ or tokens/ *is* the thing being protected, so it
         # goes whole rather than being emptied out. _protected_within walks the
         # children and never looks at the root, so without this a directory
         # called tokens/ was hard-deleted while a file called api-token.tfplan
         # beside it was correctly quarantined.
+        #
+        # This one needs somewhere to put it, which is why it is the only part
+        # of the protection that depends on a quarantine existing. Emptying a
+        # directory out does not: what is protected simply stays where it is,
+        # and requiring a quarantine for that meant a run configured without
+        # one deleted the very files these lists name.
         return holding, [], f" because it is {path.name}"
     if not is_dir:
         return quarantine, [], ""
@@ -3138,11 +3246,11 @@ def _what_to_keep(
     # Not the whole directory. Moving a 3.8 MB node_modules aside because one
     # file in it is called tokenizer.js reclaimed nothing at all — it renamed the
     # tree into a directory in the same workspace — while the README's first
-    # promise is the space back. So the few files that may be the only copy of a
-    # credential are lifted out into quarantine, and the rest of it really goes.
+    # promise is the space back. So the directory is thinned out instead: what
+    # is protected stays, everything else goes.
     shown = rescue[0].relative_to(path).as_posix()
     more = f" and {len(rescue) - 1} more" if len(rescue) > 1 else ""
-    return quarantine, rescue, f", keeping {shown}{more} in quarantine"
+    return quarantine, rescue, f", keeping {shown}{more}"
 
 
 def _remove(
@@ -3166,7 +3274,14 @@ def _remove(
         )
     except OSError:
         size = 0
-    action = Action(kind, scope, relative, f"remove {'directory' if is_dir else 'file'}", size=size)
+    action = Action(
+        kind,
+        scope,
+        relative,
+        f"remove {'directory' if is_dir else 'file'}",
+        size=size,
+        settled=True,
+    )
     action.quarantined = quarantine is not None
     plan = _what_to_keep(path, root, is_dir, quarantine, holding, sensitive, local_state)
     if isinstance(plan, str):
@@ -3180,14 +3295,19 @@ def _remove(
         return action
     quarantine, rescue, because = plan
     action.quarantined = quarantine is not None
-    action.kept_size = sum(
-        _measure(one)[0] if one.is_dir() else one.stat().st_size for one in rescue
-    )
+    kept_bytes = 0
+    for one in rescue:
+        with contextlib.suppress(OSError):
+            kept_bytes += _measure(one)[0] if one.is_dir() else one.stat().st_size
+    action.kept_size = kept_bytes
+    # size is what this action frees, in a dry run as much as in an apply, so
+    # the two summaries agree; kept_size is what stays behind, on its own line.
+    action.size = max(0, action.size - kept_bytes)
     # Said before the decision, so a dry run names the outcome it is predicting.
-    action.detail = (
-        f"{'quarantine' if action.quarantined else 'remove'} "
-        f"{'directory' if is_dir else 'file'}{because}"
-    )
+    thinned = is_dir and bool(rescue) and quarantine is None
+    verb = "empty out" if thinned else ("quarantine" if action.quarantined else "remove")
+    what = "" if thinned else f" {'directory' if is_dir else 'file'}"
+    action.detail = f"{verb}{what}{because}"
     if (holds_repo or unreadable) and protect_nested:
         # A vendored or forgotten checkout inside an artefact directory. Deleting
         # the parent would take the repository with it, and nothing in an
@@ -3209,11 +3329,12 @@ def _remove(
         _guard(path, root)
         if quarantine is not None:
             quarantine.take(path)
+        elif is_dir and rescue:
+            # Thinned out rather than removed: the protected entries stay
+            # exactly where they are, because a .env is not a copy of anything
+            # and an application reads it from that path.
+            _thin_out(path, rescue)
         elif is_dir:
-            # Before the rmtree, and only then: a failure here must leave the
-            # directory alone rather than half of it.
-            for protected in rescue:
-                holding.take(protected)  # type: ignore[union-attr]
             shutil.rmtree(path)
         else:
             path.unlink()
@@ -3223,7 +3344,9 @@ def _remove(
     action.applied = True
     # "removed" would be untrue for a quarantined path: it is still on the disk,
     # a restore away.
-    action.detail = ("quarantined" if action.quarantined else "removed") + because
+    action.detail = (
+        "emptied out" if thinned else "quarantined" if action.quarantined else "removed"
+    ) + because
     return action
 
 
@@ -4082,10 +4205,18 @@ ROLLED_UP = ("remove", "ignored")
 
 
 def _past_tense(action: Action) -> str:
-    """What a group of identical actions did, in one word."""
-    if action.applied:
-        return "quarantined" if "quarantin" in action.detail else "removed"
-    return "would quarantine" if action.quarantined else "would remove"
+    """What a group of identical actions did, in one word.
+
+    From the flags, not from the wording: "removed, keeping id_rsa in
+    quarantine" contains the word quarantine, so sniffing for it labelled a
+    group of deleted directories "quarantined" — telling the reader the bytes
+    were a restore away when they were gone.
+    """
+    if action.quarantined:
+        return "quarantined" if action.applied else "would quarantine"
+    if action.kept_size:
+        return "emptied out" if action.applied else "would empty out"
+    return "removed" if action.applied else "would remove"
 
 
 class Printer:
@@ -4235,6 +4366,10 @@ def summarise(report: Report, mode: str, printer: Printer, forced: bool = False)
         # next `df` would expose.
         moved = "would move to quarantine" if mode == DRY else "moved to quarantine"
         printer.line(f"  {human_size(held):>6}  {moved}, not reclaimed")
+    stayed = report.bytes_kept_in_place
+    if stayed:
+        left = "would stay" if mode == DRY else "stayed"
+        printer.line(f"  {human_size(stayed):>6}  {left} in place: local state and credentials")
 
     _summarise_held_back(report, printer, forced)
     _summarise_errors(report, printer)
@@ -4585,19 +4720,12 @@ def _clean_repo(
     if cfg["clean"]["ignored"]:
         ignored = clean_ignored(repo, name, cfg, context.decider, holding, git, context.quarantine)
         actions += ignored
-        # The ones that went, and the ones held back because of what is *inside*
-        # them. Those two are settled; anything else clean.ignored merely
-        # declined to match — "build output, clean.builds is off" — is still
-        # fair game for clean.dirs, and putting those here made turning
-        # clean.ignored on make the tool clean less.
-        #
-        # "kept: contains …" is a decision about that path. Letting clean.dirs
-        # take it anyway meant a run that printed "kept: contains
-        # config/prod.json", counted it under "held back", and destroyed it on
-        # the next line.
-        already = {
-            a.target for a in ignored if not a.skipped or a.detail.startswith("kept: contains ")
-        }
+        # Every path clean.ignored actually decided about — removed, quarantined,
+        # declined, or refused for what is inside it. A path it merely did not
+        # match ("build output, clean.builds is off") is not decided and is
+        # still clean.dirs's business, which is why this reads a flag rather
+        # than the wording of a reason.
+        already = {a.target for a in ignored if a.settled}
     actions += clean_tree(
         repo,
         name,

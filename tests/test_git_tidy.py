@@ -1657,7 +1657,9 @@ def test_clean_ignored_protects_a_key_buried_in_an_ignored_directory(workspace: 
 
     actions = gt.clean_ignored(repo, "repo", config(), run(), None, gt.Git(repo))
     assert (deep / "server.pem").is_file(), "the key must survive its parent"
-    assert actions and actions[0].skipped and "server.pem" in actions[0].detail
+    # Emptied out around it rather than kept whole: the key is not a copy of
+    # anything, so it stays at its path, and the rest of the tree still goes.
+    assert actions and "server.pem" in actions[0].detail
 
 
 def test_clean_ignored_still_removes_a_directory_with_nothing_protected(workspace: Path):
@@ -1812,7 +1814,7 @@ def test_ignored_keep_matches_a_relative_pattern_too(workspace: Path):
     cfg = config(clean={"ignored_keep": ["generated/config/*.crt"]})
     actions = gt.clean_ignored(repo, "repo", cfg, run(), None, gt.Git(repo))
     assert (deep / "server.crt").is_file()
-    assert actions and actions[0].skipped
+    assert actions and "server.crt" in actions[0].detail
 
 
 def test_a_workspace_inside_a_repository_keeps_its_tracked_files(tmp_path: Path):
@@ -2711,11 +2713,9 @@ def test_a_credential_inside_a_disposable_directory_is_lifted_out_of_it(workspac
         sensitive=gt.DEFAULTS["trash"]["sensitive"],
         holding=holding,
     )
-    assert not cache.exists(), "the cache is reclaimed"
-    kept = holding.dir / gt.CONTENT_DIRNAME / "repo" / ".terraform" / "client.pem"
-    assert kept.read_text(encoding="utf-8") == "PRIVATE KEY"
-    assert not (holding.dir / gt.CONTENT_DIRNAME / "repo" / ".terraform" / "provider.bin").exists()
-    assert any("keeping client.pem in quarantine" in a.detail for a in actions), actions
+    assert (cache / "client.pem").read_text(encoding="utf-8") == "PRIVATE KEY"
+    assert not (cache / "provider.bin").exists(), "the disposable part is reclaimed"
+    assert any("keeping client.pem" in a.detail for a in actions), actions
 
 
 # --------------------------------------------------------------------------- #
@@ -3803,10 +3803,9 @@ def test_a_cache_holding_a_credential_is_removed_and_the_credential_kept(workspa
     (repo / "__pycache__" / "m.pyc").write_bytes(b"0" * 4096)
 
     gt.main(["-C", str(workspace), "clean", "--apply"])
-    assert "artefacts removed" in capsys.readouterr().out
-    assert not (repo / "__pycache__").exists()
-    found = list((workspace / gt.QUARANTINE_DIRNAME).glob("*/files/repo/__pycache__/deploy.pem"))
-    assert found and found[0].read_text(encoding="utf-8") == "KEY"
+    assert "stayed in place" in capsys.readouterr().out
+    assert not (repo / "__pycache__" / "m.pyc").exists(), "the disposable part goes"
+    assert (repo / "__pycache__" / "deploy.pem").read_text(encoding="utf-8") == "KEY"
 
 
 @pytest.mark.parametrize(
@@ -4276,14 +4275,12 @@ def test_local_state_is_never_deleted_by_the_pattern_walk(workspace: Path):
         local_state=gt.DEFAULTS["clean"]["ignored_keep"],
         holding=holding,
     )
-    assert not cache.exists(), "the artefact directory is still reclaimed"
-    kept = holding.dir / gt.CONTENT_DIRNAME / "repo" / "htmlcov"
-    assert (kept / "terraform.tfstate").read_text(encoding="utf-8") == "the only copy"
-    assert (kept / "id_rsa").is_file()
+    assert not (cache / "provider.bin").exists(), "the disposable part is reclaimed"
+    assert (cache / "terraform.tfstate").read_text(encoding="utf-8") == "the only copy"
+    assert (cache / "id_rsa").is_file()
     # secrets.* is an ignored_keep entry, and the source exemption belongs to
     # trash.sensitive alone: a gitignored secrets.py is not committed source.
-    assert (kept / "secrets.py").read_text(encoding="utf-8") == "AWS_SECRET = 1"
-    assert not (kept / "provider.bin").exists()
+    assert (cache / "secrets.py").read_text(encoding="utf-8") == "AWS_SECRET = 1"
 
 
 def test_a_regenerable_cache_is_reclaimed_not_moved(workspace: Path):
@@ -4310,8 +4307,8 @@ def test_a_tfstate_outside_a_regenerable_cache_is_still_quarantined(workspace: P
     (repo / "htmlcov" / "terraform.tfstate").write_text("state", encoding="utf-8")
 
     gt.main(["-C", str(workspace), "clean", "--apply"])
-    found = list((workspace / gt.QUARANTINE_DIRNAME).glob("*/files/repo/htmlcov/terraform.tfstate"))
-    assert found and found[0].read_text(encoding="utf-8") == "state"
+    kept = repo / "htmlcov" / "terraform.tfstate"
+    assert kept.read_text(encoding="utf-8") == "state", "left exactly where it was"
 
 
 def test_a_private_key_is_never_hard_deleted_even_inside_a_regenerable_cache(workspace: Path):
@@ -4321,8 +4318,7 @@ def test_a_private_key_is_never_hard_deleted_even_inside_a_regenerable_cache(wor
     (repo / ".terraform" / "id_rsa").write_text("PRIVATE", encoding="utf-8")
 
     gt.main(["-C", str(workspace), "clean", "--apply"])
-    found = list((workspace / gt.QUARANTINE_DIRNAME).glob("*/files/repo/.terraform/id_rsa"))
-    assert found and found[0].read_text(encoding="utf-8") == "PRIVATE"
+    assert (repo / ".terraform" / "id_rsa").read_text(encoding="utf-8") == "PRIVATE"
 
 
 def test_a_switch_sees_an_env_inside_an_ignored_directory(workspace: Path):
@@ -4980,11 +4976,8 @@ def test_a_dependency_tree_is_reclaimed_and_its_credential_lifted_out(workspace:
 
     (workspace / ".git-tidy.yaml").write_text("clean:\n  dependencies: true\n", encoding="utf-8")
     gt.main(["-C", str(workspace), "clean", "--apply"])
-    assert not modules.exists(), "the tree is really gone"
-    quarantined = workspace / gt.QUARANTINE_DIRNAME
-    found = list(quarantined.glob("*/files/repo/node_modules/id_rsa"))
-    assert found and found[0].read_text(encoding="utf-8") == "PRIVATE"
-    assert not list(quarantined.glob("*/files/repo/node_modules/acorn/dist/tokenizer.js"))
+    assert not (modules / "acorn").exists(), "the tree is really gone"
+    assert (modules / "id_rsa").read_text(encoding="utf-8") == "PRIVATE"
 
 
 @pytest.mark.parametrize(
@@ -5298,11 +5291,9 @@ def test_every_ignored_keep_match_is_lifted_out_not_just_the_first(workspace: Pa
     (workspace / gt.CONFIG_NAMES[0]).write_text("clean:\n  builds: true\n", encoding="utf-8")
 
     gt.main(["-C", str(workspace), "clean", "--apply"])
-    assert not build.exists()
-    kept = workspace / gt.QUARANTINE_DIRNAME
-    assert list(kept.glob("*/files/repo/build/.env"))
-    found = list(kept.glob("*/files/repo/build/.env.sh"))
-    assert found and found[0].read_text(encoding="utf-8") == "export AWS_SECRET=hunter2"
+    assert not (build / "out.bin").exists()
+    assert (build / ".env").is_file()
+    assert (build / ".env.sh").read_text(encoding="utf-8") == "export AWS_SECRET=hunter2"
 
 
 def test_a_path_ignored_keep_protects_by_its_path_is_lifted_out(workspace: Path):
@@ -5316,12 +5307,17 @@ def test_a_path_ignored_keep_protects_by_its_path_is_lifted_out(workspace: Path)
     )
 
     gt.main(["-C", str(workspace), "clean", "--apply"])
-    found = list((workspace / gt.QUARANTINE_DIRNAME).glob("*/files/repo/build/config/prod.json"))
-    assert found and found[0].read_text(encoding="utf-8") == "THE ONLY COPY"
+    assert not (repo / "build" / "out.bin").exists()
+    kept = repo / "build" / "config" / "prod.json"
+    assert kept.read_text(encoding="utf-8") == "THE ONLY COPY"
 
 
-def test_a_path_clean_ignored_kept_is_not_taken_by_clean_dirs(workspace: Path, capsys):
-    """One run printed "kept: contains …", counted it, and deleted it next line."""
+def test_a_path_is_decided_once_even_when_both_clean_steps_name_it(workspace: Path, capsys):
+    """One run printed "kept: contains …", counted it, and deleted it next line.
+
+    clean.ignored decides the path — here by emptying it out around the file
+    ignored_keep names — and clean.dirs must not look at it again.
+    """
     repo = workspace / "repo"
     (repo / ".gitignore").write_text("build/\n", encoding="utf-8")
     git(repo, "add", ".gitignore")
@@ -5337,11 +5333,11 @@ def test_a_path_clean_ignored_kept_is_not_taken_by_clean_dirs(workspace: Path, c
     gt.main(["-C", str(workspace), "clean", "--apply", "-v"])
     lines = [line for line in capsys.readouterr().out.splitlines() if "build" in line]
     assert len(lines) == 1, lines
-    assert "kept: contains" in lines[0]
     assert (repo / "build" / "config" / "prod.json").read_text(encoding="utf-8") == "THE ONLY COPY"
+    assert not (repo / "build" / "out.bin").exists()
 
 
-def test_bytes_lifted_into_quarantine_are_not_called_freed(workspace: Path, capsys):
+def test_bytes_left_in_place_are_not_called_freed(workspace: Path, capsys):
     """The next `df` would expose it, and reclaimed space is the headline."""
     repo = workspace / "repo"
     cache = repo / "__pycache__"
@@ -5351,9 +5347,10 @@ def test_bytes_lifted_into_quarantine_are_not_called_freed(workspace: Path, caps
 
     gt.main(["-C", str(workspace), "clean", "--apply"])
     out = capsys.readouterr().out
-    assert "moved to quarantine, not reclaimed" in out
+    assert "stayed in place" in out
     freed = next(line for line in out.splitlines() if "freed" in line)
     assert "150" not in freed, freed  # not the whole directory
+    assert (cache / "id_rsa").stat().st_size == 50_000
 
 
 def test_an_unreadable_subtree_is_not_reported_as_a_symlink(workspace: Path, capsys):
@@ -5493,3 +5490,137 @@ def test_yes_to_all_is_asked_once_and_covers_everything(workspace: Path):
     assert not (repo / "cache-plain").exists()
     kept = workspace / gt.QUARANTINE_DIRNAME / "stamp" / gt.CONTENT_DIRNAME
     assert (kept / "repo" / "cache-creds" / "id_rsa").is_file(), "still never hard-deleted"
+
+
+# --------------------------------------------------------------------------- #
+# Claude review, round twelve
+# --------------------------------------------------------------------------- #
+
+
+def test_clean_ignored_does_not_stop_the_space_being_reclaimed(workspace: Path, capsys):
+    """Turning on the setting the README calls the fastest way to reclaim space
+    made the tool reclaim nothing for that directory."""
+    repo = workspace / "repo"
+    (repo / ".gitignore").write_text("node_modules/\n", encoding="utf-8")
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-q", "-m", "ignore")
+    modules = repo / "node_modules" / "pkg"
+    modules.mkdir(parents=True)
+    (modules / "big.bin").write_bytes(b"0" * 200_000)
+    (modules / "server.key").write_text("PRIVATE", encoding="utf-8")
+    (workspace / gt.CONFIG_NAMES[0]).write_text(
+        "clean:\n  ignored: true\n  dependencies: true\n", encoding="utf-8"
+    )
+
+    gt.main(["-C", str(workspace), "clean", "--apply"])
+    assert not (modules / "big.bin").exists(), "the space came back"
+    assert (modules / "server.key").read_text(encoding="utf-8") == "PRIVATE"
+    assert "freed" in capsys.readouterr().out
+
+
+def test_protection_does_not_need_a_quarantine_to_exist(workspace: Path):
+    """It stays where it is, so there is nothing to fall back on."""
+    repo = workspace / "repo"
+    cache = repo / "htmlcov"
+    cache.mkdir()
+    (cache / "junk.bin").write_bytes(b"0" * 4096)
+    (cache / ".env").write_text("DB=1", encoding="utf-8")
+
+    gt.clean_ignored(repo, "repo", config(clean={"ignored": True}), run(), None, gt.Git(repo))
+    gt.clean_tree(
+        repo,
+        "repo",
+        config(),
+        run(),
+        gt.Git(repo),
+        None,  # no quarantine
+        sensitive=gt.DEFAULTS["trash"]["sensitive"],
+        local_state=gt.DEFAULTS["clean"]["ignored_keep"],
+        holding=None,  # and nowhere to put anything
+    )
+    assert (cache / ".env").read_text(encoding="utf-8") == "DB=1"
+    assert not (cache / "junk.bin").exists()
+
+
+def test_a_thinned_directory_is_not_called_quarantined(workspace: Path, capsys):
+    """ "removed, keeping id_rsa in quarantine" contains the word quarantine."""
+    repo = workspace / "repo"
+    for name in ("one", "two", "three"):
+        (repo / name).mkdir()
+        (repo / name / "big.bin").write_bytes(b"0" * 100_000)
+        (repo / name / "id_rsa").write_text("K", encoding="utf-8")
+    (workspace / gt.CONFIG_NAMES[0]).write_text(
+        'clean:\n  extra_dirs: ["one", "two", "three"]\n', encoding="utf-8"
+    )
+
+    gt.main(["-C", str(workspace), "clean", "--apply"])
+    out = capsys.readouterr().out
+    assert "quarantined" not in out
+    assert "emptied out" in out
+
+
+def test_a_dry_run_predicts_both_totals(workspace: Path, capsys):
+    """The dry run under-reported the bytes that would stay behind."""
+    repo = workspace / "repo"
+    cache = repo / "htmlcov"
+    cache.mkdir()
+    (cache / "big.bin").write_bytes(b"0" * 300_000)
+    (cache / "id_rsa").write_bytes(b"k" * 200_000)
+
+    gt.main(["-C", str(workspace), "clean"])
+    dry = capsys.readouterr().out
+    gt.main(["-C", str(workspace), "clean", "--apply"])
+    applied = capsys.readouterr().out
+
+    def totals(text: str) -> list[str]:
+        after = text.split("Summary", 1)[-1]
+        return re.findall(r"([\d.]+ [KMG]?B)\s+(?:to free|freed|would stay|stayed)", after)
+
+    assert totals(dry) == totals(applied) != [], (dry, applied)
+
+
+def test_a_directory_held_back_is_reported_once(workspace: Path, capsys):
+    """One directory, two lines, and a held-back count of two."""
+    repo = workspace / "repo"
+    (repo / ".gitignore").write_text("htmlcov/\n", encoding="utf-8")
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-q", "-m", "ignore")
+    cache = repo / "htmlcov"
+    cache.mkdir()
+    (cache / "mytoken").symlink_to(workspace.parent / "elsewhere")
+    (workspace / gt.CONFIG_NAMES[0]).write_text("clean:\n  ignored: true\n", encoding="utf-8")
+
+    gt.main(["-C", str(workspace), "clean", "-v"])
+    out = capsys.readouterr().out
+    assert len([line for line in out.splitlines() if "htmlcov" in line]) == 1
+    assert "       1  directories" in out or "1  directories" in out
+
+
+COMMENT_AGREEMENT = [
+    "a: x 'y # z\n",
+    'a: 5 " # z\n',
+    "exclude:\n  - a 'b # c\n",
+    "a: it's fine  # note\n",
+    'a: "q" # c\n',
+    "a: 'q' # c\n",
+    'clean:\n  keep: ["a\\"b", c]\n',
+]
+
+
+@pytest.mark.parametrize("text", COMMENT_AGREEMENT)
+def test_a_quote_only_opens_where_a_value_can_begin(text: str):
+    """ "after a space" swallowed the comment in `a: x 'y # z`, silently."""
+    yaml = pytest.importorskip("yaml")
+    assert gt._parse_yaml_subset(text, "<t>") == yaml.safe_load(text), text
+
+
+@pytest.mark.parametrize("text", ["--- {jobs: 4}\n", "---jobs: 4\n"])
+def test_content_on_a_document_marker_line_is_refused(text: str):
+    """The line was dropped whole, so the config silently became empty."""
+    with pytest.raises(gt.Failure, match="not after ---"):
+        gt._parse_yaml_subset(text, "<t>")
+
+
+@pytest.mark.parametrize("text", ["---\njobs: 4\n", "jobs: 4\n...\n"])
+def test_a_bare_document_marker_is_still_fine(text: str):
+    assert gt._parse_yaml_subset(text, "<t>") == {"jobs": 4}
