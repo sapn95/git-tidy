@@ -36,12 +36,21 @@ Report what needs a human: credentials in remote URLs, detached HEADs,
 unpushed commits, repositories with no remote. Changes nothing.
 .TP
 .B run
-sync, prune, clean, trash and doctor, in that order. A run that applies
-anything also drops quarantines older than \fItrash.retention_days\fR.
+sync, prune, clean, trash and doctor, in that order. A
+.BR clean ,
+.B trash
+or
+.B run
+that applies anything also drops quarantines older than
+\fItrash.retention_days\fR; 0 keeps them for ever.
 .IP
-If three repositories in a row cannot be reached, the run stops rather than
-working through the rest on the same timeout, and points at the VPN, the proxy,
-DNS and the SSH agent.
+If three remotes in a row cannot be reached \(em remotes, not checkouts, and one
+fetch that works starts the count again \(em the run stops rather than working
+through the rest on the same timeout, and points at the VPN, the proxy, DNS and
+the SSH agent. This applies to
+.B sync
+as well. A repository that is gone, or one you may not read, is not the network
+and does not count.
 .B clean
 and
 .B trash

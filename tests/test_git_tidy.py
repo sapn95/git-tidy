@@ -5660,7 +5660,7 @@ def test_thinning_keeps_exactly_what_it_was_told_to(
     keep = [root / relative for relative in protected]
     junk_bytes = sum(4096 for relative in files if relative not in protected)
 
-    freed = gt._thin_out(root, keep)
+    freed, _ = gt._thin_out(root, keep)
 
     for relative in protected:
         assert (root / relative).is_file(), f"{name}: {relative} was deleted"
@@ -5678,7 +5678,7 @@ def test_thinning_keeps_a_protected_directory_whole(tmp_path: Path):
     (root / "creds" / "b").write_bytes(b"0" * 16)
     (root / "junk.bin").write_bytes(b"0" * 4096)
 
-    freed = gt._thin_out(root, [root / "creds"])
+    freed, _ = gt._thin_out(root, [root / "creds"])
     assert (root / "creds" / "inner" / "a").is_file()
     assert (root / "creds" / "b").is_file()
     assert not (root / "junk.bin").exists()
@@ -5708,10 +5708,11 @@ def test_thinning_reports_what_it_could_not_remove(tmp_path: Path):
     (root / "free.bin").write_bytes(b"0" * 2048)
     locked.chmod(0o555)
     try:
-        freed = gt._thin_out(root, [])
+        freed, problem = gt._thin_out(root, [])
         assert not (root / "free.bin").exists()
         assert (locked / "stuck.bin").is_file(), "could not be removed"
         assert freed == 2048, "and was not counted as freed"
+        assert problem, "and the caller is told, rather than reporting it emptied"
     finally:
         locked.chmod(0o755)
 
@@ -5868,7 +5869,9 @@ def _offline_workspace(root: Path, count: int) -> Path:
     space.mkdir()
     for number in range(count):
         git(space, "clone", "-q", str(origin), f"r{number}")
-        git(space / f"r{number}", "remote", "set-url", "origin", "https://x.invalid/r.git")
+        # A distinct host each: the give-up counts unreachable *remotes*, and
+        # one dead URL cloned six times is one dead URL.
+        git(space / f"r{number}", "remote", "set-url", "origin", f"https://x{number}.invalid/r")
     return space
 
 
@@ -5878,7 +5881,7 @@ def test_a_run_stops_once_the_network_is_clearly_the_problem(tmp_path: Path, cap
 
     assert gt.main(["-C", str(space), "sync", "--apply", "-j", "1"]) == 1
     out = capsys.readouterr().out
-    assert "could not reach the remote for 3 repositories" in out
+    assert "could not reach 3 remotes in a row" in out
     assert "VPN" in out and "proxy" in out
     attempted = [line for line in out.splitlines() if line.lstrip().startswith("! r")]
     assert len(attempted) == gt.OFFLINE_AFTER, attempted
@@ -5932,3 +5935,145 @@ def test_local_state_covers_both_lists():
     both = gt.local_state_of(gt.DEFAULTS["clean"])
     assert set(gt.DEFAULTS["clean"]["ignored_keep"]) <= set(both)
     assert set(gt.DEFAULTS["clean"]["keep"]) <= set(both)
+
+
+# --------------------------------------------------------------------------- #
+# Claude review, round thirteen
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("days", [0, -1])
+def test_expire_never_runs_without_a_positive_retention(tmp_path: Path, days: int):
+    """0 meant "cutoff = now", so `restore --expire` deleted everything.
+
+    A negative one moved the cutoff into the future and took the quarantine the
+    running command had just written, before its manifest was even flushed.
+    """
+    root = tmp_path / gt.QUARANTINE_DIRNAME
+    fresh = root / "20990101T000000Z"
+    fresh.mkdir(parents=True)
+    (fresh / gt.MANIFEST_NAME).write_text("{}", encoding="utf-8")
+
+    assert gt.expire_quarantines(root, days, run()) == []
+    assert fresh.exists()
+
+
+@pytest.mark.parametrize("key", ["retention_days", "min_age_days"])
+def test_a_negative_count_is_refused_where_it_is_written(key: str):
+    with pytest.raises(gt.Failure, match="cannot be negative"):
+        gt._merge(gt.DEFAULTS, {"trash": {key: -1}}, "test")
+
+
+def test_a_403_is_that_repositorys_problem_not_the_networks():
+    """git prefixes every HTTP failure with "unable to access", 403 included."""
+    forbidden = "fatal: unable to access 'https://x/y.git/': The requested URL returned error: 403"
+    assert gt.looks_unreachable(forbidden) is False
+    assert gt.looks_unreachable("fatal: unable to access 'https://x/': Could not resolve host: x")
+
+
+def test_a_successful_fetch_resets_the_offline_count(tmp_path: Path):
+    """ "Three in a row" was "three ever", so three dead remotes anywhere in a
+    256-repository workspace abandoned every run from then on."""
+    context = gt.Context(
+        workspace=tmp_path,
+        resolver=gt.ConfigResolver(tmp_path, {}),
+        decider=run(),
+        printer=quiet_printer(),
+        repos=[],
+        quarantine=gt.Quarantine(tmp_path / gt.QUARANTINE_DIRNAME, tmp_path),
+    )
+    for number in range(gt.OFFLINE_AFTER - 1):
+        context.note_unreachable(f"https://dead{number}/", "Could not resolve host")
+    assert not context.giving_up
+    context.note_reachable()
+    context.note_unreachable("https://dead9/", "Could not resolve host")
+    assert not context.giving_up, "the count starts again after one that worked"
+
+
+def test_one_unreachable_remote_is_counted_once(tmp_path: Path):
+    """A repository and its linked worktrees all fetch the same remote."""
+    context = gt.Context(
+        workspace=tmp_path,
+        resolver=gt.ConfigResolver(tmp_path, {}),
+        decider=run(),
+        printer=quiet_printer(),
+        repos=[],
+        quarantine=gt.Quarantine(tmp_path / gt.QUARANTINE_DIRNAME, tmp_path),
+    )
+    for _ in range(gt.OFFLINE_AFTER + 2):
+        context.note_unreachable("https://one-remote/", "Could not resolve host")
+    assert not context.giving_up, "one remote, however many checkouts of it"
+
+
+def test_a_partly_finished_run_does_not_claim_nothing_changed(tmp_path: Path, capsys):
+    """It printed "Nothing was changed" two lines above "3 fast-forwarded"."""
+    origin = tmp_path / "origin.git"
+    git(tmp_path, "init", "--bare", "-q", "-b", "main", str(origin))
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    git(seed, "init", "-q", "-b", "main")
+    commit(seed, "README.md", "hello\n")
+    git(seed, "remote", "add", "origin", str(origin))
+    git(seed, "push", "-q", "-u", "origin", "main")
+    space = tmp_path / "space"
+    space.mkdir()
+    # a- before z-, so the working ones are reached first and there is
+    # something to have been changed by the time the network gives out.
+    for number in range(gt.OFFLINE_AFTER + 1):
+        git(space, "clone", "-q", str(origin), f"a-ok{number}")
+    for number in range(gt.OFFLINE_AFTER):
+        git(space, "clone", "-q", str(origin), f"z-bad{number}")
+        git(space / f"z-bad{number}", "remote", "set-url", "origin", f"https://x{number}.invalid/r")
+
+    gt.main(["-C", str(space), "sync", "--apply", "-j", "1"])
+    out = capsys.readouterr().out
+    assert "Nothing was changed" not in out
+    assert "already been fetched" in out
+
+
+def test_a_thin_out_that_could_not_finish_says_so(workspace: Path, capsys):
+    """It reported "emptied out" and the full size freed, with 97 KB still there."""
+    repo = workspace / "repo"
+    (repo / ".gitignore").write_text("scratch/\n", encoding="utf-8")
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-q", "-m", "ignore")
+    scratch = repo / "scratch"
+    (scratch / "locked").mkdir(parents=True)
+    (scratch / "locked" / "big.bin").write_bytes(b"0" * 40960)
+    (scratch / ".env").write_text("SECRET", encoding="utf-8")
+    (workspace / gt.CONFIG_NAMES[0]).write_text("clean:\n  ignored: true\n", encoding="utf-8")
+    (scratch / "locked").chmod(0o555)
+    try:
+        gt.main(["-C", str(workspace), "clean", "--apply"])
+        out = capsys.readouterr().out
+        assert "failed" in out
+        assert (scratch / "locked" / "big.bin").exists()
+        assert (scratch / ".env").read_text(encoding="utf-8") == "SECRET"
+    finally:
+        (scratch / "locked").chmod(0o755)
+
+
+def test_nothing_expires_when_the_run_applied_nothing(workspace: Path):
+    """ "a clean that applies anything", says the README and the man page."""
+    old = workspace / gt.QUARANTINE_DIRNAME / "20240101T000000Z"
+    old.mkdir(parents=True)
+    (old / gt.MANIFEST_NAME).write_text("{}", encoding="utf-8")
+    os.utime(old, (0, 0))
+    (workspace / gt.CONFIG_NAMES[0]).write_text("clean:\n  enabled: false\n", encoding="utf-8")
+
+    gt.main(["-C", str(workspace), "clean", "--apply"])
+    assert old.exists()
+
+
+@pytest.mark.parametrize("text", ["jobs: 4\t\n", "jobs: 4\x00\n", "[a]: 1\n", "{a: b}: 1\n"])
+def test_the_parser_refuses_what_pyyaml_refuses_here_too(text: str):
+    """A tab outside the indentation ran fine on every shipped binary.
+
+    A flow collection as a key was worse: an unhashable dict key is a bare
+    TypeError rather than anything a person can act on.
+    """
+    yaml = pytest.importorskip("yaml")
+    with pytest.raises(Exception):  # noqa: B017 - the point is that it does not parse
+        yaml.safe_load(text)
+    with pytest.raises(gt.Failure):
+        gt._parse_yaml_subset(text, "<t>")
