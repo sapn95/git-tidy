@@ -197,6 +197,20 @@ Changes nothing. Reports:
 - detached HEADs, commits that exist only locally, repositories with no remote,
   and a `.git` big enough to be worth a `git gc`.
 
+`doctor --fix` (also `run --fix`) carries out the three of those that cannot
+cost a commit: it puts a detached HEAD back on the trunk, takes the credential
+out of a remote URL, and packs an oversized `.git`. Like everything else it is a
+dry run until `--apply`, and `--ask` still asks per repository.
+
+It stops short wherever the answer is a decision rather than a command. A
+detached HEAD is only moved when the commit it sits on is already contained in
+the trunk — otherwise that detached HEAD *is* the work, and switching away would
+leave it reachable from nothing but the reflog. It will not move one with
+uncommitted changes, or when the trunk is checked out in another worktree.
+Unpushed commits, branches that exist only locally and repositories with no
+remote are never touched by `--fix`: only you know whether those should be
+pushed or dropped.
+
 ## Modes
 
 | Flag        | Behaviour                                                                                                |

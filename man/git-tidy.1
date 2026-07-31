@@ -33,7 +33,26 @@ manifest. Off until a config turns it on.
 .TP
 .B doctor
 Report what needs a human: credentials in remote URLs, detached HEADs,
-unpushed commits, repositories with no remote. Changes nothing.
+unpushed commits, repositories with no remote. Changes nothing, unless
+.B \-\-fix
+says otherwise.
+.TP
+.B \-\-fix
+On
+.B doctor
+or
+.BR run :
+also carry out the remedies that cannot cost a commit \(em put a detached HEAD
+back on the trunk, take the credential out of a remote URL, pack an oversized
+.IR .git .
+Still a dry run until \fB\-\-apply\fR.
+.IP
+A detached HEAD is only moved when its commit is already contained in the trunk;
+otherwise that HEAD is the work, and switching away would leave it reachable
+from the reflog alone. Not moved either with uncommitted changes, or when the
+trunk is checked out in another worktree. Unpushed commits and local-only
+branches are never touched: only you know whether they should be pushed or
+dropped.
 .TP
 .B run
 sync, prune, clean, trash and doctor, in that order. A

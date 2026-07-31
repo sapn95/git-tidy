@@ -4188,6 +4188,22 @@ def _trash_candidates(
 # --------------------------------------------------------------------------- #
 
 
+def without_credential(url: str) -> str | None:
+    """The same URL with the user and secret taken out, or None if there is none.
+
+    Built from the match rather than substituted into: `sub(r"\\1", url)` looked
+    right and quietly ate the `://` along with the credential, leaving a remote
+    reading `httpsexample.invalid/r.git`. The user is dropped as well as the
+    password — git's credential helper and the SSH agent are what should be
+    holding both, and a username left in a URL still pins the clone to one
+    account.
+    """
+    match = CREDENTIAL_IN_URL.match(url)
+    if not match:
+        return None
+    return f"{match.group('scheme')}://" + url[match.end() :]
+
+
 def redact(url: str) -> str:
     """Hide the secret in a URL so a report can be pasted somewhere."""
     match = CREDENTIAL_IN_URL.match(url)
@@ -4196,8 +4212,20 @@ def redact(url: str) -> str:
     return f"{match.group('scheme')}://{match.group('user')}:***@" + url[match.end() :]
 
 
-def doctor_repo(path: Path, name: str, cfg: dict[str, Any]) -> list[Action]:
-    """Report the things that need a decision rather than a command."""
+def doctor_repo(
+    path: Path,
+    name: str,
+    cfg: dict[str, Any],
+    fix: Decider | None = None,
+) -> list[Action]:
+    """Report the things that need a decision rather than a command.
+
+    With `fix`, also carry out the three remedies that cannot cost a commit:
+    put a detached HEAD back on its branch, take a credential out of a remote
+    URL, and pack an oversized .git. Everything else doctor reports — unpushed
+    commits, a branch that exists only here, no remote at all — is a decision
+    somebody has to make, and is still only reported.
+    """
     checks = cfg["doctor"]
     git = Git(path, timeout=int(cfg["sync"]["timeout"]))
     actions: list[Action] = []
@@ -4206,10 +4234,9 @@ def doctor_repo(path: Path, name: str, cfg: dict[str, Any]) -> list[Action]:
     # they matter most: nothing in it is pushed anywhere, and sync leaves it
     # alone, so a detached HEAD there stays detached.
     if checks["detached_head"] and not current_branch(git):
-        commit = git.out("rev-parse", "--short", "HEAD", check=False)
-        actions.append(Action("doctor", name, "HEAD", f"detached at {commit}", skipped=True))
+        actions.append(_detached(git, name, cfg, fix))
     if checks["large_git_mb"]:
-        actions += _check_git_size(git, name, checks["large_git_mb"])
+        actions += _check_git_size(git, name, checks["large_git_mb"], fix)
 
     remotes = git.out("remote", check=False).split()
     if not remotes:
@@ -4218,28 +4245,99 @@ def doctor_repo(path: Path, name: str, cfg: dict[str, Any]) -> list[Action]:
         return actions
 
     if checks["credentials_in_url"]:
-        actions += _check_credentials(git, name, remotes)
+        actions += _check_credentials(git, name, remotes, fix)
     if checks["unpushed"]:
         actions += _check_unpushed(git, name, cfg["sync"])
     return actions
 
 
-def _check_credentials(git: Git, name: str, remotes: Sequence[str]) -> list[Action]:
+def _detached(git: Git, name: str, cfg: dict[str, Any], fix: Decider | None) -> Action:
+    """A HEAD that is on no branch, and the way back to one.
+
+    Only when the commit it is sitting on is already contained in that branch:
+    otherwise the detached HEAD *is* the work, and switching away would leave it
+    reachable from nothing but the reflog. That is the line between this and
+    the things doctor only reports.
+    """
+    commit = git.out("rev-parse", "--short", "HEAD", check=False)
+    detail = f"detached at {commit}"
+    if fix is None:
+        return Action("doctor", name, "HEAD", detail, skipped=True)
+
+    trunk = default_branch(git, cfg["sync"], readonly=True)
+    if trunk is None:
+        return Action(
+            "doctor", name, "HEAD", f"{detail}, and no branch to go back to", skipped=True
+        )
+    if is_dirty(git):
+        return Action("doctor", name, "HEAD", f"{detail}, with uncommitted changes", skipped=True)
+    head = f"refs/heads/{trunk}"
+    if not git.ok("merge-base", "--is-ancestor", "HEAD", head):
+        return Action(
+            "doctor", name, "HEAD", f"{detail}, and those commits are not in {trunk}", skipped=True
+        )
+    elsewhere = _checked_out_elsewhere(git, trunk)
+    if elsewhere is not None:
+        return Action(
+            "doctor",
+            name,
+            "HEAD",
+            f"{detail}, and {trunk} is in use by the worktree {elsewhere}",
+            skipped=True,
+        )
+
+    action = Action("fix", name, "HEAD", f"switch back to {trunk} from a detached {commit}")
+    if not fix.allow(action):
+        return action
+    result = git.run("switch", trunk, check=False)
+    if result.returncode != 0:
+        action.error = last_line(result)
+        return action
+    action.applied = True
+    action.detail = f"switched back to {trunk} from a detached {commit}"
+    return action
+
+
+def _check_credentials(
+    git: Git, name: str, remotes: Sequence[str], fix: Decider | None = None
+) -> list[Action]:
     """A token in a remote URL is a secret sitting in plain text in .git/config."""
     found: list[Action] = []
     for remote in remotes:
         url = git.out("remote", "get-url", remote, check=False)
-        if CREDENTIAL_IN_URL.match(url):
-            found.append(
-                Action(
-                    "doctor",
-                    name,
-                    remote,
-                    f"credential in the remote URL — {redact(url)}",
-                    skipped=True,
-                )
-            )
+        if not CREDENTIAL_IN_URL.match(url):
+            continue
+        detail = f"credential in the remote URL — {redact(url)}"
+        if fix is None:
+            found.append(Action("doctor", name, remote, detail, skipped=True))
+            continue
+        found.append(_strip_credential(git, name, remote, url, detail, fix))
     return found
+
+
+def _strip_credential(
+    git: Git, name: str, remote: str, url: str, detail: str, fix: Decider
+) -> Action:
+    """Rewrite the remote without the credential in it.
+
+    Reversible in the only sense that matters: the URL is printed, redacted,
+    before and after, and git's credential helper or the SSH agent is what
+    should have been holding it anyway. It does not touch a single commit.
+    """
+    action = Action("fix", name, remote, f"take the credential out of the {remote} URL")
+    if not fix.allow(action):
+        return action
+    stripped = without_credential(url)
+    if stripped is None or stripped == url:  # pragma: no cover - it matched to get here
+        action.error = "could not work out the URL without the credential"
+        return action
+    result = git.run("remote", "set-url", remote, stripped, check=False)
+    if result.returncode != 0:
+        action.error = last_line(result)
+        return action
+    action.applied = True
+    action.detail = f"credential taken out of the {remote} URL, now {stripped}"
+    return action
 
 
 def _check_unpushed(git: Git, name: str, sync: dict[str, Any]) -> list[Action]:
@@ -4303,7 +4401,7 @@ def _never_pushed(
     ]
 
 
-def _check_git_size(git: Git, name: str, limit_mb: int) -> list[Action]:
+def _check_git_size(git: Git, name: str, limit_mb: int, fix: Decider | None = None) -> list[Action]:
     """How big .git is, from git's own accounting rather than by walking it.
 
     `directory_size` would stat every loose object in every repository, which on
@@ -4318,7 +4416,27 @@ def _check_git_size(git: Git, name: str, limit_mb: int) -> list[Action]:
     megabytes = kib // 1024
     if megabytes < limit_mb:
         return []
-    return [Action("doctor", name, ".git", f"{megabytes} MB — consider git gc", skipped=True)]
+    if fix is None:
+        return [Action("doctor", name, ".git", f"{megabytes} MB — consider git gc", skipped=True)]
+    action = Action("fix", name, ".git", f"pack .git with git gc, {megabytes} MB")
+    if not fix.allow(action):
+        return [action]
+    # --prune=now only drops what is already unreachable, and never a reflog
+    # entry younger than gc.reflogExpire, which is how an accidental reset stays
+    # recoverable. Deliberately not --aggressive: minutes per repository.
+    result = git.run("gc", "--quiet", check=False)
+    if result.returncode != 0:
+        action.error = last_line(result)
+        return [action]
+    action.applied = True
+    after = 0
+    for line in git.out("count-objects", "-v", check=False).splitlines():
+        field, _, value = line.partition(": ")
+        if field in ("size", "size-pack", "size-garbage") and value.strip().isdigit():
+            after += int(value)
+    action.size = max(0, (kib - after) * 1024)
+    action.detail = f"packed, {megabytes} MB down to {after // 1024} MB"
+    return [action]
 
 
 # --------------------------------------------------------------------------- #
@@ -4452,6 +4570,7 @@ class Printer:
 # How each kind of action reads in the summary, in the order it is listed.
 DID: tuple[tuple[str, str, str], ...] = (
     # kind, what happened, what would happen
+    ("fix", "repositories put right", "repositories to put right"),
     ("fetch", "repositories fetched", "repositories to fetch"),
     ("switch", "branches switched", "branches to switch"),
     ("update", "repositories fast-forwarded", "repositories to fast-forward"),
@@ -4584,6 +4703,8 @@ REASONS: tuple[tuple[str, str], ...] = (
     ("a dependency tree", "dependency trees — clean.dependencies is off"),
     ("build output", "build output — clean.builds is off"),
     ("orphaned worktree", "orphaned worktrees — the parent pruned them away"),
+    ("are not in", "detached HEADs holding commits that are on no branch"),
+    ("no branch to go back to", "detached HEADs with no branch to return to"),
     ("nothing in the quarantine", "nothing left to restore"),
     ("cannot be read", "directories with something in them nobody can read"),
     ("protected symlink", "directories holding a symlink named like a credential"),
@@ -4648,6 +4769,9 @@ class Context:
     # sees the same broken directory, and four identical lines for one of them
     # made five orphans read as twenty.
     report_orphans: bool = False
+    # The decider doctor is allowed to act through, or None when it is only
+    # reporting — which is the default, and what `doctor` has always been.
+    fix: Decider | None = None
     # Fetches that failed for a reason that is about the network rather than
     # about the repository, and the lock that guards the count.
     unreachable: set[str] = field(default_factory=set)
@@ -5184,7 +5308,7 @@ def cmd_doctor(context: Context, report: Report) -> None:
         cfg = context.config_for(repo)
         if not cfg["doctor"]["enabled"]:
             return []
-        return doctor_repo(repo, context.name_of(repo), cfg)
+        return doctor_repo(repo, context.name_of(repo), cfg, context.fix)
 
     _in_parallel(context, work, report)
 
@@ -5430,6 +5554,16 @@ def build_parser() -> argparse.ArgumentParser:
     ):
         command(name, help_text)
 
+    for name in ("doctor", "run"):
+        # On run as well, because run *is* doctor among other things, and having
+        # to type the step out separately to fix what it just reported is the
+        # kind of thing nobody does twice.
+        sub.choices[name].add_argument(
+            "--fix",
+            action="store_true",
+            help="also put right what doctor reports and can fix without risking a commit",
+        )
+
     config_cmd = command("config", "print the effective configuration")
     config_cmd.add_argument("path", nargs="?", help="show the config that applies to this path")
 
@@ -5451,6 +5585,7 @@ def build_parser() -> argparse.ArgumentParser:
     restore_cmd.add_argument(
         "--expire", action="store_true", help="delete quarantines past trash.retention_days"
     )
+
     return parser
 
 
@@ -5708,6 +5843,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     printer.line(f"{workspace}: {plural(len(repos), 'repository')}{suffix.get(args.mode, '')}")
     quarantine = Quarantine(quarantine_root, workspace)
     context = Context(workspace, resolver, decider, printer, repos, quarantine)
+    # doctor reports by default and always has. --fix hands it the same decider
+    # every other step uses, so -n still prints what it would do, --ask still
+    # asks, and --apply is the only way anything happens.
+    context.fix = decider if getattr(args, "fix", False) else None
     report = Report()
 
     steps: dict[str, list[Callable[[Context, Report], None]]] = {
