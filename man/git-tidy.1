@@ -93,6 +93,17 @@ or
 and cannot remove a tracked file, follow a symlink or reach outside the
 workspace. Pair it with \-\-ask the first time.
 .IP
+.I clean.ignored_keep
+has one carve-out, which
+.I trash.sensitive
+does not: inside a path named in
+.IR clean.regenerable ,
+it does not apply. Those are caches a tool rebuilds, and every
+.I .terraform
+holds a
+.I terraform.tfstate
+that is the backend pointer rather than your state.
+.IP
 A file with a source-code extension is exempt from
 .I trash.sensitive
 alone: a
