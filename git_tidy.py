@@ -1638,6 +1638,37 @@ def sync_repo(path: Path, name: str, cfg: dict[str, Any], decider: Decider) -> l
     return actions
 
 
+# Substrings of git's own message that mean "this is the network, not this
+# repository". Kept narrow on purpose: a wrong guess here would abandon a run
+# over one broken remote URL.
+OFFLINE_SIGNS = (
+    "could not resolve host",
+    "could not resolve hostname",
+    "connection timed out",
+    "connection refused",
+    "connection reset",
+    "network is unreachable",
+    "no route to host",
+    "operation timed out",
+    "failed to connect",
+    "proxy connect",
+    "ssl connect error",
+    "timed out after",
+    "temporary failure in name resolution",
+    "unable to access",
+    "kex_exchange_identification",
+    "port 22: ",
+)
+# How many in a row before it is the network rather than the repositories.
+OFFLINE_AFTER = 3
+
+
+def looks_unreachable(message: str) -> bool:
+    """Whether a failed fetch says more about the network than the repository."""
+    lowered = message.lower()
+    return any(sign in lowered for sign in OFFLINE_SIGNS)
+
+
 def _sync_from(
     git: Git,
     name: str,
@@ -2148,6 +2179,11 @@ def _unstash(git: Git) -> str:
             return "your work is back, but what was staged is no longer staged"
     if result.returncode == 0:
         return "nothing changed"
+    if "No stash entries found" in result.stdout + result.stderr:
+        # Saying "your changes are in the stash" here was a contradiction, and
+        # the alarming half of it was the wrong half: there is no stash because
+        # something else already popped it.
+        return "the stash was already empty; check `git stash list` and the reflog"
     return f"your changes are in the stash: {last_line(result)}"
 
 
@@ -2234,7 +2270,12 @@ def _diverged(
         stashed, problem = _stash(git, name)
         if problem is not None:
             return [problem]
-    result = git.run("rebase", "--autostash", upstream, check=False)
+    # No --autostash: _stash has already put the work aside when there was any,
+    # and letting git stash it too means two entries pushed and popped in an
+    # order neither side agrees on. On an abort ours was already gone, and the
+    # report said "your changes are in the stash: No stash entries found" —
+    # which cannot both be true, and is a frightening thing to read.
+    result = git.run("rebase", upstream, check=False)
     if result.returncode != 0:
         # Leave nothing half-applied: a conflicted rebase in 200 repositories is
         # far worse than a report saying it did not happen.
@@ -4549,6 +4590,46 @@ class Context:
     # sees the same broken directory, and four identical lines for one of them
     # made five orphans read as twenty.
     report_orphans: bool = False
+    # Fetches that failed for a reason that is about the network rather than
+    # about the repository, and the lock that guards the count.
+    unreachable: list[str] = field(default_factory=list)
+    last_unreachable: str = ""
+    _offline_lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def note_unreachable(self, name: str, message: str) -> None:
+        """Record a fetch that failed for a reason that is about the network.
+
+        Recorded, not raised: _guarded turns a Failure from one repository into
+        that repository's error line, which is exactly right for a broken remote
+        and exactly wrong for this. giving_up is read between items instead.
+        """
+        with self._offline_lock:
+            self.unreachable.append(name)
+            self.last_unreachable = message
+
+    @property
+    def giving_up(self) -> bool:
+        """Whether enough fetches have failed on the network to stop trying.
+
+        256 repositories times a 120-second timeout is eight and a half hours of
+        waiting to be told the VPN is off. Three is enough: a real remote-side
+        outage looks the same from here, and stopping is right for that too.
+        """
+        with self._offline_lock:
+            return len(self.unreachable) >= OFFLINE_AFTER
+
+    def offline_failure(self) -> Failure:
+        with self._offline_lock:
+            count, message = len(self.unreachable), self.last_unreachable
+        return Failure(
+            f"could not reach the remote for {plural(count, 'repository')}, so the rest "
+            f"were left alone rather than waiting on the same timeout.\n"
+            f"  Last error: {message}\n"
+            "  Check the VPN, the proxy (http_proxy, https_proxy and git's own "
+            "http.proxy), DNS, and your SSH agent.\n"
+            "  Nothing needing the network was changed. `git-tidy clean` and "
+            "`git-tidy trash` do not need it."
+        )
 
     def name_of(self, repo: Path) -> str:
         return repo.relative_to(self.workspace).as_posix()
@@ -4598,14 +4679,20 @@ def _in_parallel(context: Context, work: Callable[[Path], list[Action]], report:
     jobs = context.jobs
     if jobs <= 1:
         for repo in context.repos:
+            if context.giving_up:
+                break
             results = _guarded(work, repo, context)
             report.extend(results)
             context.printer.batch(results)
+        if context.giving_up:
+            raise context.offline_failure()
         return
 
     def whole_family(family: list[Path]) -> list[Action]:
         found: list[Action] = []
         for repo in family:
+            if context.giving_up:
+                break
             found.extend(_guarded(work, repo, context))
         return found
 
@@ -4621,6 +4708,8 @@ def _in_parallel(context: Context, work: Callable[[Path], list[Action]], report:
             for future in futures:
                 future.cancel()
             raise
+    if context.giving_up:
+        raise context.offline_failure()
 
 
 def _guarded(work: Callable[[Path], list[Action]], repo: Path, context: Context) -> list[Action]:
@@ -4665,7 +4754,16 @@ def cmd_sync(context: Context, report: Report) -> None:
         cfg = context.config_for(repo)
         if not cfg["sync"]["enabled"]:
             return []
-        return sync_repo(repo, context.name_of(repo), cfg, context.decider)
+        name = context.name_of(repo)
+        actions = sync_repo(repo, name, cfg, context.decider)
+        # Checked here rather than inside sync_repo, which knows nothing about
+        # the run as a whole. note_unreachable raises once enough of them agree,
+        # and that unwinds the pool the same way a Failure from anywhere else
+        # does — with everything already done reported.
+        for action in actions:
+            if action.kind == "fetch" and action.error and looks_unreachable(action.error):
+                context.note_unreachable(name, action.error)
+        return actions
 
     _in_parallel(context, work, report)
     by_name = {context.name_of(repo): repo for repo in context.repos}
@@ -5010,7 +5108,15 @@ def _number(question: str, default: str, prompt_input: Callable[[str], str] | No
 def _interview(printer: Printer, prompt_input: Callable[[str], str] | None) -> dict[str, Any]:
     """The handful of questions whose answers actually differ between people."""
     chosen: dict[str, Any] = {}
-    jobs = _number("Workers? 0 = one per CPU core", str(DEFAULTS["jobs"]), prompt_input)
+    # Says what 0 will actually do on this machine. "[0]" on its own reads like
+    # the wrong answer to "how many workers?" — and writing the number instead
+    # would pin it, so the config stops following the machine it is copied to.
+    here = worker_count(DEFAULTS["jobs"])
+    jobs = _number(
+        f"Workers? 0 = one per CPU core, so {here} here",
+        str(DEFAULTS["jobs"]),
+        prompt_input,
+    )
     worker_count(jobs)  # refuse here rather than on every later run
     if jobs != DEFAULTS["jobs"]:
         chosen["jobs"] = jobs
@@ -5022,6 +5128,11 @@ def _interview(printer: Printer, prompt_input: Callable[[str], str] | None) -> d
         chosen.setdefault("clean", {})["builds"] = True
     if not ask_yes_no("Delete branches whose upstream is gone?", True, prompt_input):
         chosen.setdefault("branches", {})["prune_gone"] = False
+    if ask_yes_no("Stash uncommitted changes so a repository can be updated?", False, prompt_input):
+        # The report says which stash holds it, and nothing is discarded — but
+        # it is still the one answer here that moves somebody's work, so it is
+        # asked rather than left to be discovered in the config file.
+        chosen.setdefault("sync", {})["stash"] = True
     if ask_yes_no("Rebase repositories that have diverged?", False, prompt_input):
         chosen.setdefault("sync", {})["diverged"] = "rebase"
     if ask_yes_no("Sweep loose junk files in the workspace?", False, prompt_input):
@@ -5360,6 +5471,37 @@ def resolve_workspace(raw: str) -> Path:
     return workspace
 
 
+def _expire_old_quarantines(
+    context: Context, report: Report, cfg: dict[str, Any], command: str
+) -> None:
+    """Drop quarantines past trash.retention_days, at the end of a run.
+
+    Expiring only ever happened when somebody typed `restore --expire`, so a
+    daily `git-tidy run --apply` grew the quarantine without bound — which is
+    the opposite of a tool whose first promise is disk space back. Only the
+    steps that can *write* one clear old ones, so `doctor` and `config` still
+    change nothing at all.
+
+    Everything the manual path checks still applies: only directories this tool
+    wrote, only past their retention, reported and refusable like any other
+    removal.
+    """
+    if command not in ("clean", "trash", "run"):
+        return
+    days = cfg["trash"]["retention_days"]
+    if not days:
+        return
+    root = context.workspace / QUARANTINE_DIRNAME
+    if not root.is_dir():
+        return
+    expired = expire_quarantines(root, days, context.decider)
+    fresh = [a for a in expired if not a.skipped or a.error]
+    if fresh:
+        context.printer.heading("Quarantines past their retention")
+        report.extend(fresh)
+        context.printer.batch(fresh)
+
+
 def _excludes_itself(repo: Path, root: Path, resolver: ConfigResolver) -> bool:
     """Whether a repository's own config asks to be left out.
 
@@ -5464,6 +5606,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         for step in steps[args.command]:
             step(context, report)
+        _expire_old_quarantines(context, report, root_cfg, args.command)
     except Quit as quit_now:
         interrupted = True
         report.extend(quit_now.done)

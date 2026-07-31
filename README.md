@@ -156,12 +156,27 @@ Everything swept is **moved to a quarantine**, not deleted, with a manifest:
 ```bash
 git-tidy restore --list          # what is in there
 git-tidy restore --apply         # put the newest sweep back
-git-tidy restore --expire --apply  # drop quarantines past trash.retention_days
+git-tidy restore --expire --apply  # drop them now, without waiting for a run
 ```
+
+A `clean`, `trash` or `run` that applies anything also drops the quarantines
+older than `trash.retention_days` (30 by default; `0` switches it off), so a
+daily run does not leave the workspace growing a second copy of everything it
+ever removed. `doctor` and `config` still change nothing at all.
 
 Files that look like credentials — `*.pw`, `*.secret`, `*.pem`, `*creds*`,
 `*token*` — are always quarantined rather than deleted, even with quarantine
 switched off. A token on disk may be the only copy.
+
+### when the network is the problem
+
+If three repositories in a row cannot be reached, the run stops instead of
+working through the rest on the same timeout — 256 repositories at the default
+120 seconds is most of a working day — and says to check the VPN, the proxy
+(`http_proxy`, `https_proxy`, and git's own `http.proxy`), DNS and the SSH
+agent. Only errors that are about the network count: a repository that is
+simply gone, or a permission denial, is that repository's problem and the run
+carries on. `clean` and `trash` do not need the network at all.
 
 ### doctor
 
