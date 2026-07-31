@@ -87,9 +87,23 @@ is discarded \(em the report says which stash holds the work.
 It deliberately cannot delete a directory containing a git repository \(em
 except the caches named in \fIclean.regenerable\fR, whose nested repositories
 are a tool's own clones \(em cannot hard-delete anything matching
-.IR trash.sensitive ,
+.I trash.sensitive
+or
+.IR clean.ignored_keep ,
 and cannot remove a tracked file, follow a symlink or reach outside the
 workspace. Pair it with \-\-ask the first time.
+.IP
+A file with a source-code extension is exempt from
+.I trash.sensitive
+alone: a
+.I tokenizer.js
+matches
+.I *token*
+and is not a secret. The exemption does not apply to
+.IR clean.ignored_keep ,
+whose entries name local files that are deliberately not in git \(em a
+.I secrets.py
+is exactly what that list is for.
 .TP
 .BR \-C ", " \-\-workspace " " \fIDIR\fR
 The directory holding the repositories. Defaults to the current one.
