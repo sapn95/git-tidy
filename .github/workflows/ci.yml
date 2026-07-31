@@ -152,6 +152,9 @@ jobs:
           test "$(git -C /tmp/space/repo rev-parse --abbrev-ref HEAD)" = main
       - name: a second run is a no-op
         run: ./git_tidy.py -C /tmp/space run --apply --json > /tmp/second.json
+      - name: every scenario that once lost data
+        run: bash scripts/regression_sweep.sh
+
       - name: unpushed work is never deleted
         run: |
           set -eux
