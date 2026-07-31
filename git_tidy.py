@@ -3512,7 +3512,16 @@ def restore(quarantine_root: Path, stamp: str | None, decider: Decider) -> list[
         if (p / MANIFEST_NAME).is_file() or (p / JOURNAL_NAME).is_file()
     )
     if not stamps:
-        raise Failure(f"no quarantine with a manifest under {quarantine_root}")
+        if stamp is not None:
+            # Named one, so the name is the thing to say — the vaguer "no
+            # quarantine with a manifest under <root>" sent people looking at
+            # the directory rather than at what they typed.
+            raise Failure(f"no quarantine {stamp!r} under {quarantine_root}")
+        # Nothing to put back is not an error, any more than it is for
+        # `restore --list`, which prints "no quarantines" and exits 0. A restore
+        # is a thing you run again after one already worked, and the second one
+        # should not fail.
+        return [Action("restore", "-", "-", "nothing in the quarantine", skipped=True)]
     chosen = stamp or stamps[-1]
     if chosen not in stamps:
         raise Failure(f"no quarantine {chosen!r}; available: {', '.join(stamps)}")
@@ -4476,6 +4485,7 @@ REASONS: tuple[tuple[str, str], ...] = (
     ("a dependency tree", "dependency trees — clean.dependencies is off"),
     ("build output", "build output — clean.builds is off"),
     ("orphaned worktree", "orphaned worktrees — the parent pruned them away"),
+    ("nothing in the quarantine", "nothing left to restore"),
     ("cannot be read", "directories with something in them nobody can read"),
     ("protected symlink", "directories holding a symlink named like a credential"),
     ("not yet", "quarantines not yet past trash.retention_days"),
