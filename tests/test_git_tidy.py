@@ -5902,3 +5902,33 @@ def test_one_broken_remote_does_not_abandon_the_run(tmp_path: Path, capsys):
     out = capsys.readouterr().out
     assert "could not reach the remote for" not in out
     assert "fine" in out
+
+
+def test_clean_keep_protects_a_file_inside_an_ignored_directory(workspace: Path):
+    """clean.keep named it by hand, and it was hard-deleted anyway.
+
+    switched_off_rules leaves ignored_keep and clean.keep to _remove on purpose
+    — refusing the whole directory for them is what made turning clean.ignored
+    on reclaim nothing — but only ignored_keep was ever handed over.
+    """
+    repo = workspace / "repo"
+    (repo / ".gitignore").write_text("scratch/\n", encoding="utf-8")
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-q", "-m", "ignore scratch")
+    (repo / "scratch" / "tmpfiles").mkdir(parents=True)
+    (repo / "scratch" / "tmpfiles" / "big.bin").write_bytes(b"0" * 4096)
+    kept = repo / "scratch" / "notes-i-need.md"
+    kept.write_text("HAND WRITTEN", encoding="utf-8")
+    (workspace / gt.CONFIG_NAMES[0]).write_text(
+        'clean:\n  ignored: true\n  keep:\n    - "notes-i-need.md"\n', encoding="utf-8"
+    )
+
+    gt.main(["-C", str(workspace), "clean", "--apply"])
+    assert kept.read_text(encoding="utf-8") == "HAND WRITTEN"
+    assert not (repo / "scratch" / "tmpfiles").exists(), "the junk around it still goes"
+
+
+def test_local_state_covers_both_lists():
+    both = gt.local_state_of(gt.DEFAULTS["clean"])
+    assert set(gt.DEFAULTS["clean"]["ignored_keep"]) <= set(both)
+    assert set(gt.DEFAULTS["clean"]["keep"]) <= set(both)
