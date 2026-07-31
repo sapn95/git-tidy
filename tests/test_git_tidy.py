@@ -5624,3 +5624,91 @@ def test_content_on_a_document_marker_line_is_refused(text: str):
 @pytest.mark.parametrize("text", ["---\njobs: 4\n", "jobs: 4\n...\n"])
 def test_a_bare_document_marker_is_still_fine(text: str):
     assert gt._parse_yaml_subset(text, "<t>") == {"jobs": 4}
+
+
+# --------------------------------------------------------------------------- #
+# _thin_out, over every shape of tree it can be handed
+# --------------------------------------------------------------------------- #
+
+THIN_SHAPES: list[tuple[str, list[str], list[str]]] = [
+    # name, files to create, which of them are protected
+    ("flat", ["a.bin", "b.bin", "id_rsa"], ["id_rsa"]),
+    ("nested", ["x/a.bin", "x/id_rsa", "y/b.bin"], ["x/id_rsa"]),
+    ("deep", ["a/b/c/d/.env", "a/b/junk.bin", "top.bin"], ["a/b/c/d/.env"]),
+    ("two kept, far apart", ["p/.env", "q/r/id_rsa", "s/j.bin"], ["p/.env", "q/r/id_rsa"]),
+    ("everything kept", ["id_rsa", "x/.env"], ["id_rsa", "x/.env"]),
+    ("kept beside its own junk", ["k/.env", "k/j.bin"], ["k/.env"]),
+    ("only junk under a kept path", ["k/.env", "k/deep/j.bin"], ["k/.env"]),
+    ("unicode and spaces", ["a b/ü.bin", "a b/id_rsa"], ["a b/id_rsa"]),
+]
+
+
+@pytest.mark.parametrize(
+    ("name", "files", "protected"), THIN_SHAPES, ids=[s[0] for s in THIN_SHAPES]
+)
+def test_thinning_keeps_exactly_what_it_was_told_to(
+    tmp_path: Path, name: str, files: list[str], protected: list[str]
+):
+    """Every protected path survives, nothing else does, and the total adds up."""
+    root = tmp_path / "tree"
+    for relative in files:
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"0" * (1024 if relative in protected else 4096))
+    keep = [root / relative for relative in protected]
+    junk_bytes = sum(4096 for relative in files if relative not in protected)
+
+    freed = gt._thin_out(root, keep)
+
+    for relative in protected:
+        assert (root / relative).is_file(), f"{name}: {relative} was deleted"
+    for relative in files:
+        if relative not in protected:
+            assert not (root / relative).exists(), f"{name}: {relative} survived"
+    assert freed == junk_bytes, name
+    assert root.is_dir(), f"{name}: the directory itself must remain"
+
+
+def test_thinning_keeps_a_protected_directory_whole(tmp_path: Path):
+    root = tmp_path / "tree"
+    (root / "creds" / "inner").mkdir(parents=True)
+    (root / "creds" / "inner" / "a").write_bytes(b"0" * 16)
+    (root / "creds" / "b").write_bytes(b"0" * 16)
+    (root / "junk.bin").write_bytes(b"0" * 4096)
+
+    freed = gt._thin_out(root, [root / "creds"])
+    assert (root / "creds" / "inner" / "a").is_file()
+    assert (root / "creds" / "b").is_file()
+    assert not (root / "junk.bin").exists()
+    assert freed == 4096
+
+
+def test_thinning_does_not_follow_a_symlink_out_of_the_tree(tmp_path: Path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "precious").write_text("REAL", encoding="utf-8")
+    root = tmp_path / "tree"
+    root.mkdir()
+    (root / "link").symlink_to(outside)
+    (root / "junk.bin").write_bytes(b"0" * 4096)
+
+    gt._thin_out(root, [])
+    assert (outside / "precious").read_text(encoding="utf-8") == "REAL"
+    assert not (root / "junk.bin").exists()
+
+
+def test_thinning_reports_what_it_could_not_remove(tmp_path: Path):
+    """A read-only parent stops one unlink; the rest still goes and nothing lies."""
+    root = tmp_path / "tree"
+    locked = root / "locked"
+    locked.mkdir(parents=True)
+    (locked / "stuck.bin").write_bytes(b"0" * 4096)
+    (root / "free.bin").write_bytes(b"0" * 2048)
+    locked.chmod(0o555)
+    try:
+        freed = gt._thin_out(root, [])
+        assert not (root / "free.bin").exists()
+        assert (locked / "stuck.bin").is_file(), "could not be removed"
+        assert freed == 2048, "and was not counted as freed"
+    finally:
+        locked.chmod(0o755)
