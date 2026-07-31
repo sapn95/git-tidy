@@ -12,9 +12,11 @@ different kind of care:
                     — but only once their commits are contained in the default
                     branch, so unpushed work is reported instead of dropped.
 
-  git-tidy clean    Remove build output and caches: everything .gitignore already
-                    calls disposable, plus .terraform, node_modules, __pycache__
-                    and whatever else the config names. Inside a repo, only
+  git-tidy clean    Remove build output and caches: .terraform, __pycache__,
+                    .pytest_cache and whatever else the config names, plus
+                    everything .gitignore calls disposable once clean.ignored is
+                    on. Dependency trees such as node_modules are off until
+                    clean.dependencies says otherwise. Inside a repo, only
                     untracked or ignored paths are eligible; a tracked file is
                     never deleted by accident.
 
@@ -358,7 +360,10 @@ COMMENTS: dict[str, str] = {
     "temp:  *~ *.swp *.swo *.orig *.rej *.bak *.tmp *.old. Note the last two:\n"
     "       with trash.dirs on, a project.old/ somebody parked goes whole.",
     "trash.sensitive": "Reported as sensitive and always quarantined rather than\n"
-    "deleted, even with quarantine off, because a token may be the only copy.",
+    "deleted, even with quarantine off, because a token may be the only copy.\n"
+    "A file with a source-code extension is exempt: pygments/token.py matches\n"
+    "*token* and is not a secret. Inside a directory that is being removed, the\n"
+    "matches are lifted into quarantine and the rest of it still goes.",
     "trash.min_age_days": "Nothing younger than this is touched, so today's scratch\n"
     "file survives.",
     "trash.keep": "Never swept, whatever else matches. patterns win over the\n"
@@ -775,9 +780,14 @@ def _flow_collection(token: str, source: str, number: int) -> Any:
     # An opening bracket with no closing one is a mistake, not a string that
     # happens to start with a bracket. Saying so beats silently reading
     # `keep: [main, release/*` as one long name.
-    if token.startswith("[") != token.endswith("]"):
+    #
+    # Only when it *opens* with one, though: `fixtures/[0-9]` merely ends with a
+    # bracket, is a perfectly ordinary fnmatch character class, and PyYAML reads
+    # it as the string it is. Refusing it here meant the config loaded from a
+    # checkout and failed on every shipped binary.
+    if token.startswith("[") and not token.endswith("]"):
         raise Failure(f"{source}:{number}: unbalanced [ ] in {token!r}")
-    if token.startswith("{") != token.endswith("}"):
+    if token.startswith("{") and not token.endswith("}"):
         raise Failure(f"{source}:{number}: unbalanced {{ }} in {token!r}")
     if token.startswith("["):
         return [_scalar(p, source, number) for p in _split_flow(token[1:-1], source, number)]
@@ -1274,23 +1284,54 @@ def orphaned_worktree(path: Path) -> str | None:
     return None if target.exists() else str(target)
 
 
+def cannot_look(path: Path) -> bool:
+    """True when `path` cannot be listed, so no answer about it is reliable.
+
+    Asked outright rather than inferred from an exception, because the two
+    supported interpreters disagree: Path.is_dir() raises PermissionError on
+    3.10 and 3.11 for a directory that cannot be read, and simply returns False
+    from 3.12 on. Neither "crash the run" nor "there is nothing in there" is
+    what an unreadable directory means to a guard deciding whether deleting
+    something would destroy a repository — and the same workspace behaving
+    differently on two interpreters is its own defect.
+    """
+    try:
+        with os.scandir(path):
+            return False
+    except OSError:
+        return True
+
+
 def is_repo(path: Path) -> bool:
-    """True for a work tree root. A .git *file* means a worktree or submodule."""
+    """True for a work tree root. A .git *file* means a worktree or submodule.
+
+    Strict on purpose: this answers "is this a checkout we can sync", and one
+    that cannot be read is not. holds_git_data is the guard, and it is not.
+    """
     dot_git = path / ".git"
-    return dot_git.is_dir() or dot_git.is_file()
+    try:
+        return dot_git.is_dir() or dot_git.is_file()
+    except OSError:
+        return False
 
 
 def holds_git_data(path: Path) -> bool:
-    """True for a repository in any form, bare included.
+    """True for a repository in any form, bare included — or possibly one.
 
     is_repo answers "is this a checkout we can sync", which a bare clone is not.
     This answers "would deleting this destroy a repository", which it certainly
     would: `git clone --bare` and `--mirror` leave no .git entry at all, so every
-    guard that looked for one walked straight past them.
+    guard that looked for one walked straight past them. A directory nobody can
+    list gets the same answer, for the same reason.
     """
     if is_repo(path):
         return True
-    return (path / "HEAD").is_file() and (path / "objects").is_dir() and (path / "refs").is_dir()
+    try:
+        if (path / "HEAD").is_file() and (path / "objects").is_dir():
+            return (path / "refs").is_dir()
+    except OSError:
+        return True
+    return cannot_look(path)
 
 
 def find_repos(root: Path, exclude: Sequence[str], follow_nested: bool = False) -> list[Path]:
@@ -1747,6 +1788,22 @@ def _make_room(
     return proposed
 
 
+def _why_uncountable(git: Git, upstream: str) -> str | None:
+    """Why `rev-list upstream...HEAD` came back empty, or None if it can be fixed.
+
+    The upstream ref being gone is the common case — a branch merged and deleted
+    on the remote — and naming it beats "cannot compare", which tells nobody
+    what to do. An unborn HEAD is the other: a clone of a repository that was
+    empty at the time has a branch with no commit on it, and that one is not a
+    problem at all, so it gets no message and is fast-forwarded like any other.
+    """
+    if not git.ok("show-ref", "--verify", "--quiet", f"refs/remotes/{upstream}"):
+        return f"upstream {upstream} no longer exists"
+    if git.ok("rev-parse", "--verify", "--quiet", "HEAD"):
+        return "cannot compare with upstream"
+    return None
+
+
 def _fast_forward(
     git: Git,
     name: str,
@@ -1769,12 +1826,12 @@ def _fast_forward(
     counts = git.out("rev-list", "--left-right", "--count", f"{upstream}...HEAD", check=False)
     behind, _, ahead = counts.partition("\t")
     if not counts:
-        # The upstream ref is gone — the branch was merged and deleted on the
-        # remote, most often. Naming that beats "cannot compare", which tells
-        # nobody what to do about it.
-        gone = not git.ok("show-ref", "--verify", "--quiet", f"refs/remotes/{upstream}")
-        why = f"upstream {upstream} no longer exists" if gone else "cannot compare with upstream"
-        return [Action("update", name, head, why, skipped=True)]
+        uncountable = _why_uncountable(git, upstream)
+        if uncountable is not None:
+            return [Action("update", name, head, uncountable, skipped=True)]
+        # A clone of a repository that was empty at the time: nothing local to
+        # lose, so every commit upstream is one this checkout is behind by.
+        behind, ahead = git.out("rev-list", "--count", upstream, check=False) or "0", "0"
     if behind == "0":
         # Measured against the remote-tracking ref as it already stood, unless
         # this run refreshed it. A dry run does not fetch, and in --ask the
@@ -1783,7 +1840,7 @@ def _fast_forward(
         when = "" if fetched else " as of the last fetch"
         return [Action("update", name, head, f"up to date{when}", skipped=True)]
     if ahead != "0":
-        return _diverged(git, name, head, upstream, ahead, behind, sync, decider)
+        return _diverged(git, name, head, upstream, ahead, behind, sync, decider, ignored_keep)
     dirty = is_dirty(git)
     if dirty and not sync["stash"]:
         # git would refuse anyway, with "Your local changes would be overwritten
@@ -1807,6 +1864,21 @@ def _fast_forward(
                 skipped=True,
             )
         ]
+    return _carry_out_fast_forward(git, name, head, upstream, behind, verb, kind, dirty, decider)
+
+
+def _carry_out_fast_forward(
+    git: Git,
+    name: str,
+    head: str,
+    upstream: str,
+    behind: str,
+    verb: str,
+    kind: str,
+    dirty: bool,
+    decider: Decider,
+) -> list[Action]:
+    """Ask, stash if it has to, merge --ff-only, and say what happened."""
     action = Action(kind, name, head, f"{verb} {plural(behind, 'commit')}")
     # Consent covers the stash too: declining must leave the worktree as it was,
     # not tidied into a stash nobody agreed to.
@@ -1853,11 +1925,17 @@ def keeping(actions: list[Action]) -> Iterator[None]:
         raise
 
 
+# A rebase sets none of the *_HEAD markers — it writes a rebase-merge/ or
+# rebase-apply/ directory instead, so it went straight past this and turned a
+# clean report into "fatal: cannot switch branch while rebasing". Both spellings:
+# rebase-apply is what the older `--am` backend leaves behind.
 IN_PROGRESS = {
     "MERGE_HEAD": "a merge",
     "CHERRY_PICK_HEAD": "a cherry-pick",
     "REVERT_HEAD": "a revert",
     "BISECT_LOG": "a bisect",
+    "rebase-merge": "a rebase",
+    "rebase-apply": "a rebase",
 }
 
 
@@ -1940,7 +2018,7 @@ def _would_clobber_ignored(git: Git, branch: str, protect: Sequence[str]) -> str
         ref = branch
     for relative in ignored_paths(git, collapse="never"):
         name = Path(relative).name
-        if not (_matches(name, protect) or any(fnmatch.fnmatch(relative, p) for p in protect)):
+        if not (_protects(name, protect) or any(fnmatch.fnmatch(relative, p) for p in protect)):
             continue
         if git.ok("cat-file", "-e", f"{ref}:{relative}"):
             return relative
@@ -2010,6 +2088,7 @@ def _diverged(
     behind: str,
     sync: dict[str, Any],
     decider: Decider,
+    ignored_keep: Sequence[str] = (),
 ) -> list[Action]:
     """Local commits and upstream commits both. Report, or replay ours on theirs."""
     summary = f"diverged: {ahead} ahead, {behind} behind"
@@ -2019,6 +2098,22 @@ def _diverged(
         return [Action("update", name, head, summary, skipped=True)]
     if is_dirty(git) and not sync["stash"]:
         return [Action("update", name, head, f"{summary}, and uncommitted changes", skipped=True)]
+    # The same guard the switch and the fast-forward already have. A rebase
+    # checks the upstream out as surely as they do, so an uncommitted .env that
+    # the incoming commits happen to track is replaced — never committed, never
+    # stashed, never quarantined. It went missing here alone.
+    clobbered = _would_clobber_ignored(git, upstream, ignored_keep)
+    if clobbered is not None:
+        return [
+            Action(
+                "update",
+                name,
+                head,
+                f"{summary}: {upstream} tracks {clobbered}, which is ignored here "
+                "and would be replaced",
+                skipped=True,
+            )
+        ]
 
     dirty = is_dirty(git)
     verb = "stash and rebase" if dirty else "rebase"
@@ -2381,7 +2476,7 @@ class _Unreadable:
         self.hit = True
 
 
-def _measure(path: Path) -> tuple[int, bool]:
+def _measure(path: Path) -> tuple[int, bool, bool]:
     """Total size under `path`, and whether it may hold a git repository.
 
     Both come from the same walk, because the second question has to be asked
@@ -2404,7 +2499,10 @@ def _measure(path: Path) -> tuple[int, bool]:
             except OSError:
                 continue
         dirnames[:] = [d for d in dirnames if not (here / d).is_symlink()]
-    return total, holds_repo or unreadable.hit
+    # Kept apart, because they are different sentences. Folding them together
+    # made a project.old/ with one chmod-000 subdirectory in it and no git
+    # anywhere report "kept: contains a git repository", which is simply untrue.
+    return total, holds_repo, unreadable.hit
 
 
 def tracked_paths(git: Git) -> set[str]:
@@ -2564,8 +2662,18 @@ def _remove_ignored(
         # git collapses a wholly ignored directory into one entry, so a
         # build/ holding a .env or a *.pem arrives here as a single path.
         # Testing only its name would delete the protected file with it.
+        #
+        # Not for a path the user called regenerable, though: refusing .terraform
+        # here while clean.dirs removed the very same directory minutes later
+        # made one run report it both "kept: contains terraform.tfstate" and
+        # "removed". _remove decides that case, with the same split.
+        regenerable = _matches(name, clean["regenerable"])
         protect = [pattern for patterns, _ in rules for pattern in patterns]
-        if path.is_dir() and (holds := _holds_protected(path, protect, base=repo)):
+        if (
+            path.is_dir()
+            and not regenerable
+            and (holds := _holds_protected(path, protect, base=repo))
+        ):
             actions.append(
                 Action("ignored", scope, relative, f"kept: contains {holds}", skipped=True)
             )
@@ -2579,13 +2687,39 @@ def _remove_ignored(
                 quarantine,
                 is_dir=path.is_dir(),
                 kind="ignored",
-                protect_nested=(guarded := not _matches(name, clean["regenerable"])),
+                protect_nested=not regenerable,
                 sensitive=outright_guard(
-                    cfg["trash"]["sensitive"], clean["ignored_keep"], not guarded
+                    cfg["trash"]["sensitive"], clean["ignored_keep"], regenerable
                 ),
                 holding=holding,
             )
         )
+
+
+def _protected_within(directory: Path, protect: Sequence[str]) -> list[Path]:
+    """Every path inside `directory` that must not be deleted outright.
+
+    _holds_protected answers "is there one", which is all a refusal needs.
+    This answers "which ones", because they are lifted into quarantine and the
+    directory around them is then removed — the difference between reclaiming a
+    dependency tree and renaming it into the workspace it was cluttering.
+
+    Directories are returned whole and not descended into, so a `credentials/`
+    arrives in the quarantine intact.
+    """
+    found: list[Path] = []
+    unreadable = _Unreadable()
+    for dirpath, dirnames, filenames in os.walk(directory, followlinks=False, onerror=unreadable):
+        here = Path(dirpath)
+        keep = [d for d in dirnames if _protects(d, protect)]
+        found.extend(here / d for d in keep)
+        found.extend(here / f for f in filenames if _protects(f, protect))
+        dirnames[:] = [d for d in dirnames if d not in keep and not (here / d).is_symlink()]
+    if unreadable.hit:
+        # Nothing can be lifted out of a subtree that cannot be listed, so the
+        # whole directory has to stay — see _holds_protected.
+        return [directory]
+    return sorted(found)
 
 
 def _holds_protected(
@@ -2607,7 +2741,7 @@ def _holds_protected(
         for entry in (*dirnames, *filenames):
             candidate = here / entry
             relative = candidate.relative_to(root).as_posix()
-            if _matches(entry, protect) or any(fnmatch.fnmatch(relative, p) for p in protect):
+            if _protects(entry, protect) or any(fnmatch.fnmatch(relative, p) for p in protect):
                 return candidate.relative_to(directory).as_posix()
         # Pruned only after their names have been considered: a symlink whose
         # own name is protected still protects its parent from removal.
@@ -2774,6 +2908,69 @@ def _matches(name: str, patterns: Sequence[str]) -> bool:
     return any(fnmatch.fnmatch(name, pattern) for pattern in patterns)
 
 
+# Extensions that make a file source code, whatever it happens to be called.
+# trash.sensitive has to cast a wide net — *token*, *creds*, *password* — and
+# that net caught acorn/dist/tokenizer.js, pygments/token.py and yaml/tokens.py.
+# One of those in a node_modules was enough to hold the whole 400 MB tree back
+# from deletion, which is the opposite of what the tool is for. A secret is not
+# a .js file; if one is, it is committed source and clean will not touch it.
+# Deliberately not .txt, .md, .tfvars or anything else people really do keep a
+# secret in — the point is only to exclude what is unambiguously program text.
+SOURCE_SUFFIXES = frozenset(
+    {
+        ".js",
+        ".mjs",
+        ".cjs",
+        ".jsx",
+        ".ts",
+        ".tsx",
+        ".py",
+        ".pyc",
+        ".pyi",
+        ".go",
+        ".java",
+        ".kt",
+        ".scala",
+        ".rb",
+        ".php",
+        ".cs",
+        ".c",
+        ".h",
+        ".cc",
+        ".cpp",
+        ".hpp",
+        ".rs",
+        ".swift",
+        ".m",
+        ".mm",
+        ".pl",
+        ".lua",
+        ".sh",
+        ".bash",
+        ".zsh",
+        ".ps1",
+        ".r",
+        ".map",
+        ".html",
+        ".htm",
+        ".css",
+        ".scss",
+        ".less",
+        ".vue",
+        ".svelte",
+    }
+)
+
+
+def _protects(name: str, patterns: Sequence[str]) -> bool:
+    """Whether `name` is something a removal must not take with it.
+
+    The same globs as _matches, minus anything with a source-code extension:
+    those are what the file is, not what it holds.
+    """
+    return Path(name).suffix.lower() not in SOURCE_SUFFIXES and _matches(name, patterns)
+
+
 def _protected(path: Path, root: Path, keep: Sequence[str], tracked: set[str]) -> bool:
     relative = path.relative_to(root).as_posix()
     if any(
@@ -2798,42 +2995,59 @@ def _remove(
     holding: Quarantine | None = None,
 ) -> Action:
     relative = path.relative_to(root).as_posix()
-    holds_repo = False
+    holds_repo = unreadable = False
     try:
-        size, holds_repo = _measure(path) if is_dir else (path.stat().st_size, False)
+        size, holds_repo, unreadable = (
+            _measure(path) if is_dir else (path.stat().st_size, False, False)
+        )
     except OSError:
         size = 0
     action = Action(kind, scope, relative, f"remove {'directory' if is_dir else 'file'}", size=size)
     action.quarantined = quarantine is not None
     because = ""
+    rescue: list[Path] = []
     if quarantine is None and holding is not None and sensitive:
-        # The name first, for a directory as much as for a file: _holds_protected
-        # walks the children and never looks at the root, so a directory called
-        # credentials/ or tokens/ was hard-deleted while a file called
-        # api-token.pyc beside it was correctly quarantined.
-        buried = path.name if _matches(path.name, sensitive) else None
-        if buried is None and is_dir:
-            buried = _holds_protected(path, sensitive)
-        if buried is not None:
-            # The promise trash makes, kept here too: something that may be the
-            # only copy of a credential is moved, never deleted outright — even
-            # when it is buried inside a directory that is otherwise disposable.
+        # The name first: _holds_protected walks the children and never looks at
+        # the root, so a directory called credentials/ or tokens/ was
+        # hard-deleted while a file called api-token.pyc beside it was correctly
+        # quarantined.
+        if _protects(path.name, sensitive):
+            # The name first, and for a directory as much as for a file: a
+            # directory called credentials/ or tokens/ *is* the thing being
+            # protected, so it goes whole rather than being emptied out.
             quarantine = holding
             action.quarantined = True
-            because = (
-                f" because it is {buried}" if not is_dir else (f" because it contains {buried}")
-            )
+            because = f" because it is {path.name}"
+        elif is_dir:
+            rescue = _protected_within(path, sensitive)
+            if rescue:
+                # Not the whole directory. Moving a 3.8 MB node_modules aside
+                # because one file in it is called tokenizer.js reclaimed
+                # nothing at all — it renamed the tree into a directory in the
+                # same workspace — while the README's first promise is the
+                # space back. So the few files that may be the only copy of a
+                # credential are lifted out into quarantine, and the rest of the
+                # directory really goes.
+                shown = rescue[0].relative_to(path).as_posix()
+                more = f" and {len(rescue) - 1} more" if len(rescue) > 1 else ""
+                because = f", keeping {shown}{more} in quarantine"
     # Said before the decision, so a dry run names the outcome it is predicting.
     action.detail = (
         f"{'quarantine' if action.quarantined else 'remove'} "
         f"{'directory' if is_dir else 'file'}{because}"
     )
-    if holds_repo and protect_nested:
+    if (holds_repo or unreadable) and protect_nested:
         # A vendored or forgotten checkout inside an artefact directory. Deleting
         # the parent would take the repository with it, and nothing in an
         # artefact directory is worth that. `clean.regenerable` lists the caches
-        # where the nested repository is itself a tool's clone.
-        action.detail = "kept: contains a git repository"
+        # where the nested repository is itself a tool's clone. A subtree that
+        # cannot be read gets the same treatment and says so in its own words:
+        # not being able to look is not the same as having looked.
+        action.detail = (
+            "kept: contains a git repository"
+            if holds_repo
+            else "kept: something in here cannot be read"
+        )
         action.skipped = True
         action.size = 0
         return action
@@ -2844,6 +3058,10 @@ def _remove(
         if quarantine is not None:
             quarantine.take(path)
         elif is_dir:
+            # Before the rmtree, and only then: a failure here must leave the
+            # directory alone rather than half of it.
+            for protected in rescue:
+                holding.take(protected)  # type: ignore[union-attr]
             shutil.rmtree(path)
         else:
             path.unlink()
@@ -3237,7 +3455,7 @@ TEMP_SUFFIXES = ("*~", "*.swp", "*.swo", "*.orig", "*.rej", "*.bak", "*.tmp", "*
 def classify_trash(path: Path, trash: dict[str, Any], now: float) -> tuple[bool, str, bool]:
     """Decide whether one path is junk. Returns (is_junk, why, is_sensitive)."""
     name = path.name
-    sensitive = _matches(name, trash["sensitive"])
+    sensitive = _protects(name, trash["sensitive"])
     # keep is absolute. patterns win over the heuristics, not over an explicit
     # instruction to leave something alone.
     if _matches(name, trash["keep"]):
@@ -3428,7 +3646,18 @@ def _holds_a_repository(path: Path, relative: str) -> Action | None:
     under a `project.old/` directory is exactly what the rule is for. Sweeping
     it would take its unpushed commits with it.
     """
-    if not path.is_dir() or not (_measure(path)[1] or holds_git_data(path)):
+    if not path.is_dir():
+        return None
+    _, holds_repo, unreadable = _measure(path)
+    if not (holds_repo or holds_git_data(path)):
+        if unreadable:
+            return Action(
+                "trash",
+                "workspace",
+                relative,
+                "kept: something in here cannot be read",
+                skipped=True,
+            )
         return None
     return Action("trash", "workspace", relative, "kept: contains a git repository", skipped=True)
 
@@ -3930,6 +4159,7 @@ REASONS: tuple[tuple[str, str], ...] = (
     ("a dependency tree", "dependency trees — clean.dependencies is off"),
     ("build output", "build output — clean.builds is off"),
     ("orphaned worktree", "orphaned worktrees — the parent pruned them away"),
+    ("cannot be read", "directories with something in them nobody can read"),
     ("not yet", "quarantines not yet past trash.retention_days"),
     ("is in progress", "a merge, rebase, cherry-pick or bisect is unfinished"),
     ("no upstream", "on a local-only branch, never pushed"),
@@ -4186,19 +4416,6 @@ def outright_guard(
     return list(sensitive) if regenerable else [*sensitive, *local_state]
 
 
-def _never_delete_outright(cfg: dict[str, Any]) -> list[str]:
-    """Names that are moved rather than deleted, wherever they turn up.
-
-    trash.sensitive and clean.ignored_keep both name things that may be the only
-    copy — a token, a .env, a terraform.tfstate, an id_rsa. clean.ignored
-    refused a directory holding one; the pattern walk deleted the same directory
-    minutes later, because only the first list was consulted. Quarantining is
-    the better answer than refusing: the space is still reclaimed and nothing is
-    lost.
-    """
-    return [*cfg["trash"]["sensitive"], *cfg["clean"]["ignored_keep"]]
-
-
 def _clean_repo(
     repo: Path,
     name: str,
@@ -4310,7 +4527,6 @@ def _loose_artefacts(
         governing = context.config_for(here)
         here_cfg = {
             **governing["clean"],
-            "never_delete_outright": _never_delete_outright(governing),
             "sensitive_names": governing["trash"]["sensitive"],
         }
         if not here_cfg["enabled"]:
@@ -4334,7 +4550,6 @@ def _loose_artefacts(
                 governing_own = context.config_for(candidate)
                 own = {
                     **governing_own["clean"],
-                    "never_delete_outright": _never_delete_outright(governing_own),
                     "sensitive_names": governing_own["trash"]["sensitive"],
                 }
                 own_dirs, _ = clean_patterns(own)
@@ -4493,7 +4708,11 @@ def cmd_init(
     explicit_dry: bool = False,
 ) -> int:
     """Write a config file, asking about the choices that actually vary."""
-    if target.exists() and not force:
+    if target.exists() and not force and not explicit_dry:
+        # Not under -n: nothing is written, so nothing can be overwritten — and
+        # `git-tidy init -n > .git-tidy.yaml`, which the man page recommends,
+        # creates the target before this runs. Refusing there left a zero-byte
+        # config behind and printed advice about a flag that would not help.
         raise Failure(f"{target} already exists; pass --force to overwrite it")
 
     chosen: dict[str, Any] = {}
@@ -4512,9 +4731,11 @@ def cmd_init(
     body = render_config(chosen, INIT_HEADER)
     if explicit_dry:
         # -n means change nothing, here as everywhere else. Printing it is still
-        # useful: `git-tidy init -n > .git-tidy.yaml` is a reasonable thing to do.
+        # useful: `git-tidy init -n > .git-tidy.yaml` is a reasonable thing to do
+        # — which is exactly why the note goes to stderr. On stdout it ended up
+        # inside the redirected file, and both parsers then rejected it.
         printer.loud().line(body.rstrip())
-        printer.loud().line(f"\n  Not written. Run without -n, or redirect this into {target}.")
+        print(f"\n  Not written. Run without -n, or redirect this into {target}.", file=sys.stderr)
         return 0
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
