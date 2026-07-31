@@ -115,20 +115,25 @@ then ok "the space came back ($before -> $after KB)"
 else bad "nothing reclaimed ($before -> $after KB)"
 fi
 
-echo "7. a credential is lifted out and the tree still goes (rounds 10, 11)"
+echo "7. a credential stays put and the tree around it goes (rounds 10-12)"
 w=$(newspace rescue)
 mkdir -p "$w/repo/node_modules/acorn/dist"
 head -c 300000 /dev/urandom > "$w/repo/node_modules/acorn/dist/tokenizer.js"
 echo PRIVATE > "$w/repo/node_modules/id_rsa"
 echo 'export AWS_SECRET=1' > "$w/repo/node_modules/.env.sh"
 printf 'clean:\n  dependencies: true\n' > "$w/.git-tidy.yaml"
+before=$(du -sk "$w/repo/node_modules" | cut -f1)
 tidy -C "$w" clean --apply >/dev/null 2>&1
-if [ -d "$w/repo/node_modules" ]; then bad "the tree was kept"; else ok "the tree went"; fi
-if [ "$(find "$w/.git-tidy-trash" -path "*/node_modules/id_rsa" | wc -l)" -gt 0 ]
-then ok "id_rsa rescued"; else bad "id_rsa lost"; fi
-if [ "$(find "$w/.git-tidy-trash" -path "*/node_modules/.env.sh" | wc -l)" -gt 0 ]
-then ok ".env.sh rescued"; else bad ".env.sh lost"; fi
-if [ "$(find "$w/.git-tidy-trash" -path "*/node_modules/acorn/dist/tokenizer.js" | wc -l)" -gt 0 ]
+after=$(du -sk "$w/repo/node_modules" 2>/dev/null | cut -f1 || echo 0)
+if [ "$((before - after))" -gt 250 ]
+then ok "the tree went ($before -> $after KB)"
+else bad "nothing reclaimed ($before -> $after KB)"
+fi
+if [ -f "$w/repo/node_modules/id_rsa" ]
+then ok "id_rsa still at its path"; else bad "id_rsa lost"; fi
+if [ -f "$w/repo/node_modules/.env.sh" ]
+then ok ".env.sh still at its path"; else bad ".env.sh lost"; fi
+if [ -f "$w/repo/node_modules/acorn/dist/tokenizer.js" ]
 then bad "tokenizer.js was treated as a secret"; else ok "tokenizer.js went with the tree"; fi
 
 echo "8. a stash round-trips with its staging (round 8)"
