@@ -200,16 +200,31 @@ Changes nothing. Reports:
 `doctor --fix` (also `run --fix`) carries out the three of those that cannot
 cost a commit: it puts a detached HEAD back on the trunk, takes the credential
 out of a remote URL, and packs an oversized `.git`. Like everything else it is a
-dry run until `--apply`, and `--ask` still asks per repository.
+dry run until `--apply`.
 
 It stops short wherever the answer is a decision rather than a command. A
-detached HEAD is only moved when the commit it sits on is already contained in
-the trunk — otherwise that detached HEAD *is* the work, and switching away would
-leave it reachable from nothing but the reflog. It will not move one with
-uncommitted changes, or when the trunk is checked out in another worktree.
+detached HEAD is only moved when every one of these holds: the commit it sits on
+is already contained in the trunk (otherwise that HEAD *is* the work, and
+switching away would leave it reachable from nothing but the reflog); the trunk
+exists locally; nothing is uncommitted; no merge, rebase, cherry-pick or bisect
+is in progress; the trunk is not checked out in another worktree; this is not a
+linked worktree, which `sync.worktrees` keeps out of it; and the trunk does not
+track a file that is gitignored here and would be replaced — the same guard
+`sync` uses, because a local `.env` is invisible to "is the tree clean".
+
 Unpushed commits, branches that exist only locally and repositories with no
 remote are never touched by `--fix`: only you know whether those should be
 pushed or dropped.
+
+Credentials are read out of `.git/config` directly rather than through
+`git remote get-url`, which expands `insteadOf` — a token in your `~/.gitconfig`
+is not this repository's problem. `pushurl` and any second `url` are checked
+too, and a bare `https://token@host/…`, which is how a personal access token is
+usually pasted, counts as much as `user:secret@`. An `ssh://git@host` username
+does not.
+
+`--ask` asks once per remedy per repository; answering `a` covers that one
+remedy, not the other two.
 
 ## Modes
 

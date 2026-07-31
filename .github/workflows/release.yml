@@ -88,7 +88,10 @@ jobs:
           # the config parser the binary uses depend on how the binary was
           # built. Excluded, so every shipped binary reads a config exactly the
           # same way, using the parser this project maintains and tests.
-          ! grep -qr "yaml" dist/git_tidy.dist/ --include="*.py" 2>/dev/null
+          if grep -qr "yaml" dist/git_tidy.dist/ --include="*.py" 2>/dev/null; then
+            echo "PyYAML was bundled into the binary; exclude it" >&2
+            exit 1
+          fi
           test ! -e dist/git_tidy.dist/yaml
       - name: package
         run: |
@@ -123,7 +126,10 @@ jobs:
           # the config parser the binary uses depend on how the binary was
           # built. Excluded, so every shipped binary reads a config exactly the
           # same way, using the parser this project maintains and tests.
-          ! grep -qr "yaml" dist/git_tidy.dist/ --include="*.py" 2>/dev/null
+          if grep -qr "yaml" dist/git_tidy.dist/ --include="*.py" 2>/dev/null; then
+            echo "PyYAML was bundled into the binary; exclude it" >&2
+            exit 1
+          fi
           test ! -e dist/git_tidy.dist/yaml
       - name: package
         run: |
