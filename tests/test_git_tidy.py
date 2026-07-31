@@ -5138,3 +5138,66 @@ def test_no_comment_line_reads_like_a_setting_it_is_not():
         if (m := re.match(r"^\s*([a-z_]+):", line)) and m.group(1) in keys
     ]
     assert collisions == []
+
+
+# --------------------------------------------------------------------------- #
+# The exit-code contract, as the man page states it
+# --------------------------------------------------------------------------- #
+
+USAGE_OR_CONFIG = [
+    (["nosuchcommand"], "usage"),
+    (["-j", "-2", "clean"], "cannot be negative"),
+    (["restore", "NOPE", "--apply"], "no quarantine"),
+]
+
+
+@pytest.mark.parametrize(("argv", "expected"), USAGE_OR_CONFIG)
+def test_a_usage_or_configuration_error_exits_two(
+    workspace: Path, capsys, argv: list[str], expected: str
+):
+    """man/git-tidy.1: "0 on success, 1 if anything failed, 2 on a usage or
+    configuration error". Scripts branch on this."""
+    with pytest.raises(SystemExit) as exit_info:
+        gt.entrypoint(["-C", str(workspace), *argv])
+    assert exit_info.value.code == 2
+    captured = capsys.readouterr()
+    assert expected in (captured.err + captured.out).lower()
+
+
+BROKEN_CONFIGS = [
+    ("clean:\n  ignored_keep:\n", "nothing after the colon"),
+    ("nonsense: 1\n", "unknown setting"),
+    ("clean:\n  enabled: maybe\n", "clean"),
+]
+
+
+@pytest.mark.parametrize(("body", "expected"), BROKEN_CONFIGS)
+def test_a_broken_config_exits_two_with_the_file_named(
+    workspace: Path, capsys, body: str, expected: str
+):
+    (workspace / gt.CONFIG_NAMES[0]).write_text(body, encoding="utf-8")
+    with pytest.raises(SystemExit) as exit_info:
+        gt.entrypoint(["-C", str(workspace), "clean", "-n"])
+    assert exit_info.value.code == 2
+    message = capsys.readouterr().err
+    assert gt.CONFIG_NAMES[0] in message
+    assert expected in message
+
+
+@pytest.mark.parametrize("command", ["sync", "prune", "clean", "trash", "doctor", "run"])
+@pytest.mark.parametrize("mode", ["-n", "--apply"])
+def test_the_json_report_has_the_same_shape_for_every_command(
+    workspace: Path, capsys, command: str, mode: str
+):
+    """--json is the scripting contract, so every command must honour it."""
+    repo = workspace / "repo"
+    (repo / "__pycache__").mkdir(exist_ok=True)
+    (repo / "__pycache__" / "a.pyc").write_bytes(b"0" * 32)
+
+    assert gt.main(["-C", str(workspace), command, mode, "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert set(report) >= {"version", "mode", "interrupted", "actions"}
+    assert report["version"] == gt.__version__
+    for action in report["actions"]:
+        assert set(action) >= {"kind", "scope", "target", "detail"}
+        assert isinstance(action.get("size", 0), int)
