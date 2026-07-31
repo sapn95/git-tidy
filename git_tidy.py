@@ -2696,29 +2696,36 @@ def _remove_ignored(
         )
 
 
-def _protected_within(directory: Path, protect: Sequence[str]) -> list[Path]:
+def _protected_within(directory: Path, protect: Sequence[str]) -> list[Path] | None:
     """Every path inside `directory` that must not be deleted outright.
 
-    _holds_protected answers "is there one", which is all a refusal needs.
-    This answers "which ones", because they are lifted into quarantine and the
+    _holds_protected answers "is there one", which is all a refusal needs. This
+    answers "which ones", because they are lifted into quarantine and the
     directory around them is then removed — the difference between reclaiming a
     dependency tree and renaming it into the workspace it was cluttering.
 
     Directories are returned whole and not descended into, so a `credentials/`
     arrives in the quarantine intact.
+
+    None means the directory cannot be emptied out safely and has to stay. Two
+    ways that happens: a subtree nobody can list, and a *symlink* whose name is
+    protected. The quarantine refuses to take a symlink pointing outside the
+    workspace, as it should — but the refusal surfaced as a raw relative_to()
+    message against an action whose target was "-", so the run reported a
+    failure that named neither the file nor the directory.
     """
     found: list[Path] = []
     unreadable = _Unreadable()
     for dirpath, dirnames, filenames in os.walk(directory, followlinks=False, onerror=unreadable):
         here = Path(dirpath)
         keep = [d for d in dirnames if _protects(d, protect)]
-        found.extend(here / d for d in keep)
-        found.extend(here / f for f in filenames if _protects(f, protect))
+        for name in (*keep, *(f for f in filenames if _protects(f, protect))):
+            if (here / name).is_symlink():
+                return None
+            found.append(here / name)
         dirnames[:] = [d for d in dirnames if d not in keep and not (here / d).is_symlink()]
     if unreadable.hit:
-        # Nothing can be lifted out of a subtree that cannot be listed, so the
-        # whole directory has to stay — see _holds_protected.
-        return [directory]
+        return None
     return sorted(found)
 
 
@@ -2982,6 +2989,45 @@ def _protected(path: Path, root: Path, keep: Sequence[str], tracked: set[str]) -
     return relative in tracked or relative.lower() in tracked
 
 
+def _what_to_keep(
+    path: Path,
+    is_dir: bool,
+    quarantine: Quarantine | None,
+    holding: Quarantine | None,
+    sensitive: Sequence[str],
+) -> tuple[Quarantine | None, list[Path], str] | None:
+    """Where this path goes, what has to be lifted out of it first, and why.
+
+    None means it cannot be emptied out safely and has to stay whole — see
+    _protected_within.
+    """
+    if quarantine is not None or holding is None or not sensitive:
+        return quarantine, [], ""
+    if _protects(path.name, sensitive):
+        # The name first, and for a directory as much as for a file: a directory
+        # called credentials/ or tokens/ *is* the thing being protected, so it
+        # goes whole rather than being emptied out. _protected_within walks the
+        # children and never looks at the root, so without this a directory
+        # called tokens/ was hard-deleted while a file called api-token.tfplan
+        # beside it was correctly quarantined.
+        return holding, [], f" because it is {path.name}"
+    if not is_dir:
+        return quarantine, [], ""
+    rescue = _protected_within(path, sensitive)
+    if rescue is None:
+        return None
+    if not rescue:
+        return quarantine, [], ""
+    # Not the whole directory. Moving a 3.8 MB node_modules aside because one
+    # file in it is called tokenizer.js reclaimed nothing at all — it renamed the
+    # tree into a directory in the same workspace — while the README's first
+    # promise is the space back. So the few files that may be the only copy of a
+    # credential are lifted out into quarantine, and the rest of it really goes.
+    shown = rescue[0].relative_to(path).as_posix()
+    more = f" and {len(rescue) - 1} more" if len(rescue) > 1 else ""
+    return quarantine, rescue, f", keeping {shown}{more} in quarantine"
+
+
 def _remove(
     path: Path,
     root: Path,
@@ -3004,33 +3050,16 @@ def _remove(
         size = 0
     action = Action(kind, scope, relative, f"remove {'directory' if is_dir else 'file'}", size=size)
     action.quarantined = quarantine is not None
-    because = ""
-    rescue: list[Path] = []
-    if quarantine is None and holding is not None and sensitive:
-        # The name first: _holds_protected walks the children and never looks at
-        # the root, so a directory called credentials/ or tokens/ was
-        # hard-deleted while a file called api-token.pyc beside it was correctly
-        # quarantined.
-        if _protects(path.name, sensitive):
-            # The name first, and for a directory as much as for a file: a
-            # directory called credentials/ or tokens/ *is* the thing being
-            # protected, so it goes whole rather than being emptied out.
-            quarantine = holding
-            action.quarantined = True
-            because = f" because it is {path.name}"
-        elif is_dir:
-            rescue = _protected_within(path, sensitive)
-            if rescue:
-                # Not the whole directory. Moving a 3.8 MB node_modules aside
-                # because one file in it is called tokenizer.js reclaimed
-                # nothing at all — it renamed the tree into a directory in the
-                # same workspace — while the README's first promise is the
-                # space back. So the few files that may be the only copy of a
-                # credential are lifted out into quarantine, and the rest of the
-                # directory really goes.
-                shown = rescue[0].relative_to(path).as_posix()
-                more = f" and {len(rescue) - 1} more" if len(rescue) > 1 else ""
-                because = f", keeping {shown}{more} in quarantine"
+    plan = _what_to_keep(path, is_dir, quarantine, holding, sensitive)
+    if plan is None:
+        # Cannot be emptied out safely, so it stays whole. _measure has already
+        # said so for the unreadable case; this is the protected symlink.
+        action.detail = "kept: holds a protected symlink"
+        action.skipped = True
+        action.size = 0
+        return action
+    quarantine, rescue, because = plan
+    action.quarantined = quarantine is not None
     # Said before the decision, so a dry run names the outcome it is predicting.
     action.detail = (
         f"{'quarantine' if action.quarantined else 'remove'} "
@@ -4160,6 +4189,7 @@ REASONS: tuple[tuple[str, str], ...] = (
     ("build output", "build output — clean.builds is off"),
     ("orphaned worktree", "orphaned worktrees — the parent pruned them away"),
     ("cannot be read", "directories with something in them nobody can read"),
+    ("protected symlink", "directories holding a symlink named like a credential"),
     ("not yet", "quarantines not yet past trash.retention_days"),
     ("is in progress", "a merge, rebase, cherry-pick or bisect is unfinished"),
     ("no upstream", "on a local-only branch, never pushed"),

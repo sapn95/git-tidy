@@ -5201,3 +5201,30 @@ def test_the_json_report_has_the_same_shape_for_every_command(
     for action in report["actions"]:
         assert set(action) >= {"kind", "scope", "target", "detail"}
         assert isinstance(action.get("size", 0), int)
+
+
+def test_a_protected_symlink_keeps_its_directory_instead_of_failing(workspace: Path, capsys):
+    """The quarantine refuses a symlink out of the workspace, as it should.
+
+    The refusal used to surface as a raw relative_to() message on an action
+    whose target was "-", so the run reported a failure naming neither the file
+    nor the directory — and the whole point of a symlink is that deleting it
+    cannot destroy what it points at.
+    """
+    outside = workspace.parent / "outside"
+    outside.mkdir()
+    (outside / "real_id_rsa").write_text("REAL", encoding="utf-8")
+    repo = workspace / "repo"
+    cache = repo / "__pycache__"
+    cache.mkdir()
+    (cache / "a.pyc").write_bytes(b"0" * 64)
+    (cache / "id_rsa").symlink_to(outside / "real_id_rsa")
+
+    assert gt.main(["-C", str(workspace), "clean", "--apply", "-v"]) == 0
+    out = capsys.readouterr().out
+    assert "kept: holds a protected symlink" in out
+    assert "relative_to" not in out and "subpath" not in out
+    assert "1 failed" not in out
+    assert cache.exists(), "kept whole rather than half-emptied"
+    assert (outside / "real_id_rsa").read_text(encoding="utf-8") == "REAL"
+    assert gt._reason_of("kept: holds a protected symlink") != "other, see the lines marked -"
