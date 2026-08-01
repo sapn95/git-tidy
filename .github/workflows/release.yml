@@ -195,3 +195,28 @@ jobs:
           git add Formula/git-tidy.rb
           git commit -m "chore: point the Homebrew formula at ${GITHUB_REF_NAME}" || exit 0
           git push origin main
+      - name: send the same formula to the tap
+        # README says `brew install sapn95/tap/git-tidy`, and that tap is a
+        # separate repository. Rewriting the copy here and stopping left it on
+        # 2.0.1 while three releases went out — so everyone following the README
+        # installed a version that could lose an uncommitted file.
+        #
+        # Needs a token with contents:write on the tap. Without it this is a
+        # no-op that says so, rather than a red release for a formula copy.
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
+        run: |
+          if [ -z "${TAP_TOKEN}" ]; then
+            echo "::warning::TAP_TOKEN is not set, so sapn95/homebrew-tap still" \
+                 "points at whatever it pointed at before this release."
+            exit 0
+          fi
+          git clone --depth 1 \
+            "https://x-access-token:${TAP_TOKEN}@github.com/sapn95/homebrew-tap.git" tap
+          cp Formula/git-tidy.rb tap/Formula/git-tidy.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/git-tidy.rb
+          git commit -m "git-tidy ${GITHUB_REF_NAME#v}" || exit 0
+          git push origin HEAD

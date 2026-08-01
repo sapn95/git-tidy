@@ -357,7 +357,7 @@ A self-contained binary from the [releases](https://github.com/sapn95/git-tidy/r
 
 ```bash
 tar -xzf git-tidy-macos-arm64.tar.gz
-./git-tidy.dist/git-tidy --version
+./git-tidy --version
 ```
 
 From PyPI-style tooling, or straight from a checkout:
