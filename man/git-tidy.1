@@ -157,11 +157,20 @@ alone: a
 .I tokenizer.js
 matches
 .I *token*
-and is not a secret. The exemption does not apply to
-.IR clean.ignored_keep ,
-whose entries name local files that are deliberately not in git \(em a
+and is not a secret. So is a certificate holding no private key, which is read
+from the file rather than guessed. Neither exemption applies to
+.I clean.ignored_keep
+or
+.IR clean.keep ,
+whose entries name files somebody wrote down \(em a
 .I secrets.py
-is exactly what that list is for.
+is exactly what those lists are for.
+.IP
+A protected file inside a directory being removed stays exactly where it is and
+the directory is emptied around it \(em unless
+.I clean.quarantine
+is on, in which case the whole directory is moved and the file goes with it.
+Recoverable either way, but the path changes.
 .TP
 .BR \-C ", " \-\-workspace " " \fIDIR\fR
 The directory holding the repositories. Defaults to the current one.
