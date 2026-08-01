@@ -6568,16 +6568,18 @@ def test_a_key_past_the_peek_is_still_a_key(workspace: Path):
     assert bundle.is_file(), "the key is at byte 100000, and it is still a key"
 
 
-def test_two_credentialed_urls_are_both_reported_as_done(workspace: Path, capsys):
-    """The read-back narrowed by setting, so the first strip was called failed."""
+def test_a_url_and_a_pushurl_are_both_stripped(workspace: Path, capsys):
+    """One value each, so each can be rewritten in place without reordering."""
     repo = workspace / "repo"
     git(repo, "remote", "set-url", "origin", "https://alice:s3cr3t@a.invalid/one.git")
-    git(repo, "config", "--add", "remote.origin.url", "https://bob:t0ken@b.invalid/two.git")
+    git(repo, "config", "remote.origin.pushurl", "https://bob:t0ken@b.invalid/two.git")
 
     assert gt.main(["-C", str(workspace), "doctor", "--fix", "--apply"]) == 0
     assert "still in" not in capsys.readouterr().out
-    left = git(repo, "config", "--get-all", "remote.origin.url").split()
-    assert left == ["https://a.invalid/one.git", "https://b.invalid/two.git"], left
+    assert git(repo, "config", "--get", "remote.origin.url").strip() == "https://a.invalid/one.git"
+    assert (
+        git(repo, "config", "--get", "remote.origin.pushurl").strip() == "https://b.invalid/two.git"
+    )
 
 
 def test_a_url_stored_with_whitespace_is_replaced_not_appended(workspace: Path):
@@ -6707,11 +6709,12 @@ def _credential_runs(workspace: Path) -> None:
         gt.main(["-C", str(workspace), "doctor", "--fix", "--apply"])
 
 
-def test_two_credentials_stripping_to_one_url_leave_one_line(workspace: Path):
-    """And an unrelated third URL survives the tidying, which is the hard part.
+def test_stripping_credentials_leaves_the_fetch_url_where_it_was(workspace: Path):
+    """git fetches from the *first* url=, so their order is load-bearing.
 
-    A plain --unset-all cleared every url= the remote had before re-adding one,
-    so deduplicating two would have taken a mirror with it.
+    There was a dedup here that removed duplicates by unset-then-add, which
+    moved the survivor to the end and silently repointed the remote at the
+    mirror. Duplicate lines are untidy; a remote pointing somewhere else is not.
     """
     repo = workspace / "repo"
     git(repo, "config", "--local", "remote.origin.url", "https://a:one@same.invalid/r.git")
@@ -6725,9 +6728,21 @@ def test_two_credentials_stripping_to_one_url_leave_one_line(workspace: Path):
         "https://c:three@other.invalid/mirror.git",
     )
 
+    before = git(repo, "config", "--local", "--get-all", "remote.origin.url").splitlines()
     gt.main(["-C", str(workspace), "doctor", "--fix", "--apply"])
-    left = sorted(git(repo, "config", "--local", "--get-all", "remote.origin.url").splitlines())
-    assert left == ["https://other.invalid/mirror.git", "https://same.invalid/r.git"], left
+    after = git(repo, "config", "--local", "--get-all", "remote.origin.url").splitlines()
+    assert after == before, "several URLs are left exactly as they were"
+
+
+def test_several_urls_are_reported_rather_than_rewritten(workspace: Path, capsys):
+    repo = workspace / "repo"
+    git(repo, "config", "--local", "remote.origin.url", "https://a:one@same.invalid/r.git")
+    git(repo, "config", "--local", "--add", "remote.origin.url", "https://b:two@same.invalid/r.git")
+
+    gt.main(["-C", str(workspace), "doctor", "--fix", "--apply"])
+    out = capsys.readouterr().out
+    assert "by hand" in out
+    assert "credentials in a remote with several URLs" in out
 
 
 def test_a_directory_where_everything_is_protected_is_not_called_removed(workspace: Path, capsys):
@@ -6820,3 +6835,68 @@ def test_a_thin_out_that_does_free_something_is_still_work(workspace: Path, caps
     assert "freed" in capsys.readouterr().out
     assert (cache / "cacert.pem").is_file()
     assert not (cache / "m.pyc").exists()
+
+
+# --------------------------------------------------------------------------- #
+# Claude review, round eighteen
+# --------------------------------------------------------------------------- #
+
+
+def test_an_apostrophe_in_a_flow_list_is_not_an_open_quote():
+    """`keep: [Don't Touch/*, build]` was refused here and read fine by PyYAML.
+
+    _strip_comment has had the "a quote only opens where a value can begin" rule
+    for rounds; _split_flow did not, so the two disagreed with each other.
+    """
+    yaml = pytest.importorskip("yaml")
+    for text in (
+        "clean:\n  keep: [Don't Touch/*, build]\n",
+        'clean:\n  keep: ["a, b", c]\n',
+        "clean:\n  keep: ['x', 'y']\n",
+    ):
+        assert gt._parse_yaml_subset(text, "<t>") == yaml.safe_load(text), text
+
+
+def test_gc_asks_before_it_packs(workspace: Path):
+    """--help says --ask confirms every change, and a gc is a change.
+
+    It used to run whenever sync.gc was on, even in a repository where every
+    fetch and switch in the same run had just been declined.
+    """
+    asked: list[str] = []
+
+    def answer(question: str) -> str:
+        asked.append(question)
+        return "n"
+
+    decider = gt.Decider(gt.ASK, prompt_input=answer)
+    with_gc = gt.sync_repo(workspace / "repo", "repo", config(sync={"gc": True}), decider)
+    prompts_with = len(asked)
+    asked.clear()
+    gt.sync_repo(workspace / "repo", "repo", config(), gt.Decider(gt.ASK, prompt_input=answer))
+
+    assert prompts_with == len(asked) + 1, (prompts_with, len(asked))
+    packs = [one for one in with_gc if one.kind == "pack"]
+    assert packs and not packs[0].applied, "declined, and said so in the report"
+
+
+@needs_permissions
+def test_a_partial_thin_out_does_not_keep_its_prediction(workspace: Path, capsys):
+    """--json showed "empty out, keeping id_rsa" next to "applied": true."""
+    repo = workspace / "repo"
+    cache = repo / ".pytest_cache"
+    locked = cache / "sub"
+    locked.mkdir(parents=True)
+    (locked / "stuck.bin").write_bytes(b"0" * 4096)
+    (cache / "id_rsa").write_text("PRIVATE", encoding="utf-8")
+    (cache / "big.dat").write_bytes(b"0" * 40960)
+    locked.chmod(0o500)
+    try:
+        gt.main(["-C", str(workspace), "clean", "--apply", "--json"])
+        report = json.loads(capsys.readouterr().out)
+        thinned = [a for a in report["actions"] if ".pytest_cache" in a["target"]]
+        assert thinned, report["actions"]
+        assert "empty out" not in thinned[0]["detail"], thinned[0]
+        assert (cache / "id_rsa").is_file()
+    finally:
+        locked.chmod(0o755)
