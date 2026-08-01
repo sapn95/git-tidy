@@ -69,7 +69,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NoReturn
 
-__version__ = "3.0.4"
+__version__ = "3.0.5"
 
 CONFIG_NAMES = (".git-tidy.yaml", ".git-tidy.yml")
 QUARANTINE_DIRNAME = ".git-tidy-trash"
@@ -735,12 +735,21 @@ def _split_flow(body: str, source: str, number: int) -> list[str]:
     quote: str | None = None
     current: list[str] = []
     escaped = False
+    # A quote only opens one where a value could begin — the same rule
+    # _strip_comment has, and for the same reason: without it the apostrophe in
+    # `keep: [Don't Touch/*, build]` opened a quoted run that never closed, so
+    # the whole config was refused here and read fine under PyYAML.
+    can_open = True
     for ch in body:
         if quote:
             current.append(ch)
             quote, escaped = _inside_quote(ch, quote, escaped)
             continue
-        if ch in "\"'":
+        if ch in ",[{":
+            can_open = True
+        elif ch not in " \t":
+            can_open = can_open and ch in "\"'"
+        if ch in "\"'" and can_open:
             quote = ch
         elif ch in "[{":
             depth += 1
@@ -1843,7 +1852,18 @@ def _sync_from(
     )
     actions.extend(_sync_submodules(git, name, sync, decider))
     if sync["gc"] and not decider.dry:
-        git.run("gc", "--auto", "--quiet", check=False)
+        # Asked for, and reported: it used to run whenever sync.gc was on, even
+        # in a repository where every fetch and switch in the same run had just
+        # been declined — and it never appeared in the report either way.
+        pack = Action("pack", name, ".git", "run git gc")
+        if decider.allow(pack):
+            result = git.run("gc", "--auto", "--quiet", check=False)
+            if result.returncode == 0:
+                pack.applied = True
+                pack.detail = "packed with git gc"
+            else:
+                pack.error = last_line(result)
+        actions.append(pack)
     return actions
 
 
@@ -3613,15 +3633,9 @@ def _remove(
             # and keeping the prediction meant a directory holding an unreadable
             # subtree reported "emptied out" and the full size freed, with no
             # error, while 97.7 KB of it was still on the disk.
-            action.size, failed = _thin_out(path, rescue)
-            if failed:
-                action.error = failed
-                # As _rmtree_counting does: what really went is still reported.
-                # Returning applied=False after emptying 100 KB out of a
-                # directory made the line say "(97.7 KB)" while the summary said
-                # nothing was removed and nothing freed, of the same action.
-                action.applied = action.size > 0
-                return action
+            partly = _thinned_out(action, path, rescue)
+            if partly is not None:
+                return partly
         elif is_dir:
             # rmtree removes what it can and then raises, so the plain call
             # reported a directory as a pure failure while three files had
@@ -3670,6 +3684,22 @@ def _finished(action: Action, thinned: bool, because: str) -> Action:
     action.detail = (
         "emptied out" if thinned else "quarantined" if action.quarantined else "removed"
     ) + because
+    return action
+
+
+def _thinned_out(action: Action, path: Path, rescue: Sequence[Path]) -> Action | None:
+    """Empty a directory around what must stay, and say what really went."""
+    action.size, failed = _thin_out(path, rescue)
+    if not failed:
+        return None
+    action.error = failed
+    # As _rmtree_counting does: what really went is still reported, and said in
+    # the past tense. Copying only the applied line left
+    # `"detail": "empty out, keeping id_rsa"` beside `"applied": true` in
+    # --json — a promise next to its own receipt.
+    action.applied = action.size > 0
+    if action.applied:
+        action.detail = f"partly emptied out, {human_size(action.size)} of it"
     return action
 
 
@@ -4672,6 +4702,18 @@ def _strip_credential(
     )
     if not fix.allow(action):
         return action
+    if len([one for spot, one in _configured_urls(git, remote) if spot == setting]) > 1:
+        # git fetches from the *first* url=, so their order is load-bearing —
+        # and --replace-all collapses every line its pattern matches into one,
+        # which moves the survivor. Two values that strip to the same thing were
+        # enough to repoint a remote at its mirror, silently. One value is safe
+        # to rewrite in place; several are the user's to sort out.
+        action.detail = (
+            f"{setting} has more than one value, so take it out by hand: rewriting "
+            "one would reorder them, and git fetches from the first"
+        )
+        action.skipped = True
+        return action
     stripped = without_credential(url)
     if stripped is None or stripped == url:  # pragma: no cover - it matched to get here
         action.error = "could not work out the URL without the credential"
@@ -5123,6 +5165,7 @@ REASONS: tuple[tuple[str, str], ...] = (
     ("no upstream", "on a local-only branch, never pushed"),
     ("no such remote", "the configured remote is not there"),
     ("no remote", "no remote configured"),
+    ("take it out by hand", "credentials in a remote with several URLs — by hand"),
     ("credential in the remote", "a credential sits in a remote URL"),
     ("no longer exists", "on a branch whose upstream was deleted"),
     ("cannot compare", "cannot be compared with its upstream"),
