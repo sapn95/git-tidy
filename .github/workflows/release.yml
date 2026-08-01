@@ -156,12 +156,24 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - name: upload to the release
+        # The tag's own message as the notes. --generate-notes alone produced a
+        # bare "Full Changelog" link, so somebody deciding whether to upgrade
+        # from a version that could leave a credential in .git/config had to
+        # read the diff to find that out. The tag message is written by hand for
+        # exactly this; the generated list of commits goes underneath it.
         env:
           GH_TOKEN: ${{ github.token }}
-        run: >
-          gh release create "${GITHUB_REF_NAME}" dist/*
-          --generate-notes --repo "${GITHUB_REPOSITORY}"
+        run: |
+          git tag -l --format='%(contents)' "${GITHUB_REF_NAME}" > notes.md
+          if [ ! -s notes.md ]; then
+            git log -1 --pretty=%B "${GITHUB_REF_NAME}" > notes.md
+          fi
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --notes-file notes.md --generate-notes --repo "${GITHUB_REPOSITORY}"
 
   tap:
     name: update the Homebrew formula
