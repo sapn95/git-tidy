@@ -205,8 +205,11 @@ jobs:
           git diff --stat
       - name: commit
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # The repository owner, not the bot: GitHub counts a commit author as
+          # a contributor, and the formula bump is this project committing to
+          # itself rather than a second person turning up.
+          git config user.name "Sebastian Winterberger"
+          git config user.email "sapn95@users.noreply.github.com"
           git add Formula/git-tidy.rb
           git commit -m "chore: point the Homebrew formula at ${GITHUB_REF_NAME}" || exit 0
           git push origin main
@@ -230,8 +233,11 @@ jobs:
             "https://x-access-token:${TAP_TOKEN}@github.com/sapn95/homebrew-tap.git" tap
           cp Formula/git-tidy.rb tap/Formula/git-tidy.rb
           cd tap
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # The repository owner, not the bot: GitHub counts a commit author as
+          # a contributor, and the formula bump is this project committing to
+          # itself rather than a second person turning up.
+          git config user.name "Sebastian Winterberger"
+          git config user.email "sapn95@users.noreply.github.com"
           git add Formula/git-tidy.rb
           git commit -m "git-tidy ${GITHUB_REF_NAME#v}" || exit 0
           git push origin HEAD
