@@ -6876,7 +6876,7 @@ def test_gc_asks_before_it_packs(workspace: Path):
     gt.sync_repo(workspace / "repo", "repo", config(), gt.Decider(gt.ASK, prompt_input=answer))
 
     assert prompts_with == len(asked) + 1, (prompts_with, len(asked))
-    packs = [one for one in with_gc if one.kind == "pack"]
+    packs = [one for one in with_gc if one.kind == "gc"]
     assert packs and not packs[0].applied, "declined, and said so in the report"
 
 
@@ -6900,3 +6900,85 @@ def test_a_partial_thin_out_does_not_keep_its_prediction(workspace: Path, capsys
         assert (cache / "id_rsa").is_file()
     finally:
         locked.chmod(0o755)
+
+
+# --------------------------------------------------------------------------- #
+# Claude review, round nineteen
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "k: {a: 'b,c'}\n",
+        'k: {a: "b,c"}\n',
+        'k: {a: "b]c"}\n',
+        'k: {a: "b}c"}\n',
+        "k: [{a: 'b,c'}]\n",
+        "clean:\n  keep: [Don't Touch/*, build]\n",
+        "k: {a: b}\n",
+    ],
+)
+def test_a_quoted_value_in_a_flow_mapping_survives_its_own_punctuation(text: str):
+    """3.0.5 taught _split_flow that a quote only opens where a value can begin
+    and left the colon out of that list, so after `key:` the quote no longer
+    opened and every comma or bracket inside the value read as structure.
+    """
+    yaml = pytest.importorskip("yaml")
+    assert gt._parse_yaml_subset(text, "<t>") == yaml.safe_load(text), text
+
+
+def test_an_apostrophe_does_not_hide_a_tab():
+    """_outside_quotes had no can_open rule, so `- Don't\ttouch` swallowed it."""
+    with pytest.raises(gt.Failure, match="tab"):
+        gt._parse_yaml_subset("keep:\n  - Don't\ttouch\n", "<t>")
+
+
+def test_an_unhashable_flow_key_is_a_configuration_error():
+    """It was a bare TypeError and exit 1; the man page promises 2."""
+    with pytest.raises(gt.Failure, match="cannot be a key"):
+        gt._parse_yaml_subset("clean: {[a]: 1}\n", "<t>")
+
+
+def test_several_urls_are_refused_before_the_prompt(workspace: Path, capsys):
+    """The refusal sat after allow(), so a dry run promised the strip anyway."""
+    repo = workspace / "repo"
+    git(repo, "config", "--local", "remote.origin.url", "https://a:one@x.invalid/r.git")
+    git(repo, "config", "--local", "--add", "remote.origin.url", "https://b:two@x.invalid/r.git")
+
+    gt.main(["-C", str(workspace), "doctor", "--fix"])
+    dry = capsys.readouterr().out
+    gt.main(["-C", str(workspace), "doctor", "--fix", "--apply"])
+    applied = capsys.readouterr().out
+
+    assert "would take the credential out" not in dry
+    assert "by hand" in dry and "by hand" in applied
+    # One problem, one action: it used to report one per value.
+    lines = [one for one in dry.splitlines() if "by hand" in one and one.lstrip().startswith("-")]
+    assert len(lines) == 1, lines
+
+
+def test_gc_auto_does_not_claim_a_pack_it_did_not_do(workspace: Path, capsys):
+    """--auto exits 0 whether or not it repacked, and only acts past gc.auto.
+
+    Reading the exit code as success reported "200 repositories packed" for a
+    workspace where nothing happened at all.
+    """
+    (workspace / gt.CONFIG_NAMES[0]).write_text("sync:\n  gc: true\n", encoding="utf-8")
+    gt.main(["-C", str(workspace), "sync", "--apply", "-v"])
+    out = capsys.readouterr().out
+    assert "not worth repacking" in out
+    assert "repositories repacked" not in out
+
+
+def test_gc_says_what_it_would_do_in_a_dry_run(workspace: Path, capsys):
+    (workspace / gt.CONFIG_NAMES[0]).write_text("sync:\n  gc: true\n", encoding="utf-8")
+    gt.main(["-C", str(workspace), "sync", "-v"])
+    assert "would run git gc --auto" in capsys.readouterr().out
+
+
+def test_the_two_kinds_of_pack_do_not_share_consent(workspace: Path):
+    """Answering `a` to a no-op gc must not consent to doctor's real one."""
+    auto = gt.Action("gc", "repo", ".git", "run git gc --auto")
+    real = gt.Action("pack", "repo", ".git", "pack .git with git gc, 900 MB")
+    assert auto.consent_key != real.consent_key

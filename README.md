@@ -254,13 +254,19 @@ pushed or dropped.
 
 Credentials are read out of `.git/config` directly rather than through
 `git remote get-url`, which expands `insteadOf` — a token in your `~/.gitconfig`
-is not this repository's problem. `pushurl` and any second `url` are checked
-too, and a bare `https://token@host/…`, which is how a personal access token is
-usually pasted, counts as much as `user:secret@`. An `ssh://git@host` username
-does not.
+is not this repository's problem. `pushurl` is looked at as well as `url`, and a
+bare `https://token@host/…`, which is how a personal access token is usually
+pasted, counts as much as `user:secret@`. An `ssh://git@host` username does not.
 
-`--ask` asks once per remedy per repository; answering `a` covers that one
-remedy, not the other two.
+A setting holding *more than one* value is reported and left alone. Rewriting
+one of several would reorder them, and the order matters in both cases for
+different reasons: git fetches from the *first* `url`, and pushes to *every*
+`pushurl`. So that one is yours to sort out, and the report says so rather than
+quietly repointing the remote.
+
+`--ask` asks once per remedy per repository — twice if a repository has a
+credential in both `url` and `pushurl`, which are two settings and two answers.
+Answering `a` covers that one remedy, not the other two.
 
 ## How a path is decided
 
@@ -491,7 +497,10 @@ git tidy run --apply
   can touch committed content.
 - Symlinks are never followed; nothing outside the workspace is ever touched.
 - Swept files go to a quarantine with a manifest, and `restore` undoes it.
-- Anything that looks like a credential is quarantined, never deleted.
+- Anything that looks like a credential is never deleted. Inside a directory
+  being removed it stays exactly where it is, unless `clean.quarantine` is on —
+  then the whole directory is moved and it goes along, at a different path. On
+  its own it goes to quarantine.
 - It refuses to run on `$HOME` or a filesystem root.
 
 ## Development
