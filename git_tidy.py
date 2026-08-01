@@ -69,7 +69,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NoReturn
 
-__version__ = "3.0.3"
+__version__ = "3.0.4"
 
 CONFIG_NAMES = (".git-tidy.yaml", ".git-tidy.yml")
 QUARANTINE_DIRNAME = ".git-tidy-trash"
@@ -365,7 +365,11 @@ COMMENTS: dict[str, str] = {
     "looks like an artefact. Leave this off.",
     "clean.keep": "Paths never considered, as globs relative to the repository or the\n"
     "workspace root.",
-    "clean.quarantine": "Move removals to the quarantine instead of deleting them.",
+    "clean.quarantine": "Move removals to the quarantine instead of deleting them.\n"
+    "Note this changes what happens to a protected file inside a directory that\n"
+    "is being removed: without it the file stays where it is and the directory\n"
+    "is emptied around it, with it the whole directory is moved and the file\n"
+    "goes with it. Recoverable either way, but the path changes.",
     "trash": "Sweeping loose junk out of the workspace itself.",
     "trash.enabled": "Off until you turn it on: deleting files nobody asked about is\n"
     "the one thing here that cannot be inferred from git.",
@@ -380,8 +384,11 @@ COMMENTS: dict[str, str] = {
     "trash.sensitive": "Reported as sensitive and always quarantined rather than\n"
     "deleted, even with quarantine off, because a token may be the only copy.\n"
     "A file with a source-code extension is exempt: pygments/token.py matches\n"
-    "*token* and is not a secret. Inside a directory that is being removed, the\n"
-    "matches are lifted into quarantine and the rest of it still goes.",
+    "*token* and is not a secret, and so is a certificate holding no private\n"
+    "key. Inside a directory clean is removing, the matches stay exactly where\n"
+    "they are and the rest of it goes — moving a .env to a quarantine is not\n"
+    "much better for its owner than deleting it. A trash sweep is different:\n"
+    "there the whole directory is quarantined.",
     "trash.min_age_days": "Nothing younger than this is touched, so today's scratch\n"
     "file survives.",
     "trash.keep": "Never swept, whatever else matches. patterns win over the\n"
@@ -564,6 +571,14 @@ def _tokenize(text: str, source: str) -> list[_Line]:
     for number, raw in enumerate(_yaml_lines(text), start=1):
         if "\t" in raw[: len(raw) - len(raw.lstrip())]:
             raise Failure(f"{source}:{number}: tabs cannot be used for YAML indentation")
+        # The raw line for the printable check: PyYAML's Reader runs over the
+        # whole stream, comments included, so `jobs: 4  # note\x00here` was
+        # fatal there and loaded fine here.
+        for char in raw:
+            if not _yaml_printable(char):
+                raise Failure(
+                    f"{source}:{number}: character {ord(char):#04x} is not allowed in YAML"
+                )
         content = _strip_comment(raw)
         # After the comment is gone, and before the trailing whitespace is: a
         # tab in `jobs: 4  # workers\t(one per core)` is fine to PyYAML and used
@@ -939,10 +954,20 @@ def _flow_collection(token: str, source: str, number: int) -> Any:
     return _NOT_FLOW
 
 
-def _plain_scalar(token: str, source: str = "<config>", number: int = 0) -> Any:
-    """An unquoted token: null, a bool, a number, or the text itself."""
-    if not token:
-        return None  # an empty scalar is null, as it is in _YAML_NULL below
+def _refuse_unreadable_scalar(token: str, source: str, number: int) -> None:
+    """Plain-scalar shapes this parser will not guess at.
+
+    Each is a case where PyYAML means something specific, so reading it as
+    text would make the same file mean two things depending on which parser
+    ran — which is the whole reason this one is strict rather than kind.
+    """
+    if token.startswith("?") and token[1:2] in ("", " "):
+        # `? x`, or `?` alone. Only with a space after it: `a: ?x` is the plain
+        # string PyYAML reads it as, and `a: x?y` never had a question about it.
+        # The flow-collection path has guarded this for rounds; this one had not.
+        raise Failure(
+            f"{source}:{number}: '?' opens a complex mapping key here; quote it if it is text"
+        )
     if token.startswith("-") and token[1:2] in ("", " "):
         # PyYAML reads this as a nested sequence, which nothing here has a use
         # for, and refuses it in a value position. Refusing it too keeps the two
@@ -968,6 +993,13 @@ def _plain_scalar(token: str, source: str = "<config>", number: int = 0) -> Any:
             f"{source}:{number}: {token!r} has a second ': ' in it; quote the value "
             "if the colon is part of it"
         )
+
+
+def _plain_scalar(token: str, source: str = "<config>", number: int = 0) -> Any:
+    """An unquoted token: null, a bool, a number, or the text itself."""
+    if not token:
+        return None  # an empty scalar is null, as it is in _YAML_NULL below
+    _refuse_unreadable_scalar(token, source, number)
     if token[:1] in _YAML_INDICATORS:
         raise Failure(
             f"{source}:{number}: a value starting with {token[0]!r} means something "
@@ -3585,6 +3617,11 @@ def _remove(
             action.size, failed = _thin_out(path, rescue)
             if failed:
                 action.error = failed
+                # As _rmtree_counting does: what really went is still reported.
+                # Returning applied=False after emptying 100 KB out of a
+                # directory made the line say "(97.7 KB)" while the summary said
+                # nothing was removed and nothing freed, of the same action.
+                action.applied = action.size > 0
                 return action
         elif is_dir:
             # rmtree removes what it can and then raises, so the plain call
@@ -3598,6 +3635,20 @@ def _remove(
             path.unlink()
     except (OSError, Failure) as exc:
         action.error = str(exc)
+        return action
+    return _finished(action, thinned, because)
+
+
+def _finished(action: Action, thinned: bool, because: str) -> Action:
+    """Say what happened, once it has."""
+    if thinned and action.size == 0:
+        # Everything in it was protected, so the directory is exactly as it was.
+        # Calling that "emptied out" and counting it as one path removed made a
+        # .venv whose only match is a certifi/cacert.pem report work on every
+        # run for ever, with nothing removed and no bytes freed — and that false
+        # applied is what made the quarantine expiry fire each time too.
+        action.skipped = True
+        action.detail = f"kept whole: everything in it is protected{because}"
         return action
     action.applied = True
     # "removed" would be untrue for a quarantined path: it is still on the disk,
@@ -4532,7 +4583,7 @@ def _cannot_leave_a_detached_head(
         return no(f"and {trunk} tracks {clobbered}, which is ignored here and would be replaced")
     elsewhere = _checked_out_elsewhere(git, trunk)
     if elsewhere is not None:
-        return no(f"and {trunk} is in use by the worktree {elsewhere}")
+        return no(f"and {trunk} is checked out in the worktree {elsewhere}")
     return None
 
 
@@ -4579,7 +4630,12 @@ def _configured_urls(git: Git, remote: str) -> list[tuple[str, str]]:
         # because that is what --fixed-value compares against. Trimming it meant
         # a URL saved with a trailing space never matched itself, and git
         # appended one more url= on every run instead of replacing.
-        raw = git.run("config", "-z", "--get-all", setting, check=False).stdout
+        # --local, because the write is --local: git config --replace-all
+        # defaults to the local file, so a credential living in ~/.gitconfig
+        # matched nothing there and git *appended* a new url= instead. Every run
+        # added another, the read-back kept reporting failure, and none of it
+        # was ever mentioned.
+        raw = git.run("config", "--local", "-z", "--get-all", setting, check=False).stdout
         found.extend((setting, url) for url in raw.split("\0") if url)
     return found
 
@@ -4621,11 +4677,24 @@ def _strip_credential(
     # more url= on every run for ever. An anchored, escaped pattern is the
     # fallback and covers the metacharacters; only whitespace defeats it.
     result = git.run(
-        "config", "--fixed-value", "--replace-all", setting, stripped, url, check=False
+        "config",
+        "--local",
+        "--fixed-value",
+        "--replace-all",
+        setting,
+        stripped,
+        url,
+        check=False,
     )
     if result.returncode != 0 and "fixed-value" in (result.stdout + result.stderr):
         result = git.run(
-            "config", "--replace-all", setting, stripped, "^" + re.escape(url) + "$", check=False
+            "config",
+            "--local",
+            "--replace-all",
+            setting,
+            stripped,
+            "^" + re.escape(url) + "$",
+            check=False,
         )
     if result.returncode != 0:
         action.error = last_line(result)
@@ -4642,6 +4711,15 @@ def _strip_credential(
         # remedy whose failure leaves somebody believing they need not rotate.
         action.error = f"the credential is still in {setting}; take it out by hand"
         return action
+    # Two url= values that strip to the same thing leave two identical lines,
+    # which git then warns about on every command. Harmless but untidy, and the
+    # tidying is the point.
+    if len([one for _, one in _configured_urls(git, remote) if one == stripped]) > 1:
+        # --fixed-value, so only the copies of *this* value go. A plain
+        # --unset-all cleared every url= the remote had, which would have taken
+        # an unrelated second URL with it — losing a mirror to tidy a duplicate.
+        git.run("config", "--local", "--fixed-value", "--unset-all", setting, stripped, check=False)
+        git.run("config", "--local", "--add", setting, stripped, check=False)
     action.applied = True
     action.detail = f"credential taken out of {setting}, now {stripped}"
     return action
@@ -5001,6 +5079,7 @@ REASONS: tuple[tuple[str, str], ...] = (
     ("commits not in", "branches with commits not in the trunk"),
     ("diverged", "diverged from upstream — needs a merge or rebase by hand"),
     ("contains a git repository", "directories holding a git repository"),
+    ("checked out in the worktree", "detached HEADs whose trunk another worktree holds"),
     ("in use by the worktree", "branches a worktree still has checked out"),
     ("uncommitted work in", "submodules with uncommitted work"),
     ("would be replaced", "a local file the incoming commits would overwrite"),
@@ -5016,6 +5095,7 @@ REASONS: tuple[tuple[str, str], ...] = (
     ("a dependency tree", "dependency trees — clean.dependencies is off"),
     ("build output", "build output — clean.builds is off"),
     ("orphaned worktree", "orphaned worktrees — the parent pruned them away"),
+    ("kept whole", "directories where everything in them is protected"),
     ("are on no branch", "detached HEADs holding commits that are on no branch"),
     ("are not in", "detached HEADs ahead of the trunk"),
     ("no branch to go back to", "detached HEADs with no branch to return to"),

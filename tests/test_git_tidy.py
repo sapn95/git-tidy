@@ -6625,7 +6625,8 @@ def test_a_partly_removed_directory_says_how_much_went(workspace: Path, capsys):
         assert (locked / "stuck.bin").exists(), "4 KB really did not"
         # The size on the line is what went, not what was predicted. Reporting
         # the prediction claimed 12 KB freed from a removal that failed.
-        assert "8.0 KB" in out and "12" not in out.split("Summary")[0]
+        line = next(one for one in out.splitlines() if "__pycache__" in one)
+        assert "8.0 KB" in line, line  # what went, not the 12 KB predicted
     finally:
         locked.chmod(0o755)
 
@@ -6672,3 +6673,108 @@ def test_a_value_ending_in_an_escaped_backslash_still_closes():
         "a: 'it''s' # note\n",
     ):
         assert gt._parse_yaml_subset(text, "<t>") == yaml.safe_load(text), text
+
+
+# --------------------------------------------------------------------------- #
+# Claude review, round seventeen
+# --------------------------------------------------------------------------- #
+
+
+def test_a_credential_outside_this_repository_is_not_rewritten_into_it(workspace: Path):
+    """The read saw every scope; the write went to the local file.
+
+    So a credential in ~/.gitconfig matched nothing local, git *appended* a new
+    url= instead of replacing one, the read-back reported failure, and the next
+    run did it again — silently growing .git/config for ever.
+    """
+    repo = workspace / "repo"
+    elsewhere = workspace.parent / "elsewhere.gitconfig"
+    elsewhere.write_text(
+        '[remote "origin"]\n\turl = https://a:s3cr3t@global.invalid/r.git\n', encoding="utf-8"
+    )
+    os.environ["GIT_CONFIG_GLOBAL"] = str(elsewhere)
+    try:
+        _credential_runs(workspace)
+    finally:
+        os.environ.pop("GIT_CONFIG_GLOBAL", None)
+    local = git(repo, "config", "--local", "--get-all", "remote.origin.url").splitlines()
+    assert len(local) == 1, local
+    assert "s3cr3t" not in "".join(local)
+
+
+def _credential_runs(workspace: Path) -> None:
+    for _ in range(3):
+        gt.main(["-C", str(workspace), "doctor", "--fix", "--apply"])
+
+
+def test_two_credentials_stripping_to_one_url_leave_one_line(workspace: Path):
+    """And an unrelated third URL survives the tidying, which is the hard part.
+
+    A plain --unset-all cleared every url= the remote had before re-adding one,
+    so deduplicating two would have taken a mirror with it.
+    """
+    repo = workspace / "repo"
+    git(repo, "config", "--local", "remote.origin.url", "https://a:one@same.invalid/r.git")
+    git(repo, "config", "--local", "--add", "remote.origin.url", "https://b:two@same.invalid/r.git")
+    git(
+        repo,
+        "config",
+        "--local",
+        "--add",
+        "remote.origin.url",
+        "https://c:three@other.invalid/mirror.git",
+    )
+
+    gt.main(["-C", str(workspace), "doctor", "--fix", "--apply"])
+    left = sorted(git(repo, "config", "--local", "--get-all", "remote.origin.url").splitlines())
+    assert left == ["https://other.invalid/mirror.git", "https://same.invalid/r.git"], left
+
+
+def test_a_directory_where_everything_is_protected_is_not_called_removed(workspace: Path, capsys):
+    """It reported one path removed and no bytes freed, on every run, for ever.
+
+    That false applied is also what made the quarantine expiry fire each time.
+    """
+    repo = workspace / "repo"
+    cache = repo / "__pycache__"
+    cache.mkdir()
+    (cache / "cacert.pem").write_text("-----BEGIN CERTIFICATE-----\n", encoding="utf-8")
+
+    for _ in range(2):
+        gt.main(["-C", str(workspace), "clean", "--apply"])
+        out = capsys.readouterr().out
+        assert "kept whole" in out
+        assert "removed" not in out.split("Summary")[1]
+    assert (cache / "cacert.pem").is_file()
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["jobs: 4  # note\x00here\n", "# lead\x00\njobs: 4\n", "a: ?\n", "sync:\n  remote: ? x\n"],
+)
+def test_the_parser_refuses_these_as_pyyaml_does(text: str):
+    """A control character in a *comment*, and `? ` opening a complex key."""
+    yaml = pytest.importorskip("yaml")
+    with pytest.raises(Exception):  # noqa: B017 - the point is that it does not parse
+        yaml.safe_load(text)
+    with pytest.raises(gt.Failure):
+        gt._parse_yaml_subset(text, "<t>")
+
+
+@pytest.mark.parametrize("text", ["a: ?x\n", "a: x?y\n", "jobs: 4  # fine\n"])
+def test_a_question_mark_that_is_only_a_question_mark(text: str):
+    yaml = pytest.importorskip("yaml")
+    assert gt._parse_yaml_subset(text, "<t>") == yaml.safe_load(text)
+
+
+def test_a_detached_head_is_not_counted_as_a_branch(workspace: Path, capsys):
+    """Its trunk being checked out elsewhere was summarised as a branch."""
+    repo = workspace / "repo"
+    commit(repo, "second.txt")
+    git(repo, "switch", "-q", "--detach", "HEAD~1")
+    linked = workspace / "wt"
+    git(repo, "worktree", "add", "-q", str(linked), "main")
+
+    gt.main(["-C", str(workspace), "doctor", "--fix"])
+    out = capsys.readouterr().out
+    assert "detached HEADs whose trunk another worktree holds" in out
