@@ -491,7 +491,8 @@ git tidy run --apply
   can touch committed content.
 - Symlinks are never followed; nothing outside the workspace is ever touched.
 - Swept files go to a quarantine with a manifest, and `restore` undoes it.
-- Anything that looks like a credential is quarantined, never deleted.
+- Anything that looks like a credential is never deleted. Inside a directory
+  being removed it stays exactly where it is; on its own it goes to quarantine.
 - It refuses to run on `$HOME` or a filesystem root.
 
 ## Development

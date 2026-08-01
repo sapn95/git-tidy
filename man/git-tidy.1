@@ -62,7 +62,11 @@ not through
 .BR "git remote get-url" ,
 which expands \fIinsteadOf\fR \(em a token in
 .I ~/.gitconfig
-is not this repository's. \fIpushurl\fR and additional \fIurl\fR values count.
+is not this repository's. \fIpushurl\fR counts as well as \fIurl\fR.
+.IP
+A setting holding \fImore than one\fR value is reported and left alone: git
+fetches from the first \fIurl\fR, and rewriting one of several would reorder
+them.
 .TP
 .B run
 sync, prune, clean, trash and doctor, in that order. A

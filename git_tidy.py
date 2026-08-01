@@ -69,7 +69,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NoReturn
 
-__version__ = "3.0.5"
+__version__ = "3.0.6"
 
 CONFIG_NAMES = (".git-tidy.yaml", ".git-tidy.yml")
 QUARANTINE_DIRNAME = ".git-tidy-trash"
@@ -511,15 +511,26 @@ def _yaml_printable(char: str) -> bool:
 
 
 def _outside_quotes(text: str) -> str:
-    """The parts of a line that are not inside a quoted scalar."""
+    """The parts of a line that are not inside a quoted scalar.
+
+    The same "a quote only opens where a value can begin" rule the other two
+    scanners have. Without it the apostrophe in `- Don't\ttouch` opened a run
+    that swallowed the rest of the line, so the tab after it was never seen —
+    accepted on every shipped binary and a ScannerError from a checkout.
+    """
     out: list[str] = []
     quote: str | None = None
+    can_open = True
     for char in text:
         if quote:
             if char == quote:
                 quote = None
             continue
-        if char in "\"'":
+        if char in ":,[{-":
+            can_open = True
+        elif char not in " \t":
+            can_open = can_open and char in "\"'"
+        if char in "\"'" and can_open:
             quote = char
             continue
         out.append(char)
@@ -745,7 +756,7 @@ def _split_flow(body: str, source: str, number: int) -> list[str]:
             current.append(ch)
             quote, escaped = _inside_quote(ch, quote, escaped)
             continue
-        if ch in ",[{":
+        if ch in ":,[{-":
             can_open = True
         elif ch not in " \t":
             can_open = can_open and ch in "\"'"
@@ -955,7 +966,14 @@ def _flow_collection(token: str, source: str, number: int) -> Any:
     if token.startswith("{"):
         mapping: dict[str, Any] = {}
         for part in _split_flow(token[1:-1], source, number):
-            key, sep, value = part.partition(":")
+            key, sep, value = part.partition(": ")
+            if not sep and part.endswith(":"):
+                key, sep, value = part[:-1], ":", ""
+            if key.strip().startswith(("[", "{")):
+                # As _parse_mapping does for the block path: _scalar would hand
+                # back a list or a dict, and an unhashable dict key is a bare
+                # TypeError rather than anything a person can act on.
+                raise Failure(f"{source}:{number}: a list or mapping cannot be a key")
             if not sep:
                 raise Failure(f"{source}:{number}: expected 'key: value' inside {{...}}")
             mapping[_scalar(key, source, number)] = _scalar(value, source, number)
@@ -1851,20 +1869,57 @@ def _sync_from(
         _fast_forward(git, name, head, branch, target, sync, decider, ignored_keep, fetch.applied)
     )
     actions.extend(_sync_submodules(git, name, sync, decider))
-    if sync["gc"] and not decider.dry:
-        # Asked for, and reported: it used to run whenever sync.gc was on, even
-        # in a repository where every fetch and switch in the same run had just
-        # been declined — and it never appeared in the report either way.
-        pack = Action("pack", name, ".git", "run git gc")
-        if decider.allow(pack):
-            result = git.run("gc", "--auto", "--quiet", check=False)
-            if result.returncode == 0:
-                pack.applied = True
-                pack.detail = "packed with git gc"
-            else:
-                pack.error = last_line(result)
-        actions.append(pack)
+    if sync["gc"]:
+        actions.append(_maybe_pack(git, name, decider))
     return actions
+
+
+def _maybe_pack(git: Git, name: str, decider: Decider) -> Action:
+    """`git gc --auto`, which is usually a no-op, and says so when it was one.
+
+    --auto exits 0 whether or not it repacked anything — it only acts past
+    gc.auto, some seven thousand loose objects — so reading the exit code as
+    success reported "200 repositories packed" for a workspace where nothing
+    happened. COMMENTS["sync.gc"], which `git-tidy init` writes into the user's
+    config, says "when git itself thinks it is worth it", and this is the half
+    that decides whether it did.
+
+    Its own kind, not "pack": doctor --fix runs an unconditional `git gc` under
+    that name, and sharing it meant answering `a` to this — usually a no-op —
+    silently consented to the one that prunes unreachable objects and expires
+    reflogs.
+    """
+    action = Action("gc", name, ".git", "run git gc --auto")
+    if decider.dry:
+        # Said in a dry run too. Skipping it there meant `sync -n` was silent
+        # about something `sync --apply` then reported.
+        action.detail = "would run git gc --auto"
+        action.skipped = True
+        return action
+    if not decider.allow(action):
+        return action
+    before = _loose_objects(git)
+    result = git.run("gc", "--auto", "--quiet", check=False)
+    if result.returncode != 0:
+        action.error = last_line(result)
+        return action
+    after = _loose_objects(git)
+    if after >= before:
+        action.skipped = True
+        action.detail = "git decided it was not worth repacking yet"
+        return action
+    action.applied = True
+    action.detail = f"repacked {plural(before - after, 'loose object')}"
+    return action
+
+
+def _loose_objects(git: Git) -> int:
+    """How many loose objects git is carrying, from its own accounting."""
+    for line in git.out("count-objects", "-v", check=False).splitlines():
+        field, _, value = line.partition(": ")
+        if field == "count" and value.strip().isdigit():
+            return int(value)
+    return 0
 
 
 @dataclass
@@ -4647,15 +4702,23 @@ def _check_credentials(
     this file takes the list it fills; this was the one that did not.
     """
     for remote in remotes:
-        for setting, url in _configured_urls(git, remote):
-            if not CREDENTIAL_IN_URL.match(url):
+        urls = _configured_urls(git, remote)
+        for setting in dict.fromkeys(spot for spot, _ in urls):
+            # Per setting, not per value: two credentialed url= lines are one
+            # problem with one answer, and looping the values gave two identical
+            # actions, two identical prompts and a held-back count of two.
+            values = [one for spot, one in urls if spot == setting]
+            leaking = [one for one in values if CREDENTIAL_IN_URL.match(one)]
+            if not leaking:
                 continue
             where = setting.rsplit(".", 1)[-1]
-            detail = f"credential in the remote {where} — {redact(url)}"
+            detail = f"credential in the remote {where} — {redact(leaking[0])}"
             if fix is None:
                 found.append(Action("doctor", name, remote, detail, skipped=True))
                 continue
-            found.append(_strip_credential(git, name, remote, setting, url, detail, fix))
+            found.append(
+                _strip_credential(git, name, remote, setting, leaking[0], detail, fix, len(values))
+            )
 
 
 def _configured_urls(git: Git, remote: str) -> list[tuple[str, str]]:
@@ -4685,7 +4748,14 @@ def _configured_urls(git: Git, remote: str) -> list[tuple[str, str]]:
 
 
 def _strip_credential(
-    git: Git, name: str, remote: str, setting: str, url: str, detail: str, fix: Decider
+    git: Git,
+    name: str,
+    remote: str,
+    setting: str,
+    url: str,
+    detail: str,
+    fix: Decider,
+    values: int = 1,
 ) -> Action:
     """Rewrite the remote without the credential in it.
 
@@ -4700,9 +4770,7 @@ def _strip_credential(
     action = Action(
         "strip credential", name, f"{remote} {where}", f"take the credential out of {setting}"
     )
-    if not fix.allow(action):
-        return action
-    if len([one for spot, one in _configured_urls(git, remote) if spot == setting]) > 1:
+    if values > 1:
         # git fetches from the *first* url=, so their order is load-bearing —
         # and --replace-all collapses every line its pattern matches into one,
         # which moves the survivor. Two values that strip to the same thing were
@@ -4713,6 +4781,8 @@ def _strip_credential(
             "one would reorder them, and git fetches from the first"
         )
         action.skipped = True
+        return action
+    if not fix.allow(action):
         return action
     stripped = without_credential(url)
     if stripped is None or stripped == url:  # pragma: no cover - it matched to get here
@@ -5015,6 +5085,7 @@ DID: tuple[tuple[str, str, str], ...] = (
     ("switch back", "detached HEADs put back on the trunk", "detached HEADs to put back"),
     ("strip credential", "credentials taken out of remote URLs", "credentials to take out"),
     ("pack", "repositories packed", "repositories to pack"),
+    ("gc", "repositories repacked by git gc --auto", "repositories git may repack"),
     ("fetch", "repositories fetched", "repositories to fetch"),
     ("switch", "branches switched", "branches to switch"),
     ("update", "repositories fast-forwarded", "repositories to fast-forward"),
@@ -5151,6 +5222,7 @@ REASONS: tuple[tuple[str, str], ...] = (
     ("a dependency tree", "dependency trees — clean.dependencies is off"),
     ("build output", "build output — clean.builds is off"),
     ("orphaned worktree", "orphaned worktrees — the parent pruned them away"),
+    ("not worth repacking", "repositories git did not think were worth repacking"),
     ("kept whole", "directories where everything in them is protected"),
     ("are on no branch", "detached HEADs holding commits that are on no branch"),
     ("are not in", "detached HEADs ahead of the trunk"),
