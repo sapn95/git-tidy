@@ -152,13 +152,16 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Checkout first: it clears the working directory, so downloading the
+      # artefacts before it left `dist/*` with no matches and the release
+      # unpublished.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
       - name: upload to the release
         # The tag's own message as the notes. --generate-notes alone produced a
         # bare "Full Changelog" link, so somebody deciding whether to upgrade
