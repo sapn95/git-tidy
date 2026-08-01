@@ -118,10 +118,14 @@ Two mechanisms, and the first is usually all you need:
   because those are caches a tool rebuilds — every `.terraform` holds a
   `terraform.tfstate`, which is the backend pointer, not your state.
 
-  `trash.sensitive` holds everywhere, but not for source code: a `tokenizer.js`
-  or a `pygments/token.py` matches `*token*` and is not a secret, so anything
-  with a source-code extension is exempt. If it really is source, it is
-  committed, and `clean` does not touch tracked files.
+  `trash.sensitive` holds everywhere, but not for things that are provably not
+  secrets. A `tokenizer.js` or a `pygments/token.py` matches `*token*` and is
+  source, so anything with a source-code extension is exempt. A
+  `certifi/cacert.pem` matches `*.pem` and holds a hundred *public* certificates
+  and no private key, so a certificate file is read before it is believed. And a
+  directory whose every file is source — eslint ships a
+  `source-code/token-store/` — is source too; one holding anything else, like a
+  `mycreds/` with a password file in it, is kept whole.
 - **`clean.dirs` / `clean.files`** — names removed wherever they appear, ignored
   or not: `.terraform`, `.terragrunt-cache`, `__pycache__`, `.pytest_cache`,
   `.scannerwork`, `*.pyc`, `.coverage`, and so on.

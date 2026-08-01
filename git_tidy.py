@@ -69,7 +69,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NoReturn
 
-__version__ = "3.0.1"
+__version__ = "3.0.2"
 
 CONFIG_NAMES = (".git-tidy.yaml", ".git-tidy.yml")
 QUARANTINE_DIRNAME = ".git-tidy-trash"
@@ -500,8 +500,20 @@ def _refuse_control_characters(text: str, source: str, number: int) -> None:
     for char in _outside_quotes(text):
         if char == "\t":
             raise Failure(f"{source}:{number}: a tab on this line; YAML wants spaces")
-        if ord(char) < 0x20 and char not in "\n\r":
+        if ord(char) < 0x20 and char != "\n":
             raise Failure(f"{source}:{number}: control character {ord(char):#04x} on this line")
+
+
+# Exactly the breaks PyYAML's scanner recognises. str.splitlines() adds \x0b,
+# \x0c and \x1c-\x1e, which PyYAML refuses outright; split("\n") drops \r, \x85
+# and \u2028, which PyYAML honours. Either way the same file meant two things
+# depending on whether PyYAML happened to be installed, which is the one thing
+# this parser exists not to do.
+_YAML_BREAKS = re.compile(r"\r\n|\r|\n|\x85|\u2028|\u2029")
+
+
+def _yaml_lines(text: str) -> list[str]:
+    return _YAML_BREAKS.split(text)
 
 
 def _tokenize(text: str, source: str) -> list[_Line]:
@@ -509,12 +521,9 @@ def _tokenize(text: str, source: str) -> list[_Line]:
     # key becomes "\ufeffjobs" and the whole config is refused — but only where
     # PyYAML is absent, which is every shipped binary.
     text = text.lstrip("\ufeff")
-    # split("\n"), not splitlines(): the latter also breaks on \x0b, \x0c and
-    # \x1c-\x1e, so `a: 4\x0cclean:` became two keys here and a hard error
-    # under PyYAML — the same file meaning two different things again.
     lines: list[_Line] = []
     ended = False
-    for number, raw in enumerate(text.replace("\r\n", "\n").split("\n"), start=1):
+    for number, raw in enumerate(_yaml_lines(text), start=1):
         if "\t" in raw[: len(raw) - len(raw.lstrip())]:
             raise Failure(f"{source}:{number}: tabs cannot be used for YAML indentation")
         content = _strip_comment(raw)
@@ -2965,7 +2974,7 @@ def _protected_within(
         relative = None
         with contextlib.suppress(ValueError):
             relative = entry.relative_to(root).as_posix()
-        return _protects(entry.name, sensitive, local_state, relative)
+        return _protects(entry.name, sensitive, local_state, relative, entry)
 
     for dirpath, dirnames, filenames in os.walk(directory, followlinks=False, onerror=unreadable):
         here = Path(dirpath)
@@ -2985,7 +2994,7 @@ def _sensitive_within(directory: Path, sensitive: Sequence[str]) -> str | None:
     for dirpath, dirnames, filenames in os.walk(directory, followlinks=False):
         here = Path(dirpath)
         for entry in (*dirnames, *filenames):
-            if _protects(entry, sensitive):
+            if _protects(entry, sensitive, path=here / entry):
                 return (here / entry).relative_to(directory).as_posix()
         dirnames[:] = [d for d in dirnames if not (here / d).is_symlink()]
     return None
@@ -3324,6 +3333,7 @@ def _protects(
     sensitive: Sequence[str],
     local_state: Sequence[str] = (),
     relative: str | None = None,
+    path: Path | None = None,
 ) -> bool:
     """Whether `name` is something a removal must not take with it.
 
@@ -3338,8 +3348,61 @@ def _protects(
     if Path(name).suffix.lower() not in SOURCE_SUFFIXES and any(
         _matches(one, sensitive) for one in names
     ):
-        return True
+        return not _plainly_not_a_secret(path)
     return any(_matches(one, local_state) for one in names)
+
+
+# A certificate file holds a private key or it does not, and the difference is
+# written in the file. Every .venv ships a certifi/cacert.pem: 130 public
+# certificates, no key at all, and treating it as a credential is how a 200 MB
+# virtualenv is kept back over 300 KB of published trust anchors.
+CERTIFICATE_SUFFIXES = frozenset({".pem", ".crt", ".cer", ".ca-bundle"})
+PRIVATE_KEY_MARKER = b"PRIVATE KEY"
+# Enough to reach the first PEM header of any real key file; a key that begins
+# 64 KB into a certificate bundle is not a thing that happens.
+CERTIFICATE_PEEK = 64 * 1024
+
+
+def _plainly_not_a_secret(path: Path | None) -> bool:
+    """Whether this path is provably harmless despite matching by name.
+
+    Two cases, both from a real workspace and both costing more than they save:
+
+    A certificate bundle with no private key in it. `*.pem` is in the default
+    trash.sensitive because a .pem *can* be a key — but when the bytes say it is
+    not, the name is not evidence of anything.
+
+    A directory whose every file is source code. `*token*` matches eslint's
+    `source-code/token-store/`, which is forty .js files. The suffix exemption
+    reads the name, and a directory has no suffix, so it could never apply to
+    one — while `credentials/` holding an id_rsa still must be kept, and is,
+    because that directory holds something that is not source.
+    """
+    if path is None:
+        return False
+    try:
+        if path.is_dir():
+            return _only_source_inside(path)
+        if path.suffix.lower() in CERTIFICATE_SUFFIXES:
+            with path.open("rb") as handle:
+                return PRIVATE_KEY_MARKER not in handle.read(CERTIFICATE_PEEK)
+    except OSError:
+        # Cannot read it, so cannot rule it out. Keeping it is the safe answer,
+        # and the same one _Unreadable gives everywhere else.
+        return False
+    return False
+
+
+def _only_source_inside(directory: Path) -> bool:
+    """True when every file under `directory` is source code, and there is one."""
+    found = False
+    for dirpath, dirnames, filenames in os.walk(directory, followlinks=False):
+        dirnames[:] = [d for d in dirnames if not (Path(dirpath) / d).is_symlink()]
+        for name in filenames:
+            if Path(name).suffix.lower() not in SOURCE_SUFFIXES:
+                return False
+            found = True
+    return found
 
 
 def _protected(path: Path, root: Path, keep: Sequence[str], tracked: set[str]) -> bool:
@@ -3369,7 +3432,7 @@ def _what_to_keep(
     """
     if quarantine is not None or not (sensitive or local_state):
         return quarantine, [], ""
-    if holding is not None and _protects(path.name, sensitive, local_state):
+    if holding is not None and _protects(path.name, sensitive, local_state, path=path):
         # The name first, and for a directory as much as for a file: a directory
         # called credentials/ or tokens/ *is* the thing being protected, so it
         # goes whole rather than being emptied out. _protected_within walks the
@@ -3902,7 +3965,7 @@ TEMP_SUFFIXES = ("*~", "*.swp", "*.swo", "*.orig", "*.rej", "*.bak", "*.tmp", "*
 def classify_trash(path: Path, trash: dict[str, Any], now: float) -> tuple[bool, str, bool]:
     """Decide whether one path is junk. Returns (is_junk, why, is_sensitive)."""
     name = path.name
-    sensitive = _protects(name, trash["sensitive"])
+    sensitive = _protects(name, trash["sensitive"], path=path)
     # keep is absolute. patterns win over the heuristics, not over an explicit
     # instruction to leave something alone.
     if _matches(name, trash["keep"]):
@@ -4299,7 +4362,7 @@ def _doctor_checks(
         return actions
 
     if checks["credentials_in_url"]:
-        actions += _check_credentials(git, name, remotes, fix)
+        _check_credentials(git, name, remotes, fix, actions)
     if checks["unpushed"]:
         actions += _check_unpushed(git, name, cfg["sync"])
     return actions
@@ -4321,7 +4384,7 @@ def _detached(git: Git, name: str, cfg: dict[str, Any], fix: Decider | None) -> 
     refused = _cannot_leave_a_detached_head(git, name, cfg, detail)
     if refused is not None:
         return refused
-    trunk = default_branch(git, cfg["sync"], readonly=True)
+    trunk = default_branch(git, cfg["sync"], readonly=True) or _local_trunk(git, cfg["sync"])
 
     action = Action("switch back", name, "HEAD", f"switch back to {trunk} from a detached {commit}")
     if not fix.allow(action):
@@ -4333,6 +4396,21 @@ def _detached(git: Git, name: str, cfg: dict[str, Any], fix: Decider | None) -> 
     action.applied = True
     action.detail = f"switched back to {trunk} from a detached {commit}"
     return action
+
+
+def _local_trunk(git: Git, sync: dict[str, Any]) -> str | None:
+    """The trunk of a repository that has no remote to ask.
+
+    default_branch resolves through refs/remotes only, so a repository with no
+    remote always came back None — and a detached HEAD there was refused with
+    "no branch to go back to" while local main sat right there containing it.
+    A repository with no remote is where a detached HEAD matters most: nothing
+    in it is pushed anywhere, and sync leaves it alone, so it stays detached.
+    """
+    for candidate in sync["default_branch_candidates"]:
+        if git.ok("show-ref", "--verify", "--quiet", f"refs/heads/{candidate}"):
+            return str(candidate)
+    return None
 
 
 def _cannot_leave_a_detached_head(
@@ -4361,7 +4439,7 @@ def _cannot_leave_a_detached_head(
         # silence, leaving the worktree holding the trunk the main checkout
         # then could never be switched onto.
         return no("and it is a linked worktree, which sync.worktrees keeps out of this")
-    trunk = default_branch(git, cfg["sync"], readonly=True)
+    trunk = default_branch(git, cfg["sync"], readonly=True) or _local_trunk(git, cfg["sync"])
     if trunk is None:
         return no("and no branch to go back to")
     if is_dirty(git):
@@ -4391,20 +4469,30 @@ def _cannot_leave_a_detached_head(
 
 
 def _check_credentials(
-    git: Git, name: str, remotes: Sequence[str], fix: Decider | None = None
-) -> list[Action]:
-    """A token in a remote URL is a secret sitting in plain text in .git/config."""
-    found: list[Action] = []
+    git: Git,
+    name: str,
+    remotes: Sequence[str],
+    fix: Decider | None,
+    found: list[Action],
+) -> None:
+    """A token in a remote URL is a secret sitting in plain text in .git/config.
+
+    Appends to the caller's list rather than returning one. A repository can
+    hold several credentialed URLs, and answering `q` at the second prompt threw
+    away the record of the first — which had really been rewritten — while the
+    run printed "everything already done is kept". Every other accumulator in
+    this file takes the list it fills; this was the one that did not.
+    """
     for remote in remotes:
         for setting, url in _configured_urls(git, remote):
             if not CREDENTIAL_IN_URL.match(url):
                 continue
-            detail = f"credential in the remote URL — {redact(url)}"
+            where = setting.rsplit(".", 1)[-1]
+            detail = f"credential in the remote {where} — {redact(url)}"
             if fix is None:
                 found.append(Action("doctor", name, remote, detail, skipped=True))
                 continue
             found.append(_strip_credential(git, name, remote, setting, url, detail, fix))
-    return found
 
 
 def _configured_urls(git: Git, remote: str) -> list[tuple[str, str]]:
@@ -4434,8 +4522,12 @@ def _strip_credential(
     before and after, and git's credential helper or the SSH agent is what
     should have been holding it anyway. It does not touch a single commit.
     """
+    # The setting, not just the remote: a repository with both a url and a
+    # pushurl asked twice with two identical prompts and no way to tell them
+    # apart.
+    where = setting.rsplit(".", 1)[-1]
     action = Action(
-        "strip credential", name, remote, f"take the credential out of the {remote} URL"
+        "strip credential", name, f"{remote} {where}", f"take the credential out of {setting}"
     )
     if not fix.allow(action):
         return action
@@ -4446,9 +4538,29 @@ def _strip_credential(
     # The exact setting, replaced in place: `remote set-url` rewrites the first
     # fetch URL whatever was asked for, which is the wrong one for a pushurl or
     # a second url=.
-    result = git.run("config", "--replace-all", setting, stripped, url, check=False)
+    #
+    # --replace-all's third argument is a POSIX regex, not a literal. A password
+    # holding a +, ? or * therefore did not match its own value, and git
+    # *appended* instead: the secret stayed in .git/config, the remote grew a
+    # second push URL, and the report said the credential had been taken out.
+    # Anchored and escaped, and then read back to make sure.
+    pattern = "^" + re.escape(url) + "$"
+    result = git.run("config", "--replace-all", setting, stripped, pattern, check=False)
     if result.returncode != 0:
         action.error = last_line(result)
+        return action
+    # This setting, not every URL the remote has: a repository with a credential
+    # in both url and pushurl reported the first strip as failed, because the
+    # second one was still there and had not been reached yet.
+    left = [
+        one
+        for where, one in _configured_urls(git, remote)
+        if where == setting and CREDENTIAL_IN_URL.match(one)
+    ]
+    if left:
+        # Never report a secret removed without having looked. This is the one
+        # remedy whose failure leaves somebody believing they need not rotate.
+        action.error = f"the credential is still in {setting}; take it out by hand"
         return action
     action.applied = True
     action.detail = f"credential taken out of {setting}, now {stripped}"
@@ -4791,7 +4903,9 @@ NOT_HELD_BACK = (
     "already deleted",
     "nothing to fast-forward",
     "nothing to fetch",
-    "linked worktree",
+    # Not "linked worktree" on its own: that also matches the *refusal* to move
+    # a linked worktree's detached HEAD, which is held back and must be counted.
+    "linked worktree, left on",
     "staying on",
 )
 REASONS: tuple[tuple[str, str], ...] = (
@@ -4834,7 +4948,7 @@ REASONS: tuple[tuple[str, str], ...] = (
     ("no upstream", "on a local-only branch, never pushed"),
     ("no such remote", "the configured remote is not there"),
     ("no remote", "no remote configured"),
-    ("credential in the remote url", "a credential sits in the remote URL"),
+    ("credential in the remote", "a credential sits in a remote URL"),
     ("no longer exists", "on a branch whose upstream was deleted"),
     ("cannot compare", "cannot be compared with its upstream"),
     ("not pushed", "branches with commits that exist only here"),
@@ -5090,7 +5204,14 @@ def _guarded(work: Callable[[Path], list[Action]], repo: Path, context: Context)
         # give-up never fired on the case it was written for, and 256
         # repositories each waited the full sync.timeout.
         if looks_unreachable(str(exc)):
-            context.note_unreachable(_remote_url(repo, "origin"), str(exc))
+            # The configured remote, not a guess: under a renamed one this fell
+            # back to the path, which de-duplicates by checkout rather than by
+            # URL and revives the linked-worktree false positive the counting is
+            # meant to avoid. And _remote_url can time out in here, inside an
+            # except clause, which would end the whole run.
+            with contextlib.suppress(Failure, OSError):
+                remote = context.config_for(repo)["sync"]["remote"]
+                context.note_unreachable(_remote_url(repo, remote), str(exc))
         return [Action("error", context.name_of(repo), "-", "", error=str(exc))]
     except (OSError, ValueError) as exc:
         # Anything a single repository can do to itself — an unreadable config,
