@@ -360,13 +360,17 @@ tar -xzf git-tidy-macos-arm64.tar.gz
 ./git-tidy --version
 ```
 
-From PyPI-style tooling, or straight from a checkout:
+Straight from a checkout — it is one stdlib-only file, so there is nothing to
+build:
 
 ```bash
-uv tool install git-tidy
-# or
 git clone https://github.com/sapn95/git-tidy && ./git-tidy/git_tidy.py --help
 ```
+
+Not from PyPI. The name `git-tidy` there belongs to
+[Opus10/git-tidy](https://github.com/Opus10/git-tidy), which is a different
+tool, so `uv tool install git-tidy` or `pipx install git-tidy` gets you that one
+instead.
 
 PyYAML is used when it happens to be installed; when it is not, a strict parser
 for the documented config subset stands in, so there is nothing to install
