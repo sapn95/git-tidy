@@ -148,6 +148,16 @@ Two mechanisms, and the first is usually all you need:
   directory whose every file is source — eslint ships a
   `source-code/token-store/` — is source too; one holding anything else, like a
   `mycreds/` with a password file in it, is kept whole.
+
+  None of those exemptions applies to `clean.ignored_keep` or `clean.keep`.
+  Those are lists somebody wrote down, so a name in them is an instruction
+  rather than a guess — which is why a `certifi/cacert.pem` inside a `.venv` is
+  kept anyway: the default `ignored_keep` names `*.pem`. Empty that list, or
+  name the directory in `clean.regenerable`, if you would rather have the space.
+
+  And `clean.quarantine: true` changes where a protected file ends up: the
+  directory is moved *whole*, so the file goes with it instead of staying at its
+  path. Recoverable either way, but the path changes.
 - **`clean.dirs` / `clean.files`** — names removed wherever they appear, ignored
   or not: `.terraform`, `.terragrunt-cache`, `__pycache__`, `.pytest_cache`,
   `.scannerwork`, `*.pyc`, `.coverage`, and so on.
