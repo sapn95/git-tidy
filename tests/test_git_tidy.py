@@ -6213,7 +6213,6 @@ def test_fix_does_not_replace_an_ignored_local_file(workspace: Path, remote: Pat
     (repo / ".gitignore").write_text(".env\n", encoding="utf-8")
     git(repo, "add", ".gitignore")
     git(repo, "commit", "-q", "-m", "ignore .env")
-    git(repo, "add", "-f", ".env") if False else None
     (repo / ".env").write_text("PLACEHOLDER", encoding="utf-8")
     git(repo, "add", "-f", ".env")
     git(repo, "commit", "-q", "-m", "track a template")
@@ -6655,3 +6654,21 @@ def test_a_non_printable_character_is_refused_inside_quotes_too(text: str):
 def test_what_yaml_does_allow_is_still_allowed(text: str):
     yaml = pytest.importorskip("yaml")
     assert gt._parse_yaml_subset(text, "<t>") == yaml.safe_load(text)
+
+
+def test_a_value_ending_in_an_escaped_backslash_still_closes():
+    r"""_strip_comment read line[i - 1] rather than tracking escape state.
+
+    `a: "x\\"` ends in an escaped *backslash*, so the quote after it closes the
+    scalar. Looking one character back saw the backslash and called the quote
+    escaped, so the string never closed and the whole config was refused —
+    while PyYAML read it without complaint.
+    """
+    yaml = pytest.importorskip("yaml")
+    for text in (
+        'a: "x\\\\" # note\n',
+        'a: "x\\" y" # note\n',
+        'a: "plain" # note\n',
+        "a: 'it''s' # note\n",
+    ):
+        assert gt._parse_yaml_subset(text, "<t>") == yaml.safe_load(text), text

@@ -436,6 +436,20 @@ class _Line:
     number: int
 
 
+def _inside_quote(ch: str, quote: str, escaped: bool) -> tuple[str | None, bool]:
+    """Track a quoted run inside a flow collection, honouring \\" as an escape.
+
+    Without the escape, `keep: ["a\\"b", c]` was an unterminated quote here and
+    loaded fine with PyYAML — and _strip_comment, one function up, already knew
+    about it, so the two disagreed with each other.
+    """
+    if escaped:
+        return quote, False
+    if quote == '"' and ch == "\\":
+        return quote, True
+    return (None if ch == quote else quote), False
+
+
 def _strip_comment(line: str) -> str:
     """Drop a trailing comment, respecting quotes.
 
@@ -453,11 +467,15 @@ def _strip_comment(line: str) -> str:
     out: list[str] = []
     quote: str | None = None
     can_open = True  # nothing written yet, so a value could start here
+    escaped = False
     for i, ch in enumerate(line):
         if quote:
             out.append(ch)
-            if ch == quote and not (quote == '"' and i and line[i - 1] == "\\"):
-                quote = None
+            # _inside_quote rather than a look at line[i - 1]: that read `\\"`
+            # as an escaped quote when the backslash was itself escaped, so a
+            # value ending in a backslash never closed and the whole config was
+            # refused — while PyYAML read it without complaint.
+            quote, escaped = _inside_quote(ch, quote, escaped)
             continue
         if ch in "\"'" and can_open:
             quote = ch
@@ -693,20 +711,6 @@ def _looks_like_mapping(item: str) -> bool:
         return " " not in item[:-1].strip()
     key, sep, _ = item.partition(": ")
     return bool(sep) and " " not in key.strip()
-
-
-def _inside_quote(ch: str, quote: str, escaped: bool) -> tuple[str | None, bool]:
-    """Track a quoted run inside a flow collection, honouring \\" as an escape.
-
-    Without the escape, `keep: ["a\\"b", c]` was an unterminated quote here and
-    loaded fine with PyYAML — and _strip_comment, one function up, already knew
-    about it, so the two disagreed with each other.
-    """
-    if escaped:
-        return quote, False
-    if quote == '"' and ch == "\\":
-        return quote, True
-    return (None if ch == quote else quote), False
 
 
 def _split_flow(body: str, source: str, number: int) -> list[str]:
