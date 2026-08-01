@@ -11,8 +11,8 @@ git-tidy run --apply      # do all of it
 ```
 
 One file, standard library only. Run it straight from a checkout with
-`./git_tidy.py`, install it as a `git-tidy` command, or download a self-contained
-binary — see [Install](#install).
+`./git_tidy.py`, `brew install` it, or download a self-contained binary — see
+[Install](#install).
 
 Nothing is modified without `--ask` or `--apply`.
 
