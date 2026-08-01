@@ -33,6 +33,28 @@ once, and they are usually dealt with by hand, badly:
 
 git-tidy does the safe parts automatically, and reports the parts that need you.
 
+## What a run does
+
+```mermaid
+flowchart LR
+    R([git-tidy run]) --> S[sync]
+    S --> P[prune]
+    P --> C[clean]
+    C --> T[trash]
+    T --> D[doctor]
+
+    S -.- s1["fetch, switch to the<br>default branch, fast-forward"]
+    P -.- p1["delete branches whose<br>upstream is gone"]
+    C -.- c1["remove build output<br>inside repositories"]
+    T -.- t1["sweep loose junk in<br>the workspace"]
+    D -.- d1["report what needs<br>a person"]
+
+    classDef note fill:#f6f8fa,stroke:#d0d7de,color:#57606a
+    class s1,p1,c1,t1,d1 note
+```
+
+Each step is also a command of its own, so you can run just the one you want.
+
 ## What each command does
 
 | Command            | Does                                                                              |
@@ -230,7 +252,55 @@ does not.
 `--ask` asks once per remedy per repository; answering `a` covers that one
 remedy, not the other two.
 
+## How a path is decided
+
+Every rule below is a reason **not** to delete something. `clean` reaches the
+last box only when none of them applies.
+
+```mermaid
+flowchart TD
+    F([a path clean matched]) --> TR{tracked by git?}
+    TR -->|yes| KEEP1[kept: git has it]
+    TR -->|no| KP{"named in clean.keep<br>or clean.ignored_keep?"}
+    KP -->|yes| KEEP2[kept, exactly where it is]
+    KP -->|no| REPO{"a git repository<br>inside it?"}
+    REPO -->|yes| KEEP3[kept: it holds commits]
+    REPO -->|no| SENS{"looks like a credential?<br>(trash.sensitive)"}
+    SENS -->|yes| Q[moved to quarantine]
+    SENS -->|no| INSIDE{"anything protected<br>buried inside it?"}
+    INSIDE -->|yes| THIN["emptied out:<br>those stay, the rest goes"]
+    INSIDE -->|no| DEL[removed]
+
+    classDef safe fill:#dafbe1,stroke:#2da44e,color:#1a7f37
+    classDef gone fill:#ffebe9,stroke:#cf222e,color:#a40e26
+    class KEEP1,KEEP2,KEEP3,Q,THIN safe
+    class DEL gone
+```
+
+The middle of that picture is the part worth knowing: a directory holding
+something protected is not kept *whole*. The protected files stay where they
+are and the rest of the directory goes, so a 400 MB `node_modules` with one
+`id_rsa` in it gives back 400 MB and keeps the key.
+
 ## Modes
+
+```mermaid
+flowchart LR
+    A([any command]) --> M{mode}
+    M -->|"-n, the default"| DRY["says what it would do<br>changes nothing"]
+    M -->|"-i / --ask"| ASK["asks per change:<br>y / n / a / s / q"]
+    M -->|"--apply"| DO["does all of it"]
+
+    ASK --> DO
+    DO --> F{"--force?"}
+    F -->|no| SAFE["work that is only local<br>is reported, not touched"]
+    F -->|yes| MORE["also deletes an unmerged branch<br>and stashes to switch<br><i>never discards: the report names the stash</i>"]
+
+    classDef safe fill:#dafbe1,stroke:#2da44e,color:#1a7f37
+    classDef warn fill:#fff8c5,stroke:#d4a72c,color:#7d4e00
+    class DRY,SAFE safe
+    class MORE warn
+```
 
 | Flag        | Behaviour                                                                                                |
 | ----------- | -------------------------------------------------------------------------------------------------------- |
@@ -285,6 +355,20 @@ git-tidy -j 32 sync --apply   # a lot of slow remotes
 ```
 
 ## Configuration
+
+```mermaid
+flowchart TD
+    G["~/.config/git-tidy/config.yaml<br><i>global</i>"] --> W
+    W["~/git/.git-tidy.yaml<br><i>workspace</i>"] --> S
+    S["~/git/team/.git-tidy.yaml<br><i>a subdirectory</i>"] --> R
+    R["~/git/team/repo/.git-tidy.yaml<br><i>one repository</i>"] --> E([the settings that apply to that repo])
+
+    N["Each file is merged over the one above it,<br>setting by setting. The deepest wins.<br><br>A list replaces; it does not append."]
+    E -.- N
+
+    classDef note fill:#f6f8fa,stroke:#d0d7de,color:#57606a
+    class N note
+```
 
 YAML, in two places, and both are optional:
 
