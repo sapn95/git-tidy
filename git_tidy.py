@@ -69,7 +69,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NoReturn
 
-__version__ = "3.0.2"
+__version__ = "3.0.3"
 
 CONFIG_NAMES = (".git-tidy.yaml", ".git-tidy.yml")
 QUARANTINE_DIRNAME = ".git-tidy-trash"
@@ -473,6 +473,18 @@ def _strip_comment(line: str) -> str:
     return "".join(out)
 
 
+def _yaml_printable(char: str) -> bool:
+    """PyYAML's Reader.NON_PRINTABLE, in the positive."""
+    code = ord(char)
+    return (
+        char in "\t\n\r\x85"
+        or 0x20 <= code <= 0x7E
+        or 0xA0 <= code <= 0xD7FF
+        or 0xE000 <= code <= 0xFFFD
+        or 0x10000 <= code <= 0x10FFFF
+    )
+
+
 def _outside_quotes(text: str) -> str:
     """The parts of a line that are not inside a quoted scalar."""
     out: list[str] = []
@@ -497,11 +509,19 @@ def _refuse_control_characters(text: str, source: str, number: int) -> None:
     "works from a checkout, fails on every shipped build" shape in the other
     direction. NUL and the other C0 controls are the same.
     """
-    for char in _outside_quotes(text):
-        if char == "\t":
-            raise Failure(f"{source}:{number}: a tab on this line; YAML wants spaces")
-        if ord(char) < 0x20 and char != "\n":
-            raise Failure(f"{source}:{number}: control character {ord(char):#04x} on this line")
+    # Two different refusals, from two different parts of PyYAML.
+    #
+    # Its Reader rejects anything outside a printable set, wherever it appears —
+    # inside a quoted scalar as much as outside one. Checking only outside the
+    # quotes let \x00 and \x7f through in a quoted value, which loads on every
+    # shipped binary and is a ReaderError from a checkout.
+    for char in text:
+        if not _yaml_printable(char):
+            raise Failure(f"{source}:{number}: character {ord(char):#04x} is not allowed in YAML")
+    # Its Scanner rejects a tab used as structure. A tab *inside* a quoted
+    # scalar is ordinary text, which is why this half looks outside them.
+    if "\t" in _outside_quotes(text):
+        raise Failure(f"{source}:{number}: a tab on this line; YAML wants spaces")
 
 
 # Exactly the breaks PyYAML's scanner recognises. str.splitlines() adds \x0b,
@@ -3345,11 +3365,17 @@ def _protects(
     Exempting source from that list deleted exactly the files it names.
     """
     names = (name,) if relative is None else (name, relative)
-    if Path(name).suffix.lower() not in SOURCE_SUFFIXES and any(
-        _matches(one, sensitive) for one in names
-    ):
-        return not _plainly_not_a_secret(path)
-    return any(_matches(one, local_state) for one in names)
+    # local_state first, and unconditionally: clean.ignored_keep and clean.keep
+    # get no exemption at all — not the source-code one, not the certificate
+    # one. Every entry in them is there because somebody wrote it down. Falling
+    # through the sensitive branch with a `return` skipped this line entirely,
+    # so a .pem holding no private key lost its ignored_keep protection and was
+    # hard-deleted, which is the opposite of what three documents promise.
+    if any(_matches(one, local_state) for one in names):
+        return True
+    if Path(name).suffix.lower() in SOURCE_SUFFIXES:
+        return False
+    return any(_matches(one, sensitive) for one in names) and not _plainly_not_a_secret(path)
 
 
 # A certificate file holds a private key or it does not, and the difference is
@@ -3358,9 +3384,12 @@ def _protects(
 # virtualenv is kept back over 300 KB of published trust anchors.
 CERTIFICATE_SUFFIXES = frozenset({".pem", ".crt", ".cer", ".ca-bundle"})
 PRIVATE_KEY_MARKER = b"PRIVATE KEY"
-# Enough to reach the first PEM header of any real key file; a key that begins
-# 64 KB into a certificate bundle is not a thing that happens.
-CERTIFICATE_PEEK = 64 * 1024
+# The whole file, up to a ceiling no certificate bundle approaches. A haproxy.pem
+# is `cat fullchain.pem privkey.pem`, and a long chain puts the key past any
+# small peek — 64 KB was not enough, and the key was deleted with the file.
+# Anything bigger than this is not a certificate bundle, so it keeps its
+# protection rather than being read.
+CERTIFICATE_LIMIT = 4 * 1024 * 1024
 
 
 def _plainly_not_a_secret(path: Path | None) -> bool:
@@ -3384,8 +3413,9 @@ def _plainly_not_a_secret(path: Path | None) -> bool:
         if path.is_dir():
             return _only_source_inside(path)
         if path.suffix.lower() in CERTIFICATE_SUFFIXES:
-            with path.open("rb") as handle:
-                return PRIVATE_KEY_MARKER not in handle.read(CERTIFICATE_PEEK)
+            if path.stat().st_size > CERTIFICATE_LIMIT:
+                return False
+            return PRIVATE_KEY_MARKER not in path.read_bytes()
     except OSError:
         # Cannot read it, so cannot rule it out. Keeping it is the safe answer,
         # and the same one _Unreadable gives everywhere else.
@@ -3553,7 +3583,13 @@ def _remove(
                 action.error = failed
                 return action
         elif is_dir:
-            shutil.rmtree(path)
+            # rmtree removes what it can and then raises, so the plain call
+            # reported a directory as a pure failure while three files had
+            # really gone — unmentioned and uncounted. _thin_out has measured
+            # after the fact for several rounds; this path had not.
+            problem = _rmtree_counting(path, action)
+            if problem is not None:
+                return problem
         else:
             path.unlink()
     except (OSError, Failure) as exc:
@@ -3566,6 +3602,28 @@ def _remove(
         "emptied out" if thinned else "quarantined" if action.quarantined else "removed"
     ) + because
     return action
+
+
+def _rmtree_counting(path: Path, action: Action) -> Action | None:
+    """Remove a directory, and if it cannot finish, say how much of it went.
+
+    rmtree deletes what it can and then raises, so the plain call reported a
+    directory as a pure failure while three files had really gone — unmentioned
+    and uncounted. _thin_out has measured after the fact for several rounds;
+    this path had not.
+    """
+    before = action.size
+    try:
+        shutil.rmtree(path)
+    except OSError as exc:
+        left = _measure(path)[0] if path.exists() else 0
+        action.size = max(0, before - left)
+        action.error = str(exc)
+        action.applied = action.size > 0
+        if action.applied:
+            action.detail = f"partly removed, {human_size(action.size)} of it"
+        return action
+    return None
 
 
 def _guard(path: Path, root: Path) -> None:
@@ -4443,7 +4501,13 @@ def _cannot_leave_a_detached_head(
     if trunk is None:
         return no("and no branch to go back to")
     if is_dirty(git):
-        return no("with uncommitted changes")
+        # Its own wording, deliberately not "uncommitted changes": that phrase is
+        # in FORCE_CAN_FIX, and --force sets sync.stash, which this function does
+        # not read and has no stash path for. The summary was offering `run
+        # --force` for something --force cannot do — and in a repository with no
+        # remote, which is the case _local_trunk exists for, sync will not rescue
+        # it either. It is also not "left on their branch": it is on no branch.
+        return no("and there is uncommitted work on it")
     head = f"refs/heads/{trunk}"
     if not git.ok("show-ref", "--verify", "--quiet", head):
         # The trunk exists only on the remote, which is what a fresh clone whose
@@ -4507,9 +4571,12 @@ def _configured_urls(git: Git, remote: str) -> list[tuple[str, str]]:
     """
     found: list[tuple[str, str]] = []
     for setting in (f"remote.{remote}.url", f"remote.{remote}.pushurl"):
-        for url in git.out("config", "--get-all", setting, check=False).splitlines():
-            if url.strip():
-                found.append((setting, url.strip()))
+        # -z, and no strip: the value has to come back exactly as git stores it,
+        # because that is what --fixed-value compares against. Trimming it meant
+        # a URL saved with a trailing space never matched itself, and git
+        # appended one more url= on every run instead of replacing.
+        raw = git.run("config", "-z", "--get-all", setting, check=False).stdout
+        found.extend((setting, url) for url in raw.split("\0") if url)
     return found
 
 
@@ -4544,20 +4611,29 @@ def _strip_credential(
     # *appended* instead: the secret stayed in .git/config, the remote grew a
     # second push URL, and the report said the credential had been taken out.
     # Anchored and escaped, and then read back to make sure.
-    pattern = "^" + re.escape(url) + "$"
-    result = git.run("config", "--replace-all", setting, stripped, pattern, check=False)
+    # --fixed-value where git has it (2.30 and later): the value-pattern is a
+    # regex, and building it from a *trimmed* copy of the value meant a URL
+    # stored with a trailing space never matched itself, so git appended one
+    # more url= on every run for ever. An anchored, escaped pattern is the
+    # fallback and covers the metacharacters; only whitespace defeats it.
+    result = git.run(
+        "config", "--fixed-value", "--replace-all", setting, stripped, url, check=False
+    )
+    if result.returncode != 0 and "fixed-value" in (result.stdout + result.stderr):
+        result = git.run(
+            "config", "--replace-all", setting, stripped, "^" + re.escape(url) + "$", check=False
+        )
     if result.returncode != 0:
         action.error = last_line(result)
         return action
     # This setting, not every URL the remote has: a repository with a credential
     # in both url and pushurl reported the first strip as failed, because the
     # second one was still there and had not been reached yet.
-    left = [
-        one
-        for where, one in _configured_urls(git, remote)
-        if where == setting and CREDENTIAL_IN_URL.match(one)
-    ]
-    if left:
+    # This value, not every credentialed value of this setting: a remote with
+    # two credentialed url= lines reported the *first* strip as failed, because
+    # the second had not been reached yet — and sent somebody to hand-edit a
+    # file that was about to be clean.
+    if any(one == url for _, one in _configured_urls(git, remote)):
         # Never report a secret removed without having looked. This is the one
         # remedy whose failure leaves somebody believing they need not rotate.
         action.error = f"the credential is still in {setting}; take it out by hand"
@@ -4913,6 +4989,7 @@ REASONS: tuple[tuple[str, str], ...] = (
     # the answer, not about the HEAD. Every other needle here describes a state
     # the tool found; this one describes what the person said.
     ("declined", "declined at the prompt"),
+    ("uncommitted work on it", "detached HEADs with uncommitted work on them"),
     ("uncommitted changes", "uncommitted changes — left on their branch"),
     ("needs a fetch in this run", "unmerged branches waiting on a fetch — use `run --force`"),
     ("not in origin", "branches with commits not in the trunk"),
