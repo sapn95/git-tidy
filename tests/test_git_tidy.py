@@ -6469,7 +6469,13 @@ def test_every_line_break_pyyaml_knows(text: str):
 
 
 def test_a_certificate_bundle_is_not_a_credential(workspace: Path):
-    """Every .venv ships certifi/cacert.pem: 130 certificates, no key at all."""
+    """Every .venv ships certifi/cacert.pem: 130 certificates, no key at all.
+
+    The exemption is against trash.sensitive, which is a list of guesses.
+    clean.ignored_keep names the same *.pem and gets no exemption at all,
+    because that list is somebody's explicit instruction — so the config here
+    empties it to ask the one question this test is about.
+    """
     repo = workspace / "repo"
     cache = repo / "__pycache__"
     cache.mkdir()
@@ -6477,6 +6483,7 @@ def test_a_certificate_bundle_is_not_a_credential(workspace: Path):
         "-----BEGIN CERTIFICATE-----\nxx\n-----END CERTIFICATE-----\n", encoding="utf-8"
     )
     (cache / "m.pyc").write_bytes(b"0" * 4096)
+    (workspace / gt.CONFIG_NAMES[0]).write_text("clean:\n  ignored_keep: []\n", encoding="utf-8")
 
     gt.main(["-C", str(workspace), "clean", "--apply"])
     assert not cache.exists(), "a bundle of public certificates holds nothing back"
@@ -6515,3 +6522,136 @@ def test_a_directory_named_like_a_secret_holding_one_is_kept(workspace: Path):
 
     gt.main(["-C", str(workspace), "clean", "--apply"])
     assert (cache / "mycreds" / "prod").read_text(encoding="utf-8") == "hunter2"
+
+
+# --------------------------------------------------------------------------- #
+# Claude review, round sixteen
+# --------------------------------------------------------------------------- #
+
+
+def test_ignored_keep_gets_no_certificate_exemption(workspace: Path):
+    """Three documents promise clean.ignored_keep has no source exemption.
+
+    The certificate one leaked in the same way: _protects returned early on the
+    sensitive branch and never reached the local_state line, so a .pem holding
+    no private key was hard-deleted — no quarantine, no "kept" line, no mention
+    in the report at all.
+    """
+    repo = workspace / "repo"
+    (repo / ".gitignore").write_text("certs/\n", encoding="utf-8")
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-q", "-m", "ignore certs")
+    certs = repo / "certs"
+    certs.mkdir()
+    (certs / "client.pem").write_text("-----BEGIN CERTIFICATE-----\n", encoding="utf-8")
+    (certs / "blob.bin").write_bytes(b"0" * 4096)
+    (workspace / gt.CONFIG_NAMES[0]).write_text("clean:\n  ignored: true\n", encoding="utf-8")
+
+    gt.main(["-C", str(workspace), "clean", "--apply"])
+    assert (certs / "client.pem").is_file(), "ignored_keep names *.pem"
+    assert not (certs / "blob.bin").exists()
+
+
+def test_a_key_past_the_peek_is_still_a_key(workspace: Path):
+    """A haproxy.pem is `cat fullchain.pem privkey.pem`; a long chain buries it."""
+    repo = workspace / "repo"
+    cache = repo / "__pycache__"
+    cache.mkdir()
+    bundle = cache / "haproxy.pem"
+    bundle.write_text(
+        "-----BEGIN CERTIFICATE-----\n" + ("x" * 100000) + "\n-----END CERTIFICATE-----\n"
+        "-----BEGIN PRIVATE KEY-----\nreal\n",
+        encoding="utf-8",
+    )
+    (workspace / gt.CONFIG_NAMES[0]).write_text("clean:\n  ignored_keep: []\n", encoding="utf-8")
+
+    gt.main(["-C", str(workspace), "clean", "--apply"])
+    assert bundle.is_file(), "the key is at byte 100000, and it is still a key"
+
+
+def test_two_credentialed_urls_are_both_reported_as_done(workspace: Path, capsys):
+    """The read-back narrowed by setting, so the first strip was called failed."""
+    repo = workspace / "repo"
+    git(repo, "remote", "set-url", "origin", "https://alice:s3cr3t@a.invalid/one.git")
+    git(repo, "config", "--add", "remote.origin.url", "https://bob:t0ken@b.invalid/two.git")
+
+    assert gt.main(["-C", str(workspace), "doctor", "--fix", "--apply"]) == 0
+    assert "still in" not in capsys.readouterr().out
+    left = git(repo, "config", "--get-all", "remote.origin.url").split()
+    assert left == ["https://a.invalid/one.git", "https://b.invalid/two.git"], left
+
+
+def test_a_url_stored_with_whitespace_is_replaced_not_appended(workspace: Path):
+    """The pattern was built from a trimmed copy of the value git had stored."""
+    repo = workspace / "repo"
+    git(repo, "config", "remote.origin.url", "https://alice:secret@example.invalid/r.git ")
+    for _ in range(3):
+        gt.main(["-C", str(workspace), "doctor", "--fix", "--apply"])
+    values = git(repo, "config", "--get-all", "remote.origin.url").splitlines()
+    assert len(values) == 1, values
+    assert "secret" not in values[0]
+
+
+def test_force_is_not_offered_for_a_detached_head_it_cannot_fix(tmp_path: Path, capsys):
+    """--force sets sync.stash, which _cannot_leave_a_detached_head cannot use."""
+    space = tmp_path / "space"
+    repo = space / "solo"
+    repo.mkdir(parents=True)
+    git(repo, "init", "-q", "-b", "main")
+    commit(repo, "a.txt")
+    git(repo, "switch", "-q", "--detach", "HEAD")
+    (repo / "a.txt").write_text("edited", encoding="utf-8")
+
+    gt.main(["-C", str(space), "doctor", "--fix", "--force", "--apply"])
+    out = capsys.readouterr().out
+    assert "detached HEADs with uncommitted work" in out
+    assert "run --force" not in out
+    assert "left on their branch" not in out
+
+
+@needs_permissions
+def test_a_partly_removed_directory_says_how_much_went(workspace: Path, capsys):
+    """rmtree removes what it can and then raises; three files really went."""
+    repo = workspace / "repo"
+    cache = repo / "__pycache__"
+    locked = cache / "ro"
+    locked.mkdir(parents=True)
+    (locked / "stuck.bin").write_bytes(b"0" * 4096)
+    (cache / "gone.pyc").write_bytes(b"0" * 8192)
+    locked.chmod(0o555)
+    try:
+        gt.main(["-C", str(workspace), "clean", "--apply"])
+        out = capsys.readouterr().out
+        assert not (cache / "gone.pyc").exists(), "8 KB really went"
+        assert (locked / "stuck.bin").exists(), "4 KB really did not"
+        # The size on the line is what went, not what was predicted. Reporting
+        # the prediction claimed 12 KB freed from a removal that failed.
+        assert "8.0 KB" in out and "12" not in out.split("Summary")[0]
+    finally:
+        locked.chmod(0o755)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'clean:\n  keep:\n    - "a\x00b"\n',
+        'clean:\n  keep:\n    - "a\x0bb"\n',
+        'clean:\n  keep:\n    - "a\x7fb"\n',
+        "a: b\x7f\n",
+    ],
+)
+def test_a_non_printable_character_is_refused_inside_quotes_too(text: str):
+    """PyYAML's Reader applies to the whole stream, quoted scalars included."""
+    yaml = pytest.importorskip("yaml")
+    with pytest.raises(Exception):  # noqa: B017 - the point is that it does not parse
+        yaml.safe_load(text)
+    with pytest.raises(gt.Failure):
+        gt._parse_yaml_subset(text, "<t>")
+
+
+@pytest.mark.parametrize(
+    "text", ['clean:\n  keep:\n    - "a\tb"\n', "jobs: 4  # x\there\n", "a: ä\n"]
+)
+def test_what_yaml_does_allow_is_still_allowed(text: str):
+    yaml = pytest.importorskip("yaml")
+    assert gt._parse_yaml_subset(text, "<t>") == yaml.safe_load(text)
