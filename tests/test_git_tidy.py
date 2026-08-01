@@ -2971,7 +2971,7 @@ def test_a_swept_directory_holding_a_credential_is_quarantined(workspace: Path):
     junk = workspace / "loose" / "lalalalala"
     junk.mkdir(parents=True)
     (junk / "notes").write_text("disposable", encoding="utf-8")
-    (junk / "id_rsa.pem").write_text("the only copy", encoding="utf-8")
+    (junk / "id_rsa.pem").write_text("-----BEGIN PRIVATE KEY-----", encoding="utf-8")
     age(junk, 30)
     holding = _holding(workspace)
 
@@ -3808,13 +3808,17 @@ def test_a_cache_holding_a_credential_is_removed_and_the_credential_kept(workspa
     """Both halves in one summary: the space back, the key still there."""
     repo = workspace / "repo"
     (repo / "__pycache__").mkdir()
-    (repo / "__pycache__" / "deploy.pem").write_text("KEY", encoding="utf-8")
+    (repo / "__pycache__" / "deploy.pem").write_text(
+        "-----BEGIN PRIVATE KEY-----", encoding="utf-8"
+    )
     (repo / "__pycache__" / "m.pyc").write_bytes(b"0" * 4096)
 
     gt.main(["-C", str(workspace), "clean", "--apply"])
     assert "stayed in place" in capsys.readouterr().out
     assert not (repo / "__pycache__" / "m.pyc").exists(), "the disposable part goes"
-    assert (repo / "__pycache__" / "deploy.pem").read_text(encoding="utf-8") == "KEY"
+    assert (repo / "__pycache__" / "deploy.pem").read_text(encoding="utf-8") == (
+        "-----BEGIN PRIVATE KEY-----"
+    )
 
 
 @pytest.mark.parametrize(
@@ -6382,3 +6386,132 @@ def test_a_failed_repository_is_named(workspace: Path, capsys):
     with gt.reporting(actions, "the-repo"):
         raise gt.Failure("something went wrong")
     assert actions[0].scope == "the-repo"
+
+
+# --------------------------------------------------------------------------- #
+# Claude review, round fifteen
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("secret", ["us+er:tok", "a:b?c", "x:y*z", "^u:p", "a:b.c", "u:p|q"])
+def test_a_credential_with_regex_characters_is_really_removed(workspace: Path, secret: str):
+    """--replace-all's third argument is a POSIX regex, not a literal.
+
+    A password holding a + or a ? did not match its own value, so git appended
+    instead of replacing: the secret stayed in .git/config, the remote grew a
+    second push URL, and the report said the credential had been taken out.
+    """
+    repo = workspace / "repo"
+    git(repo, "remote", "set-url", "origin", f"https://{secret}@example.invalid/r.git")
+
+    gt.main(["-C", str(workspace), "doctor", "--fix", "--apply"])
+    values = git(repo, "config", "--get-all", "remote.origin.url").split()
+    assert values == ["https://example.invalid/r.git"], values
+
+
+def test_repeating_the_fix_does_not_grow_the_config(workspace: Path):
+    repo = workspace / "repo"
+    git(repo, "remote", "set-url", "origin", "https://u+s:tok@example.invalid/r.git")
+    for _ in range(3):
+        gt.main(["-C", str(workspace), "doctor", "--fix", "--apply"])
+    assert len(git(repo, "config", "--get-all", "remote.origin.url").split()) == 1
+
+
+def test_a_quit_keeps_a_credential_already_stripped(workspace: Path):
+    """A repository can hold several, and the first was really rewritten."""
+    repo = workspace / "repo"
+    git(repo, "remote", "set-url", "origin", "https://a:tokA@a.invalid/x.git")
+    git(repo, "config", "remote.origin.pushurl", "https://b:tokB@b.invalid/x.git")
+    answers = iter(["y", "q"])
+
+    decider = gt.Decider(gt.ASK, prompt_input=lambda _: next(answers))
+    with pytest.raises(gt.Quit) as quit_now:
+        gt.doctor_repo(repo, "repo", config(), decider)
+    assert any(a.applied for a in quit_now.value.done), quit_now.value.done
+
+
+def test_a_detached_head_in_a_repository_with_no_remote_goes_back(tmp_path: Path):
+    """default_branch resolves through refs/remotes only, so trunk was None.
+
+    A repository with no remote is where a detached HEAD matters most: nothing
+    in it is pushed anywhere, and sync leaves it alone.
+    """
+    space = tmp_path / "space"
+    repo = space / "solo"
+    repo.mkdir(parents=True)
+    git(repo, "init", "-q", "-b", "main")
+    commit(repo, "a.txt")
+    git(repo, "switch", "-q", "--detach", "HEAD")
+
+    gt.main(["-C", str(space), "doctor", "--fix", "--apply"])
+    assert git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip() == "main"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "jobs: 4\rclean:\n  ignored: true\n",
+        "jobs: 4\x85sync:\n  gc: true\n",
+        "jobs: 4\u2028sync:\n  gc: true\n",
+        "jobs: 4\r",
+        "exclude:\n  - a\r  - b\n",
+        "a: 1\r\nb: 2\r\n",
+    ],
+)
+def test_every_line_break_pyyaml_knows(text: str):
+    """splitlines() split on too many; split("\\n") on too few.
+
+    Either way a config loaded from a checkout and was refused by every shipped
+    binary, or the other way round.
+    """
+    yaml = pytest.importorskip("yaml")
+    assert gt._parse_yaml_subset(text, "<t>") == yaml.safe_load(text)
+
+
+def test_a_certificate_bundle_is_not_a_credential(workspace: Path):
+    """Every .venv ships certifi/cacert.pem: 130 certificates, no key at all."""
+    repo = workspace / "repo"
+    cache = repo / "__pycache__"
+    cache.mkdir()
+    (cache / "cacert.pem").write_text(
+        "-----BEGIN CERTIFICATE-----\nxx\n-----END CERTIFICATE-----\n", encoding="utf-8"
+    )
+    (cache / "m.pyc").write_bytes(b"0" * 4096)
+
+    gt.main(["-C", str(workspace), "clean", "--apply"])
+    assert not cache.exists(), "a bundle of public certificates holds nothing back"
+
+
+def test_a_pem_holding_a_key_still_is_one(workspace: Path):
+    repo = workspace / "repo"
+    cache = repo / "__pycache__"
+    cache.mkdir()
+    (cache / "client.pem").write_text("-----BEGIN PRIVATE KEY-----\n", encoding="utf-8")
+    (cache / "m.pyc").write_bytes(b"0" * 4096)
+
+    gt.main(["-C", str(workspace), "clean", "--apply"])
+    assert (cache / "client.pem").is_file()
+    assert not (cache / "m.pyc").exists()
+
+
+def test_a_directory_of_source_named_like_a_secret_is_not_one(workspace: Path):
+    """*token* matches eslint's source-code/token-store/, forty .js files."""
+    repo = workspace / "repo"
+    cache = repo / "__pycache__"
+    (cache / "token-store").mkdir(parents=True)
+    (cache / "token-store" / "cursor.js").write_text("module.exports={}", encoding="utf-8")
+    (cache / "m.pyc").write_bytes(b"0" * 4096)
+
+    gt.main(["-C", str(workspace), "clean", "--apply"])
+    assert not cache.exists()
+
+
+def test_a_directory_named_like_a_secret_holding_one_is_kept(workspace: Path):
+    repo = workspace / "repo"
+    cache = repo / "__pycache__"
+    (cache / "mycreds").mkdir(parents=True)
+    (cache / "mycreds" / "prod").write_text("hunter2", encoding="utf-8")
+    (cache / "m.pyc").write_bytes(b"0" * 4096)
+
+    gt.main(["-C", str(workspace), "clean", "--apply"])
+    assert (cache / "mycreds" / "prod").read_text(encoding="utf-8") == "hunter2"
