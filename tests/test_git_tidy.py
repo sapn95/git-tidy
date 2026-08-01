@@ -6778,3 +6778,45 @@ def test_a_detached_head_is_not_counted_as_a_branch(workspace: Path, capsys):
     gt.main(["-C", str(workspace), "doctor", "--fix"])
     out = capsys.readouterr().out
     assert "detached HEADs whose trunk another worktree holds" in out
+
+
+def test_a_dry_run_does_not_promise_a_thin_out_that_frees_nothing(workspace: Path, capsys):
+    """It said "would empty out" and "1 artefacts to remove"; apply kept it whole.
+
+    A dry run that promises work the apply will not do is the one thing a dry
+    run must not do, and the two halves of this decision had drifted apart.
+    """
+    repo = workspace / "repo"
+    cache = repo / "__pycache__"
+    cache.mkdir()
+    (cache / "cacert.pem").write_text("-----BEGIN CERTIFICATE-----\n", encoding="utf-8")
+
+    gt.main(["-C", str(workspace), "clean", "-v"])
+    dry = capsys.readouterr().out
+    gt.main(["-C", str(workspace), "clean", "--apply", "-v"])
+    applied = capsys.readouterr().out
+
+    assert "kept whole" in dry, dry
+    assert "would empty out" not in dry
+    assert "artefacts to remove" not in dry
+
+    def detail(text: str) -> str:
+        line = next(one for one in text.splitlines() if "__pycache__" in one)
+        return line.split("—", 1)[1].strip()
+
+    assert detail(dry) == detail(applied), (detail(dry), detail(applied))
+
+
+def test_a_thin_out_that_does_free_something_is_still_work(workspace: Path, capsys):
+    repo = workspace / "repo"
+    cache = repo / "__pycache__"
+    cache.mkdir()
+    (cache / "cacert.pem").write_text("-----BEGIN CERTIFICATE-----\n", encoding="utf-8")
+    (cache / "m.pyc").write_bytes(b"0" * 4096)
+
+    gt.main(["-C", str(workspace), "clean", "-v"])
+    assert "would empty out" in capsys.readouterr().out
+    gt.main(["-C", str(workspace), "clean", "--apply"])
+    assert "freed" in capsys.readouterr().out
+    assert (cache / "cacert.pem").is_file()
+    assert not (cache / "m.pyc").exists()

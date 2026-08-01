@@ -3571,16 +3571,15 @@ def _remove(
         return action
     quarantine, rescue, because = plan
     action.quarantined = quarantine is not None
-    kept_bytes = 0
-    for one in rescue:
-        with contextlib.suppress(OSError):
-            kept_bytes += _measure(one)[0] if one.is_dir() else one.stat().st_size
+    kept_bytes = _bytes_of(rescue)
     action.kept_size = kept_bytes
     # size is what this action frees, in a dry run as much as in an apply, so
     # the two summaries agree; kept_size is what stays behind, on its own line.
     action.size = max(0, action.size - kept_bytes)
     # Said before the decision, so a dry run names the outcome it is predicting.
     thinned = is_dir and bool(rescue) and quarantine is None
+    if thinned and action.size == 0:
+        return _kept_whole(action, because)
     verb = "empty out" if thinned else ("quarantine" if action.quarantined else "remove")
     what = "" if thinned else f" {'directory' if is_dir else 'file'}"
     action.detail = f"{verb}{what}{because}"
@@ -3639,17 +3638,32 @@ def _remove(
     return _finished(action, thinned, because)
 
 
+def _bytes_of(paths: Sequence[Path]) -> int:
+    """How much the protected entries take up, so the prediction can subtract it."""
+    total = 0
+    for one in paths:
+        with contextlib.suppress(OSError):
+            total += _measure(one)[0] if one.is_dir() else one.stat().st_size
+    return total
+
+
+def _kept_whole(action: Action, because: str) -> Action:
+    """Nothing in it may go, so the directory is exactly as it was.
+
+    Said in both places, because they have to agree: calling this "emptied out"
+    and counting it as one path removed made a .venv whose only match is a
+    certifi/cacert.pem report work on every run for ever, with nothing removed
+    and no bytes freed — and a dry run that promises it is worse still.
+    """
+    action.skipped = True
+    action.detail = f"kept whole: everything in it is protected{because}"
+    return action
+
+
 def _finished(action: Action, thinned: bool, because: str) -> Action:
     """Say what happened, once it has."""
     if thinned and action.size == 0:
-        # Everything in it was protected, so the directory is exactly as it was.
-        # Calling that "emptied out" and counting it as one path removed made a
-        # .venv whose only match is a certifi/cacert.pem report work on every
-        # run for ever, with nothing removed and no bytes freed — and that false
-        # applied is what made the quarantine expiry fire each time too.
-        action.skipped = True
-        action.detail = f"kept whole: everything in it is protected{because}"
-        return action
+        return _kept_whole(action, because)
     action.applied = True
     # "removed" would be untrue for a quarantined path: it is still on the disk,
     # a restore away.
