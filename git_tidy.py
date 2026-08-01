@@ -1688,7 +1688,7 @@ def sync_repo(path: Path, name: str, cfg: dict[str, Any], decider: Decider) -> l
     # A configuration value is only validated once the code reaches it, which is
     # after the fetch. Losing the fetch on the way out would report nothing for
     # a run that pruned remote-tracking refs.
-    with reporting(actions):
+    with reporting(actions, name):
         # Accumulates into `actions`, so there is something to report even when
         # a later configuration value turns out to be invalid.
         actions[:] = _sync_from(
@@ -2088,11 +2088,14 @@ def _carry_out_fast_forward(
 
 
 @contextlib.contextmanager
-def reporting(actions: list[Action]) -> Iterator[None]:
+def reporting(actions: list[Action], scope: str = "-") -> Iterator[None]:
     """Like keeping(), but for a Failure as well as a Quit.
 
     A step that has already changed something and then hits a bad config value
     must still report what it did.
+
+    `scope` names the repository. Without it the line read `! -: - — git fetch
+    timed out`, which in a workspace of 256 tells you nothing about which one.
     """
     try:
         yield
@@ -2100,7 +2103,7 @@ def reporting(actions: list[Action]) -> Iterator[None]:
         quit_now.done.extend(actions)
         raise
     except Failure as exc:
-        actions.append(Action("error", "-", "-", "", error=str(exc)))
+        actions.append(Action("error", scope, "-", "", error=str(exc)))
         return
 
 
@@ -5004,8 +5007,14 @@ def _families(repos: Sequence[Path], timeout: int = 300) -> list[list[Path]]:
 
 
 def _remote_url(repo: Path, remote: str) -> str:
-    """What this checkout would fetch from, for counting unreachable *remotes*."""
-    url = Git(repo).out("remote", "get-url", remote, check=False)
+    """What this checkout would fetch from, for counting unreachable *remotes*.
+
+    A short timeout of its own: this runs on the path where the network has just
+    failed, and inheriting sync.timeout would add another two minutes per
+    repository to the wait the give-up exists to cut short. Reading a config
+    value needs no network anyway.
+    """
+    url = Git(repo, timeout=10).out("config", "--get", f"remote.{remote}.url", check=False)
     return url or str(repo)
 
 
@@ -5075,6 +5084,13 @@ def _guarded(work: Callable[[Path], list[Action]], repo: Path, context: Context)
         )
         raise
     except Failure as exc:
+        # A timed-out fetch arrives here rather than as a fetch action with an
+        # error on it, because Git.run raises. That is the shape a dropped VPN
+        # actually has — it hangs rather than refusing — so without this the
+        # give-up never fired on the case it was written for, and 256
+        # repositories each waited the full sync.timeout.
+        if looks_unreachable(str(exc)):
+            context.note_unreachable(_remote_url(repo, "origin"), str(exc))
         return [Action("error", context.name_of(repo), "-", "", error=str(exc))]
     except (OSError, ValueError) as exc:
         # Anything a single repository can do to itself — an unreadable config,
@@ -5095,11 +5111,13 @@ def cmd_sync(context: Context, report: Report) -> None:
         # the run as a whole. context.giving_up is read between items, which is
         # what stops the rest.
         for action in actions:
-            if action.kind != "fetch":
-                continue
-            if action.applied:
+            if action.kind == "fetch" and action.applied:
                 context.note_reachable()
             elif action.error and looks_unreachable(action.error):
+                # Any errored action, not only a fetch one: Git.run *raises* on a
+                # timeout, and reporting() turns that into an "error" action. A
+                # dropped VPN hangs rather than refusing, so that is the shape
+                # the give-up was written for and the one it could not see.
                 context.note_unreachable(_remote_url(repo, cfg["sync"]["remote"]), action.error)
         return actions
 

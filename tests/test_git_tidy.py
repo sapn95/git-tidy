@@ -6344,3 +6344,41 @@ def test_a_tab_where_yaml_allows_one_is_allowed(text: str):
 def test_a_tab_where_yaml_forbids_one_is_refused(text: str):
     with pytest.raises(gt.Failure):
         gt._parse_yaml_subset(text, "<t>")
+
+
+def test_a_hanging_fetch_counts_as_unreachable(tmp_path: Path, capsys):
+    """A dropped VPN hangs rather than refusing, which is the case it was for.
+
+    Git.run *raises* on a timeout, so it never became a fetch action with an
+    error on it, and the give-up never saw the one shape it was written for:
+    256 repositories each waited the full sync.timeout.
+    """
+    origin = tmp_path / "origin.git"
+    git(tmp_path, "init", "--bare", "-q", "-b", "main", str(origin))
+    space = tmp_path / "space"
+    space.mkdir()
+    for number in range(gt.OFFLINE_AFTER + 3):
+        git(space, "clone", "-q", str(origin), f"r{number}")
+        git(space / f"r{number}", "remote", "set-url", "origin", f"ssh://git@h{number}.invalid/r")
+    slow = tmp_path / "slow-ssh"
+    slow.write_text("#!/bin/sh\nsleep 60\n", encoding="utf-8")
+    slow.chmod(0o755)
+    (space / gt.CONFIG_NAMES[0]).write_text("sync:\n  timeout: 2\n", encoding="utf-8")
+
+    os.environ["GIT_SSH_COMMAND"] = str(slow)
+    try:
+        gt.main(["-C", str(space), "sync", "--apply", "-j", "1"])
+    finally:
+        os.environ.pop("GIT_SSH_COMMAND", None)
+    out = capsys.readouterr().out
+    assert "could not reach 3 remotes in a row" in out
+    attempted = [line for line in out.splitlines() if line.lstrip().startswith("! r")]
+    assert len(attempted) == gt.OFFLINE_AFTER, attempted
+
+
+def test_a_failed_repository_is_named(workspace: Path, capsys):
+    """`! -: - — git fetch timed out` tells you nothing in a workspace of 256."""
+    actions: list[gt.Action] = []
+    with gt.reporting(actions, "the-repo"):
+        raise gt.Failure("something went wrong")
+    assert actions[0].scope == "the-repo"
