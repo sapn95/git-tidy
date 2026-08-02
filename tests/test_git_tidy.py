@@ -7105,3 +7105,33 @@ def test_a_delimiter_only_counts_where_yaml_says_it_does(text: str):
     """
     yaml = pytest.importorskip("yaml")
     assert gt._parse_yaml_subset(text, "<t>") == yaml.safe_load(text), text
+
+
+def test_a_hash_after_something_that_closed_nothing_is_not_a_comment():
+    """`build'#cache` — the apostrophe closes nothing, so PyYAML keeps the tail."""
+    yaml = pytest.importorskip("yaml")
+    for text in (
+        "exclude: build'#cache\n",
+        "exclude: build]#cache\n",
+        "remote: 'origin'#note\n",
+        "keep: [a, b]#note\n",
+        "k: {a: 1}#c\n",
+        "a: x#plain\n",
+        "url: http://x#frag\n",
+    ):
+        assert gt._parse_yaml_subset(text, "<t>") == yaml.safe_load(text), text
+
+
+def test_a_symlink_to_a_protected_file_is_not_protected(workspace: Path):
+    """resolve() made `current -> .env` resolve to .env and count as kept."""
+    repo = workspace / "repo"
+    cache = repo / "__pycache__"
+    cache.mkdir()
+    (cache / ".env").write_text("SECRET", encoding="utf-8")
+    (cache / "current").symlink_to(".env")
+    (cache / "m.pyc").write_bytes(b"0" * 4096)
+
+    gt.main(["-C", str(workspace), "clean", "--apply"])
+    assert (cache / ".env").read_text(encoding="utf-8") == "SECRET"
+    assert not (cache / "current").exists()
+    assert not (cache / "m.pyc").exists()

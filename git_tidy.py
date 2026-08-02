@@ -530,28 +530,45 @@ def _strip_comment(line: str) -> str:
     quote: str | None = None
     escaped = False
     depth = 0
+    # Whether the character just consumed ended a quoted scalar or a flow
+    # collection. A `#` right after one of those really is a comment; a `#`
+    # right after an apostrophe that opened nothing is not.
+    closed = False
     for i, ch in enumerate(line):
         if quote:
             out.append(ch)
+            was = quote
             # _inside_quote rather than a look at line[i - 1]: that read `\\"`
             # as an escaped quote when the backslash was itself escaped, so a
             # value ending in a backslash never closed and the whole config was
             # refused — while PyYAML read it without complaint.
             quote, escaped = _inside_quote(ch, quote, escaped, line[i + 1 :])
+            closed = quote is None and was is not None
             continue
+        # The flag as the previous character left it, before this one moves it.
+        after_a_close = closed
         if ch in "[{":
             depth += 1
+            closed = False
         elif ch in "]}":
+            # Only if it closed something that was open: the bracket in
+            # `exclude: build]#cache` is plain text, and PyYAML keeps the tail.
+            closed = depth > 0
             depth = max(0, depth - 1)
+        elif ch not in " \t":
+            closed = False
         if ch in "\"'" and _opens_a_value(line, i, in_flow=depth > 0):
             quote = ch
             out.append(ch)
             continue
-        if ch == "#" and (i == 0 or line[i - 1] in " \t" or line[i - 1] in "\"']}"):
-            # After a closing quote or bracket too: PyYAML starts a comment
-            # wherever its scanner is between tokens, so `remote: 'origin'#note`
-            # is the string `origin` there and was an unterminated quote here.
+        if ch == "#" and (i == 0 or line[i - 1] in " \t" or after_a_close):
+            # After a quote or bracket that really *closed* something: PyYAML
+            # starts a comment wherever its scanner is between tokens. Testing
+            # the character alone was too eager — the apostrophe in
+            # `exclude: build'#cache` closes nothing, and PyYAML keeps the whole
+            # thing, so the pattern lost its tail.
             break
+
         out.append(ch)
     return "".join(out)
 
@@ -3273,15 +3290,17 @@ def _thin_out(directory: Path, keep: Sequence[Path]) -> tuple[int, str]:
     those and reporting the prediction meant a directory holding an unreadable
     subtree said "emptied out" and named the full size as freed.
     """
-    kept = {one.resolve() for one in keep}
+    # normpath, not resolve: a symlink `current -> .env` resolves to the
+    # protected .env and would be protected itself, so it survived every run.
+    kept = {Path(os.path.normpath(one)) for one in keep}
     # Every directory on the way down to something kept has to survive too.
     needed = {parent for one in kept for parent in one.parents}
     freed = 0
     trouble = ""
 
     def protected(path: Path) -> bool:
-        resolved = path.resolve()
-        return resolved in kept or any(one in resolved.parents for one in kept)
+        here = Path(os.path.normpath(path))
+        return here in kept or any(one in here.parents for one in kept)
 
     for dirpath, dirnames, filenames in os.walk(directory, followlinks=False):
         here = Path(dirpath)
@@ -3295,7 +3314,7 @@ def _thin_out(directory: Path, keep: Sequence[Path]) -> tuple[int, str]:
         stay = []
         for name in sorted(dirnames):
             candidate = here / name
-            resolved = candidate.resolve()
+            resolved = Path(os.path.normpath(candidate))
             if candidate.is_symlink():
                 # Not followed and not counted: a symlink holds nothing, and
                 # unlinking it cannot destroy what it points at.
@@ -3846,14 +3865,18 @@ def _nothing_else_inside(directory: Path, rescue: Sequence[Path]) -> bool:
     zero-byte files or bare sub-directories — and because that check comes
     before the prompt, they were then never removed on any run.
     """
-    kept = {one.resolve() for one in rescue}
+    # Compared as written, not resolved: a symlink `current -> .env` resolves to
+    # the protected .env and would count as protected itself, so the directory
+    # was kept whole and the symlink never removed. resolve() can also raise on
+    # a loop, here, before _remove has a chance to report anything.
+    kept = {Path(os.path.normpath(one)) for one in rescue}
     for dirpath, dirnames, filenames in os.walk(directory, followlinks=False):
         here = Path(dirpath)
         for name in (*dirnames, *filenames):
-            candidate = (here / name).resolve()
+            candidate = Path(os.path.normpath(here / name))
             if candidate not in kept and not any(one in candidate.parents for one in kept):
                 return False
-        dirnames[:] = [d for d in dirnames if (here / d).resolve() not in kept]
+        dirnames[:] = [d for d in dirnames if Path(os.path.normpath(here / d)) not in kept]
     return True
 
 
