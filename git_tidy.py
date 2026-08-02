@@ -69,7 +69,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NoReturn
 
-__version__ = "3.0.6"
+__version__ = "3.0.7"
 
 CONFIG_NAMES = (".git-tidy.yaml", ".git-tidy.yml")
 QUARANTINE_DIRNAME = ".git-tidy-trash"
@@ -457,6 +457,34 @@ def _inside_quote(ch: str, quote: str, escaped: bool) -> tuple[str | None, bool]
     return (None if ch == quote else quote), False
 
 
+def _opens_a_value(text: str, index: int) -> bool:
+    """Whether a quote at `index` could be opening a scalar rather than sitting
+    inside one.
+
+    The one rule, in one place, because there are three scanners that have to
+    agree and they have disagreed in three consecutive releases. A quote opens a
+    value at the start of the content, or after a delimiter — and a delimiter is
+    only a delimiter where YAML says so:
+
+    - `,` `[` `{` always, they are flow punctuation
+    - `:` and `-` only when a space follows, so `key: 'x'` and `- 'x'` count
+      while the hyphen inside `rock-'n-roll` does not
+
+    Getting that last part wrong is what refused `[rock-'n-roll, build]` on
+    every shipped binary, and what let `- rock-'n-roll  # note` keep its comment
+    inside the value — which silently stopped a clean.keep pattern matching and
+    deleted the directory it was written to protect.
+    """
+    for position in range(index - 1, -1, -1):
+        char = text[position]
+        if char in " \t":
+            continue
+        if char in ",[{":
+            return True
+        return char in ":-" and position + 1 < len(text) and text[position + 1] in " \t"
+    return True
+
+
 def _strip_comment(line: str) -> str:
     """Drop a trailing comment, respecting quotes.
 
@@ -473,7 +501,6 @@ def _strip_comment(line: str) -> str:
     """
     out: list[str] = []
     quote: str | None = None
-    can_open = True  # nothing written yet, so a value could start here
     escaped = False
     for i, ch in enumerate(line):
         if quote:
@@ -484,14 +511,10 @@ def _strip_comment(line: str) -> str:
             # refused — while PyYAML read it without complaint.
             quote, escaped = _inside_quote(ch, quote, escaped)
             continue
-        if ch in "\"'" and can_open:
+        if ch in "\"'" and _opens_a_value(line, i):
             quote = ch
             out.append(ch)
             continue
-        if ch in ":,[{-":
-            can_open = True
-        elif ch not in " \t":
-            can_open = False
         if ch == "#" and (i == 0 or line[i - 1] in " \t"):
             break
         out.append(ch)
@@ -520,17 +543,15 @@ def _outside_quotes(text: str) -> str:
     """
     out: list[str] = []
     quote: str | None = None
-    can_open = True
-    for char in text:
+    escaped = False
+    for index, char in enumerate(text):
         if quote:
-            if char == quote:
-                quote = None
+            # _inside_quote, as the other two scanners use: without it `"a\"\tb"`
+            # closed at the escaped quote and the tab after it read as
+            # structure, so the line was refused while PyYAML loaded it.
+            quote, escaped = _inside_quote(char, quote, escaped)
             continue
-        if char in ":,[{-":
-            can_open = True
-        elif char not in " \t":
-            can_open = can_open and char in "\"'"
-        if char in "\"'" and can_open:
+        if char in "\"'" and _opens_a_value(text, index):
             quote = char
             continue
         out.append(char)
@@ -750,17 +771,12 @@ def _split_flow(body: str, source: str, number: int) -> list[str]:
     # _strip_comment has, and for the same reason: without it the apostrophe in
     # `keep: [Don't Touch/*, build]` opened a quoted run that never closed, so
     # the whole config was refused here and read fine under PyYAML.
-    can_open = True
-    for ch in body:
+    for index, ch in enumerate(body):
         if quote:
             current.append(ch)
             quote, escaped = _inside_quote(ch, quote, escaped)
             continue
-        if ch in ":,[{-":
-            can_open = True
-        elif ch not in " \t":
-            can_open = can_open and ch in "\"'"
-        if ch in "\"'" and can_open:
+        if ch in "\"'" and _opens_a_value(body, index):
             quote = ch
         elif ch in "[{":
             depth += 1
@@ -820,22 +836,37 @@ _YAML_TIMESTAMP = re.compile(
 )
 
 
+class _NotANumber(Exception):
+    """The regex matched but the value is not one — `._` is a string to PyYAML."""
+
+
 def _yaml_int(token: str) -> int:
     body = token.replace("_", "")
     sign = -1 if body.startswith("-") else 1
     body = body.lstrip("+-")
+
     if ":" in body:  # sexagesimal, which YAML 1.1 still has
-        value = 0
-        for part in body.split(":"):
-            value = value * 60 + int(part)
+        try:
+            value = 0
+            for part in body.split(":"):
+                value = value * 60 + int(part)
+        except ValueError as exc:
+            raise _NotANumber(token) from exc
         return sign * value
-    if body[:2].lower() == "0b":
-        return sign * int(body[2:], 2)
-    if body[:2].lower() == "0x":
-        return sign * int(body[2:], 16)
-    if body.startswith("0") and len(body) > 1:
-        return sign * int(body, 8)
-    return sign * int(body)
+    try:
+        if body[:2].lower() == "0b":
+            return sign * int(body[2:], 2)
+        if body[:2].lower() == "0x":
+            return sign * int(body[2:], 16)
+        if body.startswith("0") and len(body) > 1:
+            return sign * int(body, 8)
+        return sign * int(body)
+    except ValueError as exc:
+        # The pattern allows underscores among the digits, so `0x_` arrives here
+        # with none left. int() then raises a bare ValueError with a traceback
+        # and exit 1, where the man page promises 2 — and PyYAML just reads it
+        # as the string it looks like.
+        raise _NotANumber(token) from exc
 
 
 def _yaml_float(token: str) -> float:
@@ -844,6 +875,7 @@ def _yaml_float(token: str) -> float:
         return float("-inf") if body.startswith("-") else float("inf")
     if body.lower() == ".nan":
         return float("nan")
+
     if ":" in body:
         sign = -1 if body.startswith("-") else 1
         whole, _, fraction = body.lstrip("+-").partition(".")
@@ -851,7 +883,10 @@ def _yaml_float(token: str) -> float:
         for part in whole.split(":"):
             value = value * 60 + float(part)
         return sign * (value + (float("0." + fraction) if fraction else 0.0))
-    return float(body)
+    try:
+        return float(body)
+    except ValueError as exc:
+        raise _NotANumber(token) from exc
 
 
 def _scalar(token: str, source: str, number: int) -> Any:
@@ -1039,9 +1074,11 @@ def _plain_scalar(token: str, source: str = "<config>", number: int = 0) -> Any:
     if token in _YAML_BOOL_FALSE:
         return False
     if _YAML_INT.match(token):
-        return _yaml_int(token)
+        with contextlib.suppress(_NotANumber):
+            return _yaml_int(token)
     if _YAML_FLOAT.match(token):
-        return _yaml_float(token)
+        with contextlib.suppress(_NotANumber):
+            return _yaml_float(token)
     if _YAML_TIMESTAMP.match(token):
         # PyYAML resolves this to a date, which _merge then refuses because it
         # is not text. Refusing it here keeps both paths saying the same thing.
@@ -1893,8 +1930,10 @@ def _maybe_pack(git: Git, name: str, decider: Decider) -> Action:
     if decider.dry:
         # Said in a dry run too. Skipping it there meant `sync -n` was silent
         # about something `sync --apply` then reported.
+        # Not skipped: a dry run *predicts*, and marking it held back filed this
+        # under "other, see the lines marked -" while the apply counted it
+        # properly.
         action.detail = "would run git gc --auto"
-        action.skipped = True
         return action
     if not decider.allow(action):
         return action
@@ -6282,7 +6321,9 @@ def _expire_old_quarantines(
     root = context.workspace / QUARANTINE_DIRNAME
     if days <= 0 or not root.is_dir():
         return
-    if not any(action.applied for action in report.actions) and not context.decider.dry:
+    if not any(
+        action.applied or (context.decider.dry and not action.skipped) for action in report.actions
+    ):
         # The README and the man page both say "a clean, trash or run that
         # applies anything". Keying off the command name alone meant a
         # `clean --apply` in a workspace with clean switched off still deleted
