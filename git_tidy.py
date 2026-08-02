@@ -69,7 +69,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NoReturn
 
-__version__ = "3.0.7"
+__version__ = "3.0.8"
 
 CONFIG_NAMES = (".git-tidy.yaml", ".git-tidy.yml")
 QUARANTINE_DIRNAME = ".git-tidy-trash"
@@ -430,7 +430,12 @@ def load_yaml(text: str, source: str) -> Any:
         return _parse_yaml_subset(text, source)
     try:
         return yaml.safe_load(text)
-    except yaml.YAMLError as exc:  # pragma: no cover - message shape varies
+    except (yaml.YAMLError, ValueError) as exc:
+        # ValueError as well: PyYAML's *constructors* raise it — `jobs: 0x_`
+        # gives "invalid literal for int() with base 16", `remote: 2024-13-45`
+        # gives "month must be in 1..12" — and a bare ValueError escapes
+        # entrypoint's except Failure as a traceback with exit 1, where the man
+        # page promises 2.  # pragma: no cover - message shape varies
         raise Failure(f"{source}: {exc}") from exc
 
 
@@ -443,7 +448,9 @@ class _Line:
     number: int
 
 
-def _inside_quote(ch: str, quote: str, escaped: bool) -> tuple[str | None, bool]:
+def _inside_quote(
+    ch: str, quote: str, escaped: bool, following: str = ""
+) -> tuple[str | None, bool]:
     """Track a quoted run inside a flow collection, honouring \\" as an escape.
 
     Without the escape, `keep: ["a\\"b", c]` was an unterminated quote here and
@@ -454,7 +461,22 @@ def _inside_quote(ch: str, quote: str, escaped: bool) -> tuple[str | None, bool]
         return quote, False
     if quote == '"' and ch == "\\":
         return quote, True
+    if quote == "'" and ch == "'" and following[:1] == "'":
+        # '' is a literal apostrophe, so the run does not end here. Closing on
+        # the first of the pair left the scanner outside the quotes mid-scalar,
+        # and a comma or a # after it then read as structure: `'it''s, fine'`
+        # was an unterminated quote here and an ordinary string to PyYAML.
+        return quote, True
     return (None if ch == quote else quote), False
+
+
+# YAML's whitespace is exactly these two. Python's str.strip() also eats
+# U+00A0, U+2000-U+200A, U+3000 and a dozen more, which is what you get pasting
+# a pattern out of rendered markdown or a chat client — and stripping them made
+# `- .terraform\u00a0` protect the directory on every shipped binary and protect
+# nothing from a checkout. It can change the structure too: a line indented with
+# U+00A0 is a second top-level key to PyYAML and a nested block here.
+YAML_SPACE = " \t"
 
 
 def _opens_a_value(text: str, index: int, in_flow: bool) -> bool:
@@ -486,7 +508,7 @@ def _opens_a_value(text: str, index: int, in_flow: bool) -> bool:
         if char == ":" and follows_space:
             return True
         # `- ` opens a block sequence item, and only at the start of the content.
-        return char == "-" and follows_space and not text[:position].strip()
+        return char == "-" and follows_space and not text[:position].strip(YAML_SPACE)
     return True
 
 
@@ -515,7 +537,7 @@ def _strip_comment(line: str) -> str:
             # as an escaped quote when the backslash was itself escaped, so a
             # value ending in a backslash never closed and the whole config was
             # refused — while PyYAML read it without complaint.
-            quote, escaped = _inside_quote(ch, quote, escaped)
+            quote, escaped = _inside_quote(ch, quote, escaped, line[i + 1 :])
             continue
         if ch in "[{":
             depth += 1
@@ -525,7 +547,10 @@ def _strip_comment(line: str) -> str:
             quote = ch
             out.append(ch)
             continue
-        if ch == "#" and (i == 0 or line[i - 1] in " \t"):
+        if ch == "#" and (i == 0 or line[i - 1] in " \t" or line[i - 1] in "\"']}"):
+            # After a closing quote or bracket too: PyYAML starts a comment
+            # wherever its scanner is between tokens, so `remote: 'origin'#note`
+            # is the string `origin` there and was an unterminated quote here.
             break
         out.append(ch)
     return "".join(out)
@@ -560,7 +585,7 @@ def _outside_quotes(text: str) -> str:
             # _inside_quote, as the other two scanners use: without it `"a\"\tb"`
             # closed at the escaped quote and the tab after it read as
             # structure, so the line was refused while PyYAML loaded it.
-            quote, escaped = _inside_quote(char, quote, escaped)
+            quote, escaped = _inside_quote(char, quote, escaped, text[index + 1 :])
             continue
         if char in "[{":
             depth += 1
@@ -616,7 +641,7 @@ def _tokenize(text: str, source: str) -> list[_Line]:
     lines: list[_Line] = []
     ended = False
     for number, raw in enumerate(_yaml_lines(text), start=1):
-        if "\t" in raw[: len(raw) - len(raw.lstrip())]:
+        if "\t" in raw[: len(raw) - len(raw.lstrip(YAML_SPACE))]:
             raise Failure(f"{source}:{number}: tabs cannot be used for YAML indentation")
         # The raw line for the printable check: PyYAML's Reader runs over the
         # whole stream, comments included, so `jobs: 4  # note\x00here` was
@@ -632,13 +657,13 @@ def _tokenize(text: str, source: str) -> list[_Line]:
         # to refuse the whole config on every shipped binary, while a tab *after*
         # the value is a ScannerError there and used to be stripped away here.
         _refuse_control_characters(content, source, number)
-        content = content.rstrip()
-        if not content.strip():
+        content = content.rstrip(YAML_SPACE)
+        if not content.strip(YAML_SPACE):
             continue
-        if content.strip() == "...":
+        if content.strip(YAML_SPACE) == "...":
             ended = True
             continue
-        if content.strip() == "---":
+        if content.strip(YAML_SPACE) == "---":
             if lines or ended:
                 # A second document. PyYAML refuses one outright; merging them
                 # here silently dropped whichever key came first.
@@ -646,7 +671,7 @@ def _tokenize(text: str, source: str) -> list[_Line]:
                     f"{source}:{number}: more than one YAML document; this reads only one"
                 )
             continue
-        if content.lstrip().startswith("---"):
+        if content.lstrip(YAML_SPACE).startswith("---"):
             # `--- {jobs: 4}` is one document with content on the marker line,
             # and `---jobs: 4` is a key called ---jobs. Dropping the line
             # outright threw the first away in silence and left the config
@@ -655,7 +680,9 @@ def _tokenize(text: str, source: str) -> list[_Line]:
             raise Failure(f"{source}:{number}: put the document on its own lines, not after ---")
         if ended:
             raise Failure(f"{source}:{number}: content after the end of the document")
-        lines.append(_Line(len(content) - len(content.lstrip()), content.strip(), number))
+        lines.append(
+            _Line(len(content) - len(content.lstrip(YAML_SPACE)), content.strip(YAML_SPACE), number)
+        )
     return lines
 
 
@@ -698,7 +725,7 @@ def _parse_mapping(lines: list[_Line], index: int, indent: int, source: str) -> 
                 f"{source}:{line.number}: expected 'key: value' — a colon needs a space "
                 f"after it, or nothing at all"
             )
-        key, rest = key.strip(), rest.strip()
+        key, rest = key.strip(YAML_SPACE), rest.strip(YAML_SPACE)
         index += 1
         if rest:
             result[_scalar(key, source, line.number)] = _scalar(rest, source, line.number)
@@ -732,7 +759,7 @@ def _parse_sequence(lines: list[_Line], index: int, indent: int, source: str) ->
             # mapping key sits at this same indent, so stopping is what YAML
             # means — refusing would reject `exclude:` / `- a` / `jobs: 2`.
             break
-        item = line.text[1:].lstrip()
+        item = line.text[1:].lstrip(YAML_SPACE)
         # The column the item's content starts at, so `- key: value` can be
         # re-read as a mapping that later lines at the same column extend.
         item_indent = indent + (len(line.text) - len(item))
@@ -770,9 +797,9 @@ def _looks_like_mapping(item: str) -> bool:
     if item.startswith(("[", "{", '"', "'")):
         return False
     if item.endswith(":"):
-        return " " not in item[:-1].strip()
+        return " " not in item[:-1].strip(YAML_SPACE)
     key, sep, _ = item.partition(": ")
-    return bool(sep) and " " not in key.strip()
+    return bool(sep) and " " not in key.strip(YAML_SPACE)
 
 
 def _split_flow(body: str, source: str, number: int) -> list[str]:
@@ -789,7 +816,7 @@ def _split_flow(body: str, source: str, number: int) -> list[str]:
     for index, ch in enumerate(body):
         if quote:
             current.append(ch)
-            quote, escaped = _inside_quote(ch, quote, escaped)
+            quote, escaped = _inside_quote(ch, quote, escaped, body[index + 1 :])
             continue
         if ch in "\"'" and _opens_a_value(body, index, in_flow=True):
             quote = ch
@@ -806,9 +833,9 @@ def _split_flow(body: str, source: str, number: int) -> list[str]:
         current.append(ch)
     if quote or depth:
         raise Failure(f"{source}:{number}: unterminated quote or bracket")
-    if "".join(current).strip():
+    if "".join(current).strip(YAML_SPACE):
         parts.append("".join(current))
-    return [p.strip() for p in parts]
+    return [p.strip(YAML_SPACE) for p in parts]
 
 
 # YAML 1.1 resolution, as PyYAML's safe loader implements it. Copied deliberately
@@ -828,7 +855,7 @@ _YAML_INT = re.compile(
 )
 _YAML_FLOAT = re.compile(
     r"""^(?:[-+]?[0-9][0-9_]*\.[0-9_]*(?:[eE][-+][0-9]+)?
-        |\.[0-9_]+(?:[eE][-+][0-9]+)?
+        |\.[0-9][0-9_]*(?:[eE][-+][0-9]+)?
         |[-+]?[0-9][0-9_]*(?::[0-5]?[0-9])+\.[0-9_]*
         |[-+]?\.(?:inf|Inf|INF)
         |\.(?:nan|NaN|NAN))$""",
@@ -906,18 +933,22 @@ def _yaml_float(token: str) -> float:
 
 def _scalar(token: str, source: str, number: int) -> Any:
     """Read one scalar, or a flow collection, the way PyYAML's safe loader would."""
-    token = token.strip()
+    token = token.strip(YAML_SPACE)
     flow = _flow_collection(token, source, number)
     if flow is not _NOT_FLOW:
         return flow
     if not token:
         return None  # an empty scalar is null; indexing it below would not be
-    if token[0] in "\"'" and not (len(token) >= 2 and token[-1] == token[0]):
+    if token[0] in "\"'" and not _closes_at_the_end(token):
         # Refused for the same reason an unbalanced bracket is: read as a plain
         # scalar, `keep: "docs/*` becomes a pattern that can never match, and
         # the directory it was written to protect is deleted. PyYAML rejects it.
+        #
+        # "closes at the end", not "starts and ends with the same quote": in
+        # `'Don't touch'` the run closes at the apostrophe and the rest is a
+        # syntax error, which PyYAML says and this used to load.
         raise Failure(f"{source}:{number}: unterminated quote in {token!r}")
-    if len(token) >= 2 and token[0] == token[-1] and token[0] in "\"'":
+    if len(token) >= 2 and token[0] in "\"'":
         body = token[1:-1]
         if token[0] == '"':
             return _unescape(body, source, number)
@@ -982,6 +1013,22 @@ def _unescape(body: str, source: str, number: int) -> str:
     return "".join(out)
 
 
+def _closes_at_the_end(token: str) -> bool:
+    """Whether the opening quote is closed by the *last* character and no sooner.
+
+    Matching first-against-last accepted `'Don't touch'` as a value, which is a
+    ParserError to PyYAML — the run closes at the apostrophe in "Don't" and the
+    rest is a syntax error. Same for `"say "hi""` and `'a' 'b'`. Loading them
+    happened on every shipped binary and nowhere else.
+    """
+    quote, escaped = token[0], False
+    for index, char in enumerate(token[1:], start=1):
+        quote, escaped = _inside_quote(char, quote, escaped, token[index + 1 :])
+        if quote is None:
+            return index == len(token) - 1
+    return False
+
+
 # A sentinel, because None is itself a perfectly good parsed value.
 _NOT_FLOW = object()
 
@@ -1019,7 +1066,7 @@ def _flow_collection(token: str, source: str, number: int) -> Any:
             key, sep, value = part.partition(": ")
             if not sep and part.endswith(":"):
                 key, sep, value = part[:-1], ":", ""
-            if key.strip().startswith(("[", "{")):
+            if key.strip(YAML_SPACE).startswith(("[", "{")):
                 # As _parse_mapping does for the block path: _scalar would hand
                 # back a list or a dict, and an unhashable dict key is a bare
                 # TypeError rather than anything a person can act on.
@@ -1505,7 +1552,11 @@ def plural(count: str | int, word: str) -> str:
         return f"{count} {word}s"
     if number == 1:
         return f"{number} {word}"
-    return f"{number} {word[:-1]}ies" if word.endswith("y") else f"{number} {word}s"
+    # Only a consonant before the y takes -ies: "repositories" and "entries",
+    # but "days", not "daies".
+    if word.endswith("y") and word[-2:-1] not in "aeiou":
+        return f"{number} {word[:-1]}ies"
+    return f"{number} {word}s"
 
 
 def last_line(result: subprocess.CompletedProcess[str]) -> str:
@@ -1953,7 +2004,11 @@ def _maybe_pack(git: Git, name: str, decider: Decider) -> Action:
     if not decider.allow(action):
         return action
     before = _loose_objects(git)
-    result = git.run("gc", "--auto", "--quiet", check=False)
+    # -c gc.autoDetach=false: --auto forks and returns 0 immediately by
+    # default, so reading the loose count straight afterwards saw the number it
+    # started with and every real repack was reported as "not worth repacking
+    # yet" — on a repository where gc had just packed sixteen hundred objects.
+    result = git.run("-c", "gc.autoDetach=false", "gc", "--auto", "--quiet", check=False)
     if result.returncode != 0:
         action.error = last_line(result)
         return action
@@ -2068,8 +2123,12 @@ def _cannot_switch(
         # the commit it was reset from is not written down anywhere. _stash
         # already refused for this reason, but a *clean* repository mid-bisect
         # never reached it — it was simply switched off its detached HEAD.
+        # stop=True, like every other refusal here: without it _sync_from
+        # carried on to _fast_forward, which printed "fast-forwarded 2 commits"
+        # directly under "a bisect is in progress, left alone".
         return _Outcome(
-            [Action("sync", name, where, f"{busy} is in progress, left alone", skipped=True)]
+            [Action("sync", name, where, f"{busy} is in progress, left alone", skipped=True)],
+            stop=True,
         )
     if sync["worktrees"] == "skip" and is_linked_worktree(git):
         # Nothing is wrong here: this checkout exists to hold its own branch.
@@ -2204,6 +2263,15 @@ def _fast_forward(
 ) -> list[Action]:
     if not sync["fast_forward"]:
         return []
+    busy = _operation_in_progress(git)
+    if busy:
+        # The commoner bisect case never reaches _switch at all: a bisect
+        # started while already on the trunk leaves HEAD detached on the trunk's
+        # own history, so there is nothing to switch and the fast-forward moved
+        # the branch out from under it. .git/BISECT_START holds the branch
+        # *name*, so `git bisect reset` then lands on the new tip and the
+        # commit the bisect began from survives only in the reflog.
+        return [Action("sync", name, head or "HEAD", f"{busy} is in progress, left alone", True)]
     upstream = target if head == branch else _upstream_of(git, head)
     if not head:
         return [Action("update", name, "HEAD", "detached, nothing to fast-forward", skipped=True)]
@@ -3707,7 +3775,7 @@ def _remove(
     action.size = max(0, action.size - kept_bytes)
     # Said before the decision, so a dry run names the outcome it is predicting.
     thinned = is_dir and bool(rescue) and quarantine is None
-    if thinned and action.size == 0:
+    if thinned and _nothing_else_inside(path, rescue):
         return _kept_whole(action, because)
     verb = "empty out" if thinned else ("quarantine" if action.quarantined else "remove")
     what = "" if thinned else f" {'directory' if is_dir else 'file'}"
@@ -3770,6 +3838,25 @@ def _bytes_of(paths: Sequence[Path]) -> int:
     return total
 
 
+def _nothing_else_inside(directory: Path, rescue: Sequence[Path]) -> bool:
+    """Whether the protected entries really are all there is in here.
+
+    Entries, not bytes. Testing `size == 0` called a directory "kept whole:
+    everything in it is protected" when what was left over happened to be
+    zero-byte files or bare sub-directories — and because that check comes
+    before the prompt, they were then never removed on any run.
+    """
+    kept = {one.resolve() for one in rescue}
+    for dirpath, dirnames, filenames in os.walk(directory, followlinks=False):
+        here = Path(dirpath)
+        for name in (*dirnames, *filenames):
+            candidate = (here / name).resolve()
+            if candidate not in kept and not any(one in candidate.parents for one in kept):
+                return False
+        dirnames[:] = [d for d in dirnames if (here / d).resolve() not in kept]
+    return True
+
+
 def _kept_whole(action: Action, because: str) -> Action:
     """Nothing in it may go, so the directory is exactly as it was.
 
@@ -3784,9 +3871,11 @@ def _kept_whole(action: Action, because: str) -> Action:
 
 
 def _finished(action: Action, thinned: bool, because: str) -> Action:
-    """Say what happened, once it has."""
-    if thinned and action.size == 0:
-        return _kept_whole(action, because)
+    """Say what happened, once it has.
+
+    No kept-whole branch here: _remove returns early when nothing in the
+    directory may go, so this is only ever reached when something did.
+    """
     action.applied = True
     # "removed" would be untrue for a quarantined path: it is still on the disk,
     # a restore away.
@@ -5117,7 +5206,15 @@ class Printer:
         else:
             mark, code = "~", "33"
         size = f" ({human_size(action.size)})" if action.size else ""
-        detail = action.error or action.detail
+        # Both, when both are true: a directory that was partly removed and
+        # then hit a permission error has something to say in each — "partly
+        # removed, 55.7 KB of it" was written for exactly this and only ever
+        # reached --json, because the error won outright.
+        detail = (
+            f"{action.detail} — {action.error}"
+            if action.error and action.applied
+            else action.error or action.detail
+        )
         line = f"  {self.paint(mark, code)} {action.scope}: {action.target}{size}"
         if detail:
             line += f" — {detail}"
@@ -5591,7 +5688,14 @@ def cmd_sync(context: Context, report: Report) -> None:
     context.fetched = {
         by_name[a.scope]
         for a in report.actions
-        if a.kind == "fetch" and a.applied and a.scope in by_name
+        # `applied` is never true in a dry run, so this was always empty there —
+        # and prune then reported "kept: deleting unmerged work needs a fetch in
+        # this run" for exactly the branches --apply was about to delete. A dry
+        # run has to predict what the apply will do, so a fetch it *would* make
+        # counts: not skipped, and no error.
+        if a.kind == "fetch"
+        and (a.applied or (context.decider.dry and not a.skipped and not a.error))
+        and a.scope in by_name
     }
 
 
@@ -6006,6 +6110,11 @@ def cmd_init(
         chosen = _interview(printer, prompt_input)
 
     body = render_config(chosen, INIT_HEADER)
+    # Before writing, not after: an answer of -5 to "older than how many days?"
+    # produced a file that every later run refused, and `init` would not fix it
+    # ("already exists; pass --force"). The interview validates jobs already;
+    # this validates the lot, by the same route a real run would.
+    _merge(DEFAULTS, load_yaml(body, str(target)) or {}, str(target))
     if explicit_dry:
         # -n means change nothing, here as everywhere else. Printing it is still
         # useful: `git-tidy init -n > .git-tidy.yaml` is a reasonable thing to do

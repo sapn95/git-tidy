@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "git-tidy"
-version = "3.0.7"
+version = "3.0.8"
 description = "Keep a directory full of git checkouts clean: sync, prune, clean, sweep."
 readme = "README.md"
 license = "MIT"
