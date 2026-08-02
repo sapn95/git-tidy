@@ -6982,3 +6982,126 @@ def test_the_two_kinds_of_pack_do_not_share_consent(workspace: Path):
     auto = gt.Action("gc", "repo", ".git", "run git gc --auto")
     real = gt.Action("pack", "repo", ".git", "pack .git with git gc, 900 MB")
     assert auto.consent_key != real.consent_key
+
+
+# --------------------------------------------------------------------------- #
+# Claude review, round twenty
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "clean:\n  keep: [rock-'n-roll, build]\n",
+        "clean:\n  keep:\n    - rock-'n-roll   # the band\n",
+        "exclude:\n    - old-'22   # last year\n",
+        "clean:\n  keep: [Don't Touch/*, build]\n",
+        "k: {a: 'b,c'}\n",
+        'k: {a: "b]c"}\n',
+        "a: it's fine  # note\n",
+        'clean:\n  keep: ["a, b", c]\n',
+        'a: "a\\"b"  # note\n',
+    ],
+)
+def test_a_hyphen_inside_a_word_does_not_open_a_quote(text: str):
+    """One rule, three scanners, and they have disagreed in three releases.
+
+    `-` and `:` reset "a value could start here" only when a space follows —
+    the hyphen inside `rock-'n-roll` is part of the word. Getting that wrong
+    refused `[rock-'n-roll, build]` on every shipped binary, and let
+    `- rock-'n-roll  # note` keep the comment inside the value, which silently
+    stopped a clean.keep pattern matching.
+    """
+    yaml = pytest.importorskip("yaml")
+    assert gt._parse_yaml_subset(text, "<t>") == yaml.safe_load(text), text
+
+
+def test_a_kept_directory_with_a_hyphen_and_an_apostrophe_survives(workspace: Path):
+    """The end of that bug: the pattern stopped matching and the directory went."""
+    repo = workspace / "repo"
+    protected = repo / "rock-'n-roll"
+    protected.mkdir()
+    (protected / "asset.bin").write_bytes(b"0" * 512)
+    (repo / "__pycache__").mkdir()
+    (repo / "__pycache__" / "m.pyc").write_bytes(b"0" * 512)
+    (workspace / gt.CONFIG_NAMES[0]).write_text(
+        'clean:\n  dirs: ["rock-\'n-roll", __pycache__]\n'
+        "  keep:\n    - rock-'n-roll   # the band's assets\n",
+        encoding="utf-8",
+    )
+
+    gt.main(["-C", str(workspace), "clean", "--apply"])
+    assert (protected / "asset.bin").is_file(), "clean.keep named it"
+    assert not (repo / "__pycache__").exists()
+
+
+@pytest.mark.parametrize("token", ["._", ".__", "0b_", "0x_", "-._", "1:_", "_"])
+def test_a_number_pattern_that_matched_nothing_is_not_a_traceback(token: str):
+    """int()/float() raised a bare ValueError, exit 1, where the man page says 2."""
+    text = f"a: {token}\n"
+    try:
+        gt._parse_yaml_subset(text, "<t>")
+    except gt.Failure:
+        pass  # a refusal is fine; a traceback is not
+    except Exception as exc:  # that a bare exception escapes is the point
+        pytest.fail(f"{type(exc).__name__}: {exc}")
+
+
+@pytest.mark.parametrize("token", [".inf", "-.inf", ".nan", "1.5", ".5", "1_000", "0x1f", "12:30"])
+def test_the_numbers_that_are_numbers_still_are(token: str):
+    yaml = pytest.importorskip("yaml")
+    text = f"a: {token}\n"
+    mine, theirs = gt._parse_yaml_subset(text, "<t>")["a"], yaml.safe_load(text)["a"]
+    assert mine == theirs or (mine != mine and theirs != theirs), (mine, theirs)
+
+
+def test_a_dry_run_does_not_promise_an_expiry_the_apply_will_not_do(workspace: Path, capsys):
+    """The early return was gated on `and not dry`, so the dry run always ran on."""
+    old = workspace / gt.QUARANTINE_DIRNAME / "20240101T000000Z"
+    (old / gt.CONTENT_DIRNAME).mkdir(parents=True)
+    (old / gt.MANIFEST_NAME).write_text("{}", encoding="utf-8")
+    (old / gt.CONTENT_DIRNAME / "old.bin").write_bytes(b"0" * 99)
+    os.utime(old, (0, 0))
+
+    gt.main(["-C", str(workspace), "clean"])
+    dry = capsys.readouterr().out
+    gt.main(["-C", str(workspace), "clean", "--apply"])
+    applied = capsys.readouterr().out
+
+    assert "quarantines to delete" not in dry, dry
+    assert "quarantines deleted" not in applied, applied
+    assert old.exists()
+
+
+def test_a_dry_run_gc_is_a_prediction_not_something_held_back(workspace: Path, capsys):
+    """It was filed under "other, see the lines marked -" while apply counted it."""
+    (workspace / gt.CONFIG_NAMES[0]).write_text("sync:\n  gc: true\n", encoding="utf-8")
+    gt.main(["-C", str(workspace), "sync", "-v"])
+    out = capsys.readouterr().out
+    assert "repositories git may repack" in out
+    assert "other, see the lines marked" not in out
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "a: keep - 'still text # note\n",
+        "a: x, 'y # note\n",
+        "a: it's fine  # note\n",
+        "clean:\n  keep: [rock-'n-roll, build]\n",
+        'clean:\n  keep: ["a, b", c]\n',
+        "k: {a: 'b,c'}\n",
+        "k: ['a', \"b\"]\n",
+        "a: 'quoted'  # note\n",
+        'a: "a\\"b"  # note\n',
+    ],
+)
+def test_a_delimiter_only_counts_where_yaml_says_it_does(text: str):
+    """Everything from `key: ` to the end of the line is one plain scalar.
+
+    So the `- ` and the `,` in `a: keep - 'still text` are ordinary characters
+    and the apostrophe after them opens nothing — while inside `[...]` the same
+    comma really is a delimiter. One rule, told which context it is in.
+    """
+    yaml = pytest.importorskip("yaml")
+    assert gt._parse_yaml_subset(text, "<t>") == yaml.safe_load(text), text
