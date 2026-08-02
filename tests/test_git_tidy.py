@@ -7080,3 +7080,28 @@ def test_a_dry_run_gc_is_a_prediction_not_something_held_back(workspace: Path, c
     out = capsys.readouterr().out
     assert "repositories git may repack" in out
     assert "other, see the lines marked" not in out
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "a: keep - 'still text # note\n",
+        "a: x, 'y # note\n",
+        "a: it's fine  # note\n",
+        "clean:\n  keep: [rock-'n-roll, build]\n",
+        'clean:\n  keep: ["a, b", c]\n',
+        "k: {a: 'b,c'}\n",
+        "k: ['a', \"b\"]\n",
+        "a: 'quoted'  # note\n",
+        'a: "a\\"b"  # note\n',
+    ],
+)
+def test_a_delimiter_only_counts_where_yaml_says_it_does(text: str):
+    """Everything from `key: ` to the end of the line is one plain scalar.
+
+    So the `- ` and the `,` in `a: keep - 'still text` are ordinary characters
+    and the apostrophe after them opens nothing — while inside `[...]` the same
+    comma really is a delimiter. One rule, told which context it is in.
+    """
+    yaml = pytest.importorskip("yaml")
+    assert gt._parse_yaml_subset(text, "<t>") == yaml.safe_load(text), text

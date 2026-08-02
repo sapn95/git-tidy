@@ -381,20 +381,26 @@ git-tidy -j 32 sync --apply   # a lot of slow remotes
 
 ```mermaid
 flowchart LR
-    A([any command]) --> M{mode}
+    A([any command]) --> M{"mode — pick one"}
     M -->|"-n, the default"| DRY["says what it would do<br>changes nothing"]
     M -->|"-i / --ask"| ASK["asks per change:<br>y / n / a / s / q"]
     M -->|"--apply"| DO["does all of it"]
-    ASK --> DO
-    DO --> F{"and then?"}
-    F -->|"plain"| SAFE["work that is only local<br>is reported, not touched"]
-    F -->|"--force"| MORE["also deletes an unmerged branch<br>and stashes to switch<br><i>never discards: the report names the stash</i>"]
-    F -->|"--fix, on doctor or run"| FIX["also puts a detached HEAD back,<br>takes a credential out of a remote URL,<br>packs an oversized .git"]
+
+    MOD["<b>modifiers — add either, or both</b><br><br><b>--force</b>  also deletes an unmerged branch<br>and stashes to switch. Never discards:<br>the report names the stash.<br><br><b>--fix</b>  on doctor or run, also puts a<br>detached HEAD back, takes a credential<br>out of a remote URL, packs a big .git."]
+
+    DRY -.-> MOD
+    ASK -.-> MOD
+    DO -.-> MOD
+
+    N["Modifiers change <i>what is offered</i>,<br>never <i>whether it is asked</i>.<br>-n stays a dry run with either."]
+    MOD --- N
 
     classDef safe fill:#dafbe1,stroke:#2da44e,color:#1a7f37
     classDef warn fill:#fff8c5,stroke:#d4a72c,color:#7d4e00
-    class DRY,SAFE,FIX safe
-    class MORE warn
+    classDef note fill:#f6f8fa,stroke:#d0d7de,color:#57606a
+    class DRY safe
+    class MOD warn
+    class N note
 ```
 
 YAML, in two places, and both are optional:

@@ -457,31 +457,36 @@ def _inside_quote(ch: str, quote: str, escaped: bool) -> tuple[str | None, bool]
     return (None if ch == quote else quote), False
 
 
-def _opens_a_value(text: str, index: int) -> bool:
+def _opens_a_value(text: str, index: int, in_flow: bool) -> bool:
     """Whether a quote at `index` could be opening a scalar rather than sitting
     inside one.
 
     The one rule, in one place, because there are three scanners that have to
-    agree and they have disagreed in three consecutive releases. A quote opens a
-    value at the start of the content, or after a delimiter — and a delimiter is
-    only a delimiter where YAML says so:
+    agree and they have disagreed in three consecutive releases.
 
-    - `,` `[` `{` always, they are flow punctuation
-    - `:` and `-` only when a space follows, so `key: 'x'` and `- 'x'` count
-      while the hyphen inside `rock-'n-roll` does not
+    Where it opens depends on which kind of context the quote is in:
 
-    Getting that last part wrong is what refused `[rock-'n-roll, build]` on
-    every shipped binary, and what let `- rock-'n-roll  # note` keep its comment
-    inside the value — which silently stopped a clean.keep pattern matching and
-    deleted the directory it was written to protect.
+    - inside a flow collection, after `,` `[` `{`, or a `:` with a space after
+      it — those really are delimiters there
+    - outside one, only at the very start of the value. Everything from `key: `
+      to the end of the line is a single plain scalar, so the `- ` and the `,`
+      in `a: keep - 'still text` are ordinary characters and the apostrophe
+      after them opens nothing.
+
+    Getting the second part wrong kept `# note` inside the value of
+    `a: keep - 'still text # note`, which PyYAML strips.
     """
     for position in range(index - 1, -1, -1):
         char = text[position]
         if char in " \t":
             continue
-        if char in ",[{":
+        if in_flow and char in ",[{":
             return True
-        return char in ":-" and position + 1 < len(text) and text[position + 1] in " \t"
+        follows_space = position + 1 < len(text) and text[position + 1] in " \t"
+        if char == ":" and follows_space:
+            return True
+        # `- ` opens a block sequence item, and only at the start of the content.
+        return char == "-" and follows_space and not text[:position].strip()
     return True
 
 
@@ -502,6 +507,7 @@ def _strip_comment(line: str) -> str:
     out: list[str] = []
     quote: str | None = None
     escaped = False
+    depth = 0
     for i, ch in enumerate(line):
         if quote:
             out.append(ch)
@@ -511,7 +517,11 @@ def _strip_comment(line: str) -> str:
             # refused — while PyYAML read it without complaint.
             quote, escaped = _inside_quote(ch, quote, escaped)
             continue
-        if ch in "\"'" and _opens_a_value(line, i):
+        if ch in "[{":
+            depth += 1
+        elif ch in "]}":
+            depth = max(0, depth - 1)
+        if ch in "\"'" and _opens_a_value(line, i, in_flow=depth > 0):
             quote = ch
             out.append(ch)
             continue
@@ -544,6 +554,7 @@ def _outside_quotes(text: str) -> str:
     out: list[str] = []
     quote: str | None = None
     escaped = False
+    depth = 0
     for index, char in enumerate(text):
         if quote:
             # _inside_quote, as the other two scanners use: without it `"a\"\tb"`
@@ -551,7 +562,11 @@ def _outside_quotes(text: str) -> str:
             # structure, so the line was refused while PyYAML loaded it.
             quote, escaped = _inside_quote(char, quote, escaped)
             continue
-        if char in "\"'" and _opens_a_value(text, index):
+        if char in "[{":
+            depth += 1
+        elif char in "]}":
+            depth = max(0, depth - 1)
+        if char in "\"'" and _opens_a_value(text, index, in_flow=depth > 0):
             quote = char
             continue
         out.append(char)
@@ -776,7 +791,7 @@ def _split_flow(body: str, source: str, number: int) -> list[str]:
             current.append(ch)
             quote, escaped = _inside_quote(ch, quote, escaped)
             continue
-        if ch in "\"'" and _opens_a_value(body, index):
+        if ch in "\"'" and _opens_a_value(body, index, in_flow=True):
             quote = ch
         elif ch in "[{":
             depth += 1
