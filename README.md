@@ -276,27 +276,34 @@ last box only when none of them applies.
 ```mermaid
 flowchart TD
     F([a path clean matched]) --> TR{tracked by git?}
-    TR -->|yes| KEEP1[kept: git has it]
+    TR -->|yes| K1[kept: git has it]
     TR -->|no| KP{"named in clean.keep<br>or clean.ignored_keep?"}
-    KP -->|yes| KEEP2[kept, exactly where it is]
+    KP -->|yes| K2[kept, exactly where it is]
     KP -->|no| REPO{"a git repository<br>inside it?"}
-    REPO -->|yes| KEEP3[kept: it holds commits]
-    REPO -->|no| SENS{"looks like a credential?<br>(trash.sensitive)"}
-    SENS -->|yes| Q[moved to quarantine]
+    REPO -->|yes| K3[kept: it holds commits]
+    REPO -->|no| SENS{"name looks like a credential?<br>(trash.sensitive)"}
+    SENS -->|yes| PROVE{"but provably not one?<br>source file, keyless<br>certificate, all-source dir"}
+    PROVE -->|no| Q[moved to quarantine]
+    PROVE -->|yes| INSIDE
     SENS -->|no| INSIDE{"anything protected<br>buried inside it?"}
-    INSIDE -->|yes| THIN["emptied out:<br>those stay, the rest goes"]
     INSIDE -->|no| DEL[removed]
+    INSIDE -->|"yes, and that is<br>all there is"| K4[kept whole]
+    INSIDE -->|"yes, plus other things"| THIN["emptied out around them:<br>they stay at their path,<br>the rest goes"]
 
     classDef safe fill:#dafbe1,stroke:#2da44e,color:#1a7f37
     classDef gone fill:#ffebe9,stroke:#cf222e,color:#a40e26
-    class KEEP1,KEEP2,KEEP3,Q,THIN safe
+    class K1,K2,K3,K4,Q,THIN safe
     class DEL gone
 ```
 
-The middle of that picture is the part worth knowing: a directory holding
-something protected is not kept *whole*. The protected files stay where they
-are and the rest of the directory goes, so a 400 MB `node_modules` with one
-`id_rsa` in it gives back 400 MB and keeps the key.
+Two parts of that picture are worth knowing. A name that looks like a
+credential is checked before it is believed — a `tokenizer.js` matches `*token*`
+and is source, and a `cacert.pem` holds a hundred public certificates and no
+private key. And a directory holding something protected is not kept *whole*
+unless that is all it holds: the protected files stay where they are and the
+rest of the directory goes, so a 400 MB `node_modules` with one `id_rsa` in it
+gives back 400 MB and keeps the key. With `clean.quarantine` on, the directory
+moves instead and the protected file moves with it.
 
 ## Modes
 
@@ -373,17 +380,21 @@ git-tidy -j 32 sync --apply   # a lot of slow remotes
 ## Configuration
 
 ```mermaid
-flowchart TD
-    G["~/.config/git-tidy/config.yaml<br><i>global</i>"] --> W
-    W["~/git/.git-tidy.yaml<br><i>workspace</i>"] --> S
-    S["~/git/team/.git-tidy.yaml<br><i>a subdirectory</i>"] --> R
-    R["~/git/team/repo/.git-tidy.yaml<br><i>one repository</i>"] --> E([the settings that apply to that repo])
+flowchart LR
+    A([any command]) --> M{mode}
+    M -->|"-n, the default"| DRY["says what it would do<br>changes nothing"]
+    M -->|"-i / --ask"| ASK["asks per change:<br>y / n / a / s / q"]
+    M -->|"--apply"| DO["does all of it"]
+    ASK --> DO
+    DO --> F{"and then?"}
+    F -->|"plain"| SAFE["work that is only local<br>is reported, not touched"]
+    F -->|"--force"| MORE["also deletes an unmerged branch<br>and stashes to switch<br><i>never discards: the report names the stash</i>"]
+    F -->|"--fix, on doctor or run"| FIX["also puts a detached HEAD back,<br>takes a credential out of a remote URL,<br>packs an oversized .git"]
 
-    N["Each file is merged over the one above it,<br>setting by setting. The deepest wins.<br><br>A list replaces; it does not append."]
-    E -.- N
-
-    classDef note fill:#f6f8fa,stroke:#d0d7de,color:#57606a
-    class N note
+    classDef safe fill:#dafbe1,stroke:#2da44e,color:#1a7f37
+    classDef warn fill:#fff8c5,stroke:#d4a72c,color:#7d4e00
+    class DRY,SAFE,FIX safe
+    class MORE warn
 ```
 
 YAML, in two places, and both are optional:
