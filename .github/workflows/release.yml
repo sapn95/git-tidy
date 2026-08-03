@@ -186,6 +186,8 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
+      pull-requests: write # main is protected: the bump lands through a PR
+      actions: write # …whose held check runs this job has to release itself
     steps:
       - uses: actions/checkout@v7
         with:
@@ -204,15 +206,41 @@ jobs:
             "linux-x86_64=$(sha linux-x86_64)"
           git diff --stat
       - name: commit
+        # `main` is protected: pull request required, plus every CI context.
+        # Admins are exempt, the GITHUB_TOKEN is not, so a straight push to main
+        # dies with GH006 and takes the release down with it. The formula bump
+        # goes the same road a person would instead of being an exception.
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           # The repository owner, not the bot: GitHub counts a commit author as
           # a contributor, and the formula bump is this project committing to
           # itself rather than a second person turning up.
           git config user.name "Sebastian Winterberger"
           git config user.email "sapn95@users.noreply.github.com"
+          branch="formula/${GITHUB_REF_NAME}"
+          git checkout -b "$branch"
           git add Formula/git-tidy.rb
           git commit -m "chore: point the Homebrew formula at ${GITHUB_REF_NAME}" || exit 0
-          git push origin main
+          git push origin "$branch"
+          gh pr create --base main --head "$branch" \
+            --title "chore: point the Homebrew formula at ${GITHUB_REF_NAME}" \
+            --body "Checksums of the assets published for ${GITHUB_REF_NAME}, written by scripts/update_formula.py."
+
+          # A pull request opened by the bot counts as a first-time contributor,
+          # so the runs it triggers wait in `action_required` for a human to
+          # press a button — and auto-merge would wait behind them forever.
+          # A held run reports status=completed with CONCLUSION=action_required,
+          # so both fields have to be looked at.
+          for run in $(gh run list --branch "$branch" --json databaseId,status,conclusion \
+            -q '.[] | select(.status == "action_required" or .conclusion == "action_required") | .databaseId'); do
+            gh api -X POST "repos/$GITHUB_REPOSITORY/actions/runs/$run/approve" >/dev/null || true
+          done
+
+          # --auto, not a plain merge: the required checks have not even started
+          # while the pull request is a second old. GitHub merges it when they
+          # pass, and leaves it open if they do not.
+          gh pr merge "$branch" --auto --rebase --delete-branch
       - name: send the same formula to the tap
         # README says `brew install sapn95/tap/git-tidy`, and that tap is a
         # separate repository. Rewriting the copy here and stopping left it on
