@@ -19,9 +19,10 @@ concurrency:
 env:
   # UBI10 is the base everything Python runs in; the runner OS is only a host.
   # uv supplies the interpreter, because UBI10's own Python packages stop at 3.12.
-  # ruff is pinned so a new release cannot turn an unrelated pull request red.
+  # ruff, pytest and nuitka come from uv.lock rather than a second pin beside
+  # it: RUFF_VERSION was an unchecked twin of the version already locked
+  # there, free to drift from it in either direction, and nothing updated it.
   PYTHON_VERSION: "3.14"
-  RUFF_VERSION: "0.16.0"
 
 jobs:
   lint:
@@ -38,9 +39,9 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@v9.0.0
       - name: ruff check
-        run: uvx "ruff==${RUFF_VERSION}" check --output-format=github .
+        run: uv run --locked --python "${PYTHON_VERSION}" --group dev ruff check --output-format=github .
       - name: ruff format
-        run: uvx "ruff==${RUFF_VERSION}" format --check --diff .
+        run: uv run --locked --python "${PYTHON_VERSION}" --group dev ruff format --check --diff .
 
   workflows:
     name: lint workflows
