@@ -23,7 +23,7 @@ Issues = "https://github.com/sapn95/git-tidy/issues"
 git-tidy = "git_tidy:entrypoint"
 
 [dependency-groups]
-dev = ["pytest>=8", "pytest-cov>=6", "ruff>=0.16.1", "nuitka>=2.5", "pyyaml>=6"]
+dev = ["pytest>=8", "pytest-cov>=6", "ruff>=0.16.2", "nuitka>=2.5", "pyyaml>=6"]
 
 [tool.hatch.build.targets.wheel]
 only-include = ["git_tidy.py"]
