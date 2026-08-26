@@ -37,7 +37,7 @@ jobs:
         with:
           # Nothing here pushes, and `pull_request` runs code from strangers.
           persist-credentials: false
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: astral-sh/setup-uv@v10.0.1
       - name: ruff check
         run: uv run --locked --python "${PYTHON_VERSION}" --group dev ruff check --output-format=github .
       - name: ruff format
@@ -98,7 +98,7 @@ jobs:
         with:
           # Nothing here pushes, and `pull_request` runs code from strangers.
           persist-credentials: false
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: astral-sh/setup-uv@v10.0.1
       - name: pytest with coverage
         run: |
           extra=""
@@ -118,7 +118,7 @@ jobs:
         with:
           # Nothing here pushes, and `pull_request` runs code from strangers.
           persist-credentials: false
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: astral-sh/setup-uv@v10.0.1
       - name: build a wheel and check the console script works
         run: |
           uv build --wheel
