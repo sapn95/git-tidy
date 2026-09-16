@@ -816,6 +816,38 @@ def test_clean_honours_keep(workspace: Path):
     assert (repo / "__pycache__").exists()
 
 
+def test_clean_keep_protects_what_is_inside_the_tree(workspace: Path):
+    """Keeping a dependency tree means keeping the packages in it.
+
+    The walk went into it instead, so with clean.builds on the dist/ of every
+    package in a kept node_modules went, and the tree was as broken as if the
+    whole thing had been removed.
+    """
+    repo = workspace / "repo"
+    (repo / "node_modules" / "pkg" / "dist").mkdir(parents=True)
+    (repo / "node_modules" / "pkg" / "dist" / "index.js").write_text("x", encoding="utf-8")
+    (repo / "node_modules" / "pkg" / "__pycache__").mkdir()
+    cfg = config(clean={"keep": ["node_modules"], "dependencies": True, "builds": True})
+
+    gt.clean_tree(repo, "repo", cfg, run(), gt.Git(repo), None)
+    assert (repo / "node_modules" / "pkg" / "dist" / "index.js").exists()
+    assert (repo / "node_modules" / "pkg" / "__pycache__").exists()
+
+
+def test_clean_keep_does_not_shelter_the_artefacts_around_a_tracked_file(workspace: Path):
+    """The other half of _protected still keeps only itself."""
+    repo = workspace / "repo"
+    (repo / "dist").mkdir()
+    (repo / "dist" / "committed.js").write_text("x", encoding="utf-8")
+    git(repo, "add", "dist/committed.js")
+    git(repo, "commit", "-q", "-m", "track one file in dist")
+    (repo / "dist" / "__pycache__").mkdir()
+
+    gt.clean_tree(repo, "repo", config(), run(), gt.Git(repo), None)
+    assert (repo / "dist" / "committed.js").exists()
+    assert not (repo / "dist" / "__pycache__").exists()
+
+
 def test_clean_keep_can_name_one_repository_from_the_workspace(workspace: Path, remote: Path):
     """The half of clean.keep the help promised and the code did not deliver.
 
