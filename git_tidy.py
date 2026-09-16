@@ -69,7 +69,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NoReturn
 
-__version__ = "3.1.0"
+__version__ = "3.1.1"
 
 CONFIG_NAMES = (".git-tidy.yaml", ".git-tidy.yml")
 QUARANTINE_DIRNAME = ".git-tidy-trash"
@@ -3546,6 +3546,12 @@ def _sort_directories(plan: _Sweep, here: Path, dirnames: list[str]) -> tuple[li
             continue
         if plan.stay_inside and candidate != plan.root and is_repo(candidate):
             continue  # a repo of its own; not this walk's business
+        if _named_in_keep(candidate, plan.root, plan.keep):
+            # What is inside it is what keeping it means. The walk used to go in,
+            # leaving a node_modules that clean.keep had just protected standing
+            # while clean.builds took the dist/ out of every package in it — and
+            # the tree was as broken as if the whole thing had gone.
+            continue
         named = _matches(name, plan.dir_patterns)
         if (
             not named
@@ -3727,13 +3733,24 @@ def _only_source_inside(directory: Path) -> bool:
     return found
 
 
-def _protected(path: Path, root: Path, keep: Sequence[str], tracked: set[str]) -> bool:
+def _named_in_keep(path: Path, root: Path, keep: Sequence[str]) -> bool:
+    """clean.keep alone, without the tracked half of _protected.
+
+    The two protect the same path for different reasons, and the walk treats
+    them differently: what clean.keep names is kept with everything inside it,
+    while a tracked file only keeps itself and the artefacts around it still go.
+    """
     relative = path.relative_to(root).as_posix()
-    if any(
+    return any(
         fnmatch.fnmatch(relative, pattern) or fnmatch.fnmatch(path.name, pattern)
         for pattern in keep
-    ):
+    )
+
+
+def _protected(path: Path, root: Path, keep: Sequence[str], tracked: set[str]) -> bool:
+    if _named_in_keep(path, root, keep):
         return True
+    relative = path.relative_to(root).as_posix()
     # tracked holds both spellings; see tracked_paths.
     return relative in tracked or relative.lower() in tracked
 
