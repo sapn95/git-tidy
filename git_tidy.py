@@ -69,7 +69,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NoReturn
 
-__version__ = "3.0.8"
+__version__ = "3.1.0"
 
 CONFIG_NAMES = (".git-tidy.yaml", ".git-tidy.yml")
 QUARANTINE_DIRNAME = ".git-tidy-trash"
@@ -364,7 +364,10 @@ COMMENTS: dict[str, str] = {
     "clean.tracked": "A tracked file is somebody's committed content, even when it\n"
     "looks like an artefact. Leave this off.",
     "clean.keep": "Paths never considered, as globs relative to the repository or the\n"
-    "workspace root.",
+    "workspace root. A pattern whose leading part names a repository is read\n"
+    "inside that repository alone, so web/node_modules or *-mcp/node_modules\n"
+    "keeps the one dependency tree that has to survive, where a bare\n"
+    "node_modules would keep every one in the workspace.",
     "clean.quarantine": "Move removals to the quarantine instead of deleting them.\n"
     "Note this changes what happens to a protected file inside a directory that\n"
     "is being removed: without it the file stays where it is and the directory\n"
@@ -3111,6 +3114,43 @@ def protection_rules(clean: dict[str, Any]) -> list[tuple[Sequence[str], str]]:
     return rules
 
 
+def keep_for_repo(keep: Sequence[str], repo: Path, workspace: Path) -> list[str]:
+    """clean.keep, with the patterns that name this repository made local to it.
+
+    clean.keep is documented as globs "relative to the repository or the
+    workspace root", and only the first half was true: every pattern was matched
+    against a path relative to the repository being cleaned, so a workspace
+    config asking to keep `server/node_modules` matched nothing anywhere and the
+    tree it named was deleted with the rest. The way to be heard was to write
+    `node_modules`, which protects the dependency tree of every repository in the
+    workspace — a different request, and not one anybody makes on purpose.
+
+    A pattern is split at each separator in turn: the head is matched against
+    this repository's own path below the workspace, and when it matches, the tail
+    joins the list as an ordinary repository-relative pattern. Trying every
+    position rather than the first is what lets `*-mcp/node_modules` and
+    `work/*/vendor` name a repository the way `exclude` already does.
+
+    The original pattern stays in the list. It is a legitimate
+    repository-relative glob in its own right, and this only ever adds.
+    """
+    try:
+        here = repo.resolve().relative_to(workspace.resolve()).as_posix()
+    except ValueError:
+        # A repository outside the workspace: --include can reach one, and then
+        # there is no workspace-relative path to match a head against.
+        return list(keep)
+    if here in ("", "."):
+        return list(keep)
+    local: list[str] = []
+    for pattern in keep:
+        parts = pattern.split("/")
+        for cut in range(1, len(parts)):
+            if fnmatch.fnmatch(here, "/".join(parts[:cut])):
+                local.append("/".join(parts[cut:]))
+    return [*keep, *local]
+
+
 def clean_ignored(
     repo: Path,
     scope: str,
@@ -5810,6 +5850,17 @@ def _clean_repo(
     actions: list[Action],
 ) -> None:
     """Both cleaning mechanisms for one repository, accumulating in place."""
+    # Once, here: clean.ignored and the pattern walk both read
+    # cfg["clean"]["keep"], and resolving the workspace-relative patterns
+    # separately in each of them is how they would come to disagree about what
+    # they protect.
+    cfg = {
+        **cfg,
+        "clean": {
+            **cfg["clean"],
+            "keep": keep_for_repo(cfg["clean"]["keep"], repo, context.workspace),
+        },
+    }
     holding = context.quarantine if cfg["clean"]["quarantine"] else None
     git = Git(repo, timeout=int(cfg["sync"]["timeout"]))
     # Ignored paths first: it removes whole directories in one step, which

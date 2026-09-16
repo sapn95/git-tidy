@@ -816,6 +816,47 @@ def test_clean_honours_keep(workspace: Path):
     assert (repo / "__pycache__").exists()
 
 
+def test_clean_keep_can_name_one_repository_from_the_workspace(workspace: Path, remote: Path):
+    """The half of clean.keep the help promised and the code did not deliver.
+
+    Without it the only pattern that reaches a dependency tree is the bare name,
+    which then protects every repository in the workspace — so the choice was
+    between keeping all of them and losing the one that has to stay.
+    """
+    git(workspace, "clone", "-q", str(remote), "other")
+    for name in ("repo", "other"):
+        repo = workspace / name
+        (repo / ".gitignore").write_text("node_modules/\n", encoding="utf-8")
+        git(repo, "add", ".gitignore")
+        git(repo, "commit", "-q", "-m", "ignore the dependency tree")
+        (repo / "node_modules" / "pkg").mkdir(parents=True)
+        (repo / "node_modules" / "pkg" / "index.js").write_text("x", encoding="utf-8")
+    (workspace / ".git-tidy.yaml").write_text(
+        'clean:\n  ignored: true\n  dependencies: true\n  keep: ["repo/node_modules"]\n',
+        encoding="utf-8",
+    )
+
+    gt.main(["-C", str(workspace), "clean", "--apply"])
+    assert (workspace / "repo" / "node_modules").exists(), "named by the workspace config"
+    assert not (workspace / "other" / "node_modules").exists()
+
+
+def test_keep_for_repo_reads_a_glob_as_the_repository_name(tmp_path: Path):
+    """`*-mcp/node_modules` names a set of repositories, as `exclude` already does."""
+    keep = gt.keep_for_repo(["*-mcp/node_modules"], tmp_path / "notes-mcp", tmp_path)
+    assert keep == ["*-mcp/node_modules", "node_modules"]
+
+
+def test_keep_for_repo_leaves_a_pattern_for_another_repository_alone(tmp_path: Path):
+    keep = gt.keep_for_repo(["other/node_modules"], tmp_path / "repo", tmp_path)
+    assert keep == ["other/node_modules"]
+
+
+def test_keep_for_repo_survives_a_repository_outside_the_workspace(tmp_path: Path):
+    """--include can reach one, and then there is no workspace-relative path."""
+    assert gt.keep_for_repo(["a/b"], tmp_path / "space" / "repo", tmp_path / "elsewhere") == ["a/b"]
+
+
 def test_clean_does_not_follow_symlinks(workspace: Path, tmp_path: Path):
     repo = workspace / "repo"
     outside = tmp_path / "outside"
