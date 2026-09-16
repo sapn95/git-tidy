@@ -170,6 +170,13 @@ expensive to restore without a network, and every one of those build directory
 names is also a perfectly ordinary source directory name. Turn them on with
 `clean.dependencies` and `clean.builds`.
 
+With them on, `clean.keep` is how a single tree stays. A pattern whose leading
+part names a repository is read inside that repository alone, so
+`server/node_modules` or `*-mcp/node_modules` in the workspace config keeps one
+dependency tree where a bare `node_modules` would keep all of them. The usual
+reason to name one is a checkout that something outside the workspace starts:
+reinstalling the tree needs a network.
+
 Inside a repository, a **tracked file is never deleted**, however much it looks
 like an artefact — unless `clean.tracked: true` says so, which is off by default
 and the only way `clean` will touch committed content. Symlinks are never followed. Nested repositories are left for
