@@ -814,6 +814,31 @@ def test_prune_removes_a_worktree_git_declines_over_submodules(
     assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
 
 
+def test_prune_keeps_a_worktree_locked_while_the_prompt_waited(
+    workspace: Path, remote: Path, tmp_path: Path
+):
+    """Every question is asked again at the moment of the removal.
+
+    The override of git's submodule refusal is the one place git-tidy decides
+    this for itself, and --ask waits as long as somebody takes to answer: a
+    lock taken in that time is the answer, and it arrives after the check.
+    """
+    repo = workspace / "repo"
+    where = make_submodule_worktree(repo, remote, tmp_path / "inner", "held")
+    cfg = config(branches={"prune_worktrees": True})
+
+    def answer(_prompt: str) -> str:
+        git(repo, "worktree", "lock", str(where))  # somebody wants it kept
+        return "y"
+
+    decider = gt.Decider(gt.ASK, stream=io.StringIO(), prompt_input=answer)
+    actions = gt.prune_branches(repo, "repo", cfg, decider, fetched=True)
+
+    assert [(a.kind, a.applied, a.skipped) for a in actions] == [("worktree", False, True)]
+    assert where.exists()
+    assert "held" in git(repo, "branch", "--format=%(refname:short)").split()
+
+
 def test_prune_keeps_a_submodule_worktree_with_work_in_it(
     workspace: Path, remote: Path, tmp_path: Path
 ):
