@@ -708,16 +708,129 @@ def test_prune_removes_the_worktree_then_the_branch(workspace: Path, remote: Pat
 
 
 def test_prune_keeps_a_worktree_with_uncommitted_work(workspace: Path, remote: Path):
-    """git's own refusal is the safety model, so the files decide the outcome."""
+    """git's own question, asked before the branch is proposed at all.
+
+    Asking it only through `git worktree remove` meant a dry run promised a
+    branch that the apply then kept, which is the one thing a plan is for.
+    """
     repo = workspace / "repo"
     where = make_worktree_on_gone_branch(repo, remote, "held")
     (where / "scratch.txt").write_text("not committed", encoding="utf-8")
     cfg = config(branches={"prune_worktrees": True})
 
     actions = gt.prune_branches(repo, "repo", cfg, run(), fetched=True)
-    assert [(a.kind, a.applied, a.skipped) for a in actions] == [("worktree", False, True)]
-    assert "in use by the worktree" in actions[0].detail
+    assert [(a.kind, a.target, a.skipped) for a in actions] == [("branch", "held", True)]
+    assert actions[0].detail == (
+        f"in use by the worktree at {where}: it holds modified or untracked files"
+    )
     assert (where / "scratch.txt").exists()
+    assert "held" in git(repo, "branch", "--format=%(refname:short)").split()
+
+
+def test_prune_plans_only_what_an_apply_would_do(workspace: Path, remote: Path):
+    """A dry run reads the worktrees too, so the plan is the apply's own answer."""
+    repo = workspace / "repo"
+    where = make_worktree_on_gone_branch(repo, remote, "held")
+    (where / "scratch.txt").write_text("not committed", encoding="utf-8")
+    cfg = config(branches={"prune_worktrees": True})
+
+    actions = gt.prune_branches(repo, "repo", cfg, gt.Decider(gt.DRY), fetched=True)
+    assert [(a.kind, a.applied, a.skipped) for a in actions] == [("branch", False, True)]
+    assert "modified or untracked" in actions[0].detail
+
+
+def test_prune_names_the_main_working_tree_as_the_holder(workspace: Path, remote: Path):
+    """git has no way to remove a main working tree, so its branch keeps itself.
+
+    It turns up at all because a linked worktree is a repository of its own to
+    a workspace walk: read from in there, the branch the main checkout has is a
+    branch somebody else holds. Attempting it only ever produced git's
+    "is a main working tree", once per branch.
+    """
+    repo = workspace / "repo"
+    make_gone_branch(repo, remote, "held")
+    where = repo.parent / "wt-other"
+    git(repo, "worktree", "add", "-q", "-b", "other", str(where))
+    git(repo, "switch", "-q", "held")  # the main checkout now holds it
+    cfg = config(branches={"prune_worktrees": True})
+
+    actions = gt.prune_branches(where, "wt-other", cfg, run(), fetched=True)
+    assert [(a.kind, a.target, a.skipped) for a in actions] == [("branch", "held", True)]
+    assert actions[0].detail == f"in use by the main working tree at {repo}"
+    assert repo.exists()
+    assert "held" in git(repo, "branch", "--format=%(refname:short)").split()
+
+
+def test_prune_keeps_a_locked_worktree(workspace: Path, remote: Path):
+    """A lock is somebody having already said what happens to that checkout."""
+    repo = workspace / "repo"
+    where = make_worktree_on_gone_branch(repo, remote, "held")
+    git(repo, "worktree", "lock", str(where))
+    cfg = config(branches={"prune_worktrees": True})
+
+    actions = gt.prune_branches(repo, "repo", cfg, run(), fetched=True)
+    assert [(a.kind, a.target, a.skipped) for a in actions] == [("branch", "held", True)]
+    assert actions[0].detail == f"in use by the worktree at {where}: it is locked"
+    assert where.exists()
+
+
+def add_submodule(repo: Path, inner: Path) -> None:
+    """Commit a submodule into `repo`, from a repository made at `inner`."""
+    inner.mkdir()
+    git(inner, "init", "-q", "-b", "main")
+    commit(inner, "lib.txt", "v1\n")
+    git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(inner), "vendor")
+    git(repo, "commit", "-q", "-m", "add submodule")
+
+
+def make_submodule_worktree(repo: Path, remote: Path, inner: Path, name: str) -> Path:
+    """A linked worktree on a gone branch, with its submodule checked out in it."""
+    add_submodule(repo, inner)
+    git(repo, "push", "-q", "origin", "main")
+    where = make_worktree_on_gone_branch(repo, remote, name)
+    git(where, "-c", "protocol.file.allow=always", "submodule", "update", "-q", "--init")
+    return where
+
+
+def test_prune_removes_a_worktree_git_declines_over_submodules(
+    workspace: Path, remote: Path, tmp_path: Path
+):
+    """git refuses any worktree holding submodules, before looking inside it.
+
+    No flag changes that, so a workspace of repositories with submodules kept
+    every branch its worktrees held. The files are clean, nothing in there is
+    unrecoverable, and the directory goes.
+    """
+    repo = workspace / "repo"
+    where = make_submodule_worktree(repo, remote, tmp_path / "inner", "held")
+    assert (where / "vendor" / "lib.txt").exists()  # populated, which is what git declines over
+    cfg = config(branches={"prune_worktrees": True})
+
+    actions = gt.prune_branches(repo, "repo", cfg, run(), fetched=True)
+    assert [(a.kind, a.applied) for a in actions] == [("worktree", True), ("branch", True)]
+    assert actions[0].detail == "removed with its submodule checkouts, so held can go"
+    assert not where.exists()
+    assert "held" not in git(repo, "branch", "--format=%(refname:short)").split()
+    assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
+
+
+def test_prune_keeps_a_submodule_worktree_with_work_in_it(
+    workspace: Path, remote: Path, tmp_path: Path
+):
+    """The override is git's blanket refusal, never its answer about the files.
+
+    Work inside a submodule is as unrecoverable as work at the top, and
+    `git status --ignore-submodules=none` is what says so.
+    """
+    repo = workspace / "repo"
+    where = make_submodule_worktree(repo, remote, tmp_path / "inner", "held")
+    (where / "vendor" / "lib.txt").write_text("work in progress\n", encoding="utf-8")
+    cfg = config(branches={"prune_worktrees": True})
+
+    actions = gt.prune_branches(repo, "repo", cfg, run(), fetched=True)
+    assert [(a.kind, a.target, a.skipped) for a in actions] == [("branch", "held", True)]
+    assert "modified or untracked" in actions[0].detail
+    assert (where / "vendor" / "lib.txt").read_text(encoding="utf-8") == "work in progress\n"
     assert "held" in git(repo, "branch", "--format=%(refname:short)").split()
 
 

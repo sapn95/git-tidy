@@ -70,7 +70,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NoReturn
 
-__version__ = "3.2.0"
+__version__ = "3.3.0"
 
 CONFIG_NAMES = (".git-tidy.yaml", ".git-tidy.yml")
 QUARANTINE_DIRNAME = ".git-tidy-trash"
@@ -332,10 +332,10 @@ COMMENTS: dict[str, str] = {
     "branches.prune_worktrees": "A branch a linked worktree has checked out cannot be\n"
     "deleted while that worktree exists, so a `git worktree add` made months ago\n"
     "keeps its branch for ever. With this on, such a worktree is removed first\n"
-    "and the branch then goes by the rules above. git refuses to remove a\n"
-    "worktree holding modified or untracked files, and that refusal is reported\n"
-    "rather than overridden, so uncommitted work keeps the worktree and the\n"
-    "worktree keeps the branch.",
+    "and the branch then goes by the rules above. A worktree holding modified or\n"
+    "untracked files, a locked one, and the main working tree all keep their\n"
+    "branch: the first because the work in it is not recoverable, the second\n"
+    "because somebody said so, and the last because git has no way to remove it.",
     "branches.keep": "Never deleted, whatever the rules above say. Globs allowed.",
     "clean": "Removing build output and caches.",
     "clean.enabled": "Turn the whole clean step off for this directory.",
@@ -2844,21 +2844,13 @@ def _consider_branches(
             continue
 
         # A branch checked out in a linked worktree cannot be deleted either.
-        # Saying so beats one failure line per branch. --force does not help:
-        # the answer is to remove the worktree, which branches.prune_worktrees
-        # turns into part of the run and is otherwise a decision, not a detail.
+        # Saying so beats one failure line per branch.
         held_by = _checked_out_elsewhere(git, branch.name)
-        if held_by and not rules["prune_worktrees"]:
-            actions.append(
-                Action(
-                    "branch",
-                    name,
-                    branch.name,
-                    f"in use by the worktree at {held_by}",
-                    skipped=True,
-                )
-            )
-            continue
+        if held_by:
+            in_the_way = _worktree_in_the_way(git, held_by, rules)
+            if in_the_way is not None:
+                actions.append(Action("branch", name, branch.name, in_the_way, skipped=True))
+                continue
 
         _delete_the_branch(
             git,
@@ -2875,32 +2867,140 @@ def _consider_branches(
         )
 
 
+def _worktrees(git: Git) -> list[tuple[str, set[str]]]:
+    """Every worktree of this ref store, as (path, the words git printed under it).
+
+    The first entry is always the main working tree. The words are the ones
+    `git worktree list --porcelain` puts on their own lines, among them "bare",
+    "detached", "locked" and "prunable".
+    """
+    entries: list[tuple[str, set[str]]] = []
+    for line in git.out("worktree", "list", "--porcelain", check=False).splitlines():
+        field, _, value = line.partition(" ")
+        if field == "worktree":
+            entries.append((value, set()))
+        elif field and entries:
+            entries[-1][1].add(field)
+    return entries
+
+
+def _worktree_in_the_way(git: Git, held_by: str, rules: dict[str, Any]) -> str | None:
+    """Why the worktree holding a branch stops it going, or None when it can go.
+
+    Asked before anything is removed, and in a dry run as well as an apply, so
+    that the plan says what the apply will do. --force reaches none of this: the
+    answer to a worktree is to remove it, which branches.prune_worktrees turns
+    into part of the run and is otherwise a decision, not a detail.
+    """
+    entries = _worktrees(git)
+    if entries and held_by == entries[0][0]:
+        # The main working tree, which git will never remove, whatever
+        # prune_worktrees says. A linked worktree is a repository of its own as
+        # far as a workspace walk goes, so the branch the main checkout holds
+        # turns up here as held by somebody else, and `git worktree remove` on
+        # it can only ever answer "is a main working tree".
+        return f"in use by the main working tree at {held_by}"
+    if not rules["prune_worktrees"]:
+        return f"in use by the worktree at {held_by}"
+    locked = any(path == held_by and "locked" in words for path, words in entries)
+    stays = "it is locked" if locked else _why_worktree_stays(git, held_by)
+    return None if stays is None else f"in use by the worktree at {held_by}: {stays}"
+
+
+def _why_worktree_stays(git: Git, held_by: str) -> str | None:
+    """What would be lost with this worktree, or None when nothing would be.
+
+    The question `git worktree remove` asks before it removes one, asked here
+    for two reasons. A dry run has to say what an apply will do, and git's own
+    refusal only arrives once the apply is under way. And git declines a
+    worktree holding submodules before it ever looks at what is in it, so for
+    those this is the only answer there is.
+    """
+    where = Path(held_by)
+    if where.is_symlink():
+        return "it is reached through a symlink"
+    if not where.is_dir():
+        return "its directory is not there"
+    worktree = Git(where, timeout=git.timeout)
+    # --ignore-submodules=none asks all the way down: git runs a status inside
+    # each submodule, and that status reports its own submodules the same way.
+    # On the command line it also overrides any submodule.<name>.ignore, which
+    # a repository can otherwise use to hide exactly the work that matters.
+    changes = worktree.out(
+        "status",
+        "--porcelain",
+        "--untracked-files=all",
+        "--ignore-submodules=none",
+        check=False,
+    )
+    return "it holds modified or untracked files" if changes else None
+
+
+def _holds_submodules(git: Git, held_by: str) -> bool:
+    """A gitlink in the worktree's index: what git declines to remove over."""
+    worktree = Git(Path(held_by), timeout=git.timeout)
+    return bool(worktree.out("submodule", "status", check=False))
+
+
+def _take_the_worktree_out(git: Git, held_by: str) -> str | None:
+    """Delete the worktree's directory and let git forget it. None when it is gone.
+
+    Only reached for a worktree git declined over the submodules in it, and
+    only once _why_worktree_stays has found nothing in it to lose. git refuses
+    that worktree whatever its state, because *moving* a submodule is what it
+    cannot do safely; removing one is an rmtree, and the submodule's own
+    repository lives in the parent's .git rather than in here.
+    """
+    try:
+        shutil.rmtree(held_by)
+    except OSError as exc:
+        return str(exc)
+    # The record under .git/worktrees outlives the directory, and git goes on
+    # refusing to delete a branch a worktree holds even once that worktree is
+    # prunable. Note this forgets every other worktree of this repository whose
+    # directory has already gone, which is the state git itself calls prunable.
+    git.run("worktree", "prune", check=False)
+    return None
+
+
 def _remove_worktree(git: Git, name: str, branch: str, held_by: str, actions: list[Action]) -> bool:
     """Remove the linked worktree holding `branch`. True when it is gone.
 
     Called only after the branch has passed every other test and the removal has
     been allowed, so the one question left is git's.
 
-    `git worktree remove` without --force is the whole safety model here: git
-    refuses a worktree holding modified or untracked files, and that refusal is
-    reported rather than overridden. Deciding what counts as dirty here would be
-    a second answer to a question git already answers, and the case that matters
-    — a checkout somebody is working in — is exactly the one git refuses.
+    `git worktree remove` without --force is the first answer and the safety
+    model: git refuses a worktree holding modified or untracked files. The one
+    refusal that is overridden is the blanket one over submodules, which git
+    gives before it looks at what is in the worktree at all — and only after
+    _why_worktree_stays has asked git's own question about the files and found
+    nothing to lose.
     """
     action = Action("worktree", name, held_by, f"remove, so {branch} can go")
     result = git.run("worktree", "remove", held_by, check=False)
-    if result.returncode != 0:
-        # Usually "contains modified or untracked files", which is the refusal
-        # this is built around rather than a fault in it. Reported on the
-        # worktree, because the worktree is what stayed.
-        action.skipped = True
-        action.detail = f"in use by the worktree at {held_by}: {last_line(result)}"
+    if result.returncode == 0:
+        action.applied = True
+        action.detail = f"removed, so {branch} can go"
         actions.append(action)
-        return False
-    action.applied = True
-    action.detail = f"removed, so {branch} can go"
+        return True
+    if _holds_submodules(git, held_by) and _why_worktree_stays(git, held_by) is None:
+        problem = _take_the_worktree_out(git, held_by)
+        if problem is not None:
+            action.error = problem
+            actions.append(action)
+            return False
+        action.applied = True
+        action.detail = f"removed with its submodule checkouts, so {branch} can go"
+        actions.append(action)
+        return True
+    # _worktree_in_the_way asked all of this before the branch was proposed, so
+    # what is left here is the gap between that answer and this moment: a file
+    # written in the worktree while --ask waited. Reported on the worktree,
+    # because the worktree is what stayed.
+    action.skipped = True
+    action.detail = f"in use by the worktree holding {branch}: {last_line(result)}"
     actions.append(action)
-    return True
+    return False
 
 
 def _delete_the_branch(
@@ -5546,6 +5646,7 @@ REASONS: tuple[tuple[str, str], ...] = (
     ("diverged", "diverged from upstream — needs a merge or rebase by hand"),
     ("contains a git repository", "directories holding a git repository"),
     ("checked out in the worktree", "detached HEADs whose trunk another worktree holds"),
+    ("in use by the main working tree", "branches the main working tree has checked out"),
     ("in use by the worktree", "branches a worktree still has checked out"),
     ("uncommitted work in", "submodules with uncommitted work"),
     ("would be replaced", "a local file the incoming commits would overwrite"),

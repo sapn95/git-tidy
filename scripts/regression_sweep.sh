@@ -168,6 +168,32 @@ wait "$PID" 2>/dev/null
 tidy -C "$w" restore --apply >/dev/null 2>&1
 check "every file is back" "$(find "$w" -maxdepth 1 -name '*.bak' | wc -l | tr -d ' ')" "400"
 
+echo "10. a worktree holding work keeps it, and its branch (round 13)"
+w=$(newspace worktree)
+git init -q "$ROOT/inner"
+( cd "$ROOT/inner" && echo lib > lib.txt && git add -A && git commit -qm lib )
+( cd "$w/repo" &&
+  git -c protocol.file.allow=always submodule add -q "$ROOT/inner" vendor &&
+  git commit -qm sub && git push -q origin main &&
+  git switch -qc held && git push -q -u origin held && git switch -q main )
+git -C "$w/o.git" branch -D held >/dev/null 2>&1
+( cd "$w/repo" && git fetch -q --prune origin && git worktree add -q "$w/wt" held &&
+  git -C "$w/wt" -c protocol.file.allow=always submodule update -q --init )
+# git declines to remove any worktree holding submodules, so what is in this one
+# is git-tidy's own answer to give — and the work is inside the submodule.
+echo wip > "$w/wt/vendor/lib.txt"
+printf 'branches:\n  prune_worktrees: true\n' > "$w/.git-tidy.yaml"
+tidy -C "$w" prune --apply >/dev/null 2>&1
+check "the work in the submodule is untouched" "$(cat "$w/wt/vendor/lib.txt")" "wip"
+# `branch --list` marks a branch a worktree holds with a +, which is the
+# whole reason it is still here.
+check "the branch is kept" "$(git -C "$w/repo" branch --list held | tr -d ' *+')" "held"
+git -C "$w/wt/vendor" checkout -q -- lib.txt
+tidy -C "$w" prune --apply >/dev/null 2>&1
+if [ -d "$w/wt" ]
+then bad "a clean worktree stayed"; else ok "a clean worktree goes"; fi
+check "and its branch with it" "$(git -C "$w/repo" branch --list held | tr -d ' *')" ""
+
 echo ""
 echo "$pass passed, $fail failed"
 exit $(( fail > 0 ))
