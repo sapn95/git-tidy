@@ -69,7 +69,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NoReturn
 
-__version__ = "3.1.1"
+__version__ = "3.2.0"
 
 CONFIG_NAMES = (".git-tidy.yaml", ".git-tidy.yml")
 QUARANTINE_DIRNAME = ".git-tidy-trash"
@@ -171,6 +171,7 @@ DEFAULTS: dict[str, Any] = {
         "prune_gone": True,
         "require_merged": True,
         "prune_local_only": False,
+        "worktrees": False,
         "keep": ["main", "master", "trunk", "develop", "release/*"],
     },
     "clean": {
@@ -327,6 +328,13 @@ COMMENTS: dict[str, str] = {
     "default branch. Turning this off deletes unpushed work.",
     "branches.prune_local_only": "Branches that never had an upstream. Usually local\n"
     "scratch work, so they are reported rather than deleted.",
+    "branches.worktrees": "A branch a linked worktree has checked out cannot be\n"
+    "deleted while that worktree exists, so a `git worktree add` made months ago\n"
+    "keeps its branch for ever. With this on, such a worktree is removed first\n"
+    "and the branch then goes by the rules above. git refuses to remove a\n"
+    "worktree holding modified or untracked files, and that refusal is reported\n"
+    "rather than overridden, so uncommitted work keeps the worktree and the\n"
+    "worktree keeps the branch.",
     "branches.keep": "Never deleted, whatever the rules above say. Globs allowed.",
     "clean": "Removing build output and caches.",
     "clean.enabled": "Turn the whole clean step off for this directory.",
@@ -2825,25 +2833,23 @@ def _consider_branches(
             reason = "never pushed"
         else:
             continue
-        # A branch checked out in a linked worktree cannot be deleted either.
-        # Saying so beats one failure line per branch, and --force cannot help:
-        # the answer is to remove the worktree, which is a decision, not a detail.
-        held_by = _checked_out_elsewhere(git, branch.name)
-        if held_by:
-            actions.append(
-                Action(
-                    "branch",
-                    name,
-                    branch.name,
-                    f"in use by the worktree at {held_by}",
-                    skipped=True,
-                )
-            )
-            continue
-
+        # Why the branch would be kept comes first, and the worktree second: the
+        # other way round, a run with require_merged on removed somebody's
+        # checkout and then kept the branch anyway, which is the one outcome
+        # where the worktree was destroyed for nothing.
         kept = _why_keep(git, branch, trunk, remote, reason, rules, fetched)
         if kept is not None:
             actions.append(Action("branch", name, branch.name, kept, skipped=True))
+            continue
+
+        # A branch checked out in a linked worktree cannot be deleted either.
+        # Saying so beats one failure line per branch. --force does not help:
+        # the answer is to remove the worktree, which branches.worktrees turns
+        # into part of the run and is otherwise a decision, not a detail.
+        held_by = _checked_out_elsewhere(git, branch.name)
+        if held_by and not _free_the_worktree(
+            git, name, branch.name, held_by, rules, decider, actions
+        ):
             continue
 
         action = Action("branch", name, branch.name, f"delete ({reason})")
@@ -2870,6 +2876,51 @@ def _consider_branches(
         else:
             action.error = last_line(result)
         actions.append(action)
+
+
+def _free_the_worktree(
+    git: Git,
+    name: str,
+    branch: str,
+    held_by: str,
+    rules: dict[str, Any],
+    decider: Decider,
+    actions: list[Action],
+) -> bool:
+    """Remove the linked worktree holding `branch`, so the branch can go.
+
+    True when the branch is free to be deleted now. False reports why it is not,
+    on the branch's own line, because the branch is what the person came for.
+
+    `git worktree remove` without --force is the whole safety model here: git
+    refuses a worktree holding modified or untracked files, and that refusal is
+    reported rather than overridden. Deciding what counts as dirty in a second
+    place would be a second answer to a question git already answers, and the
+    one case that matters — a checkout somebody is working in — is exactly the
+    one git refuses.
+    """
+    if not rules["worktrees"]:
+        actions.append(
+            Action("branch", name, branch, f"in use by the worktree at {held_by}", skipped=True)
+        )
+        return False
+    action = Action("worktree", name, held_by, f"remove, so {branch} can go")
+    if not decider.allow(action):
+        actions.append(action)
+        return False
+    result = git.run("worktree", "remove", held_by, check=False)
+    if result.returncode != 0:
+        # Usually "contains modified or untracked files", which is the refusal
+        # this is built around rather than a fault in it. Reported on the
+        # worktree, since that is the thing that stayed.
+        action.skipped = True
+        action.detail = f"in use by the worktree at {held_by}: {last_line(result)}"
+        actions.append(action)
+        return False
+    action.applied = True
+    action.detail = f"removed, so {branch} can go"
+    actions.append(action)
+    return True
 
 
 # The branch was there when it was listed and is not there now: another worker
@@ -5325,6 +5376,7 @@ DID: tuple[tuple[str, str, str], ...] = (
     ("stash+rebase", "stashed and rebased", "to stash and rebase"),
     ("stash+switch", "stashed and switched", "to stash and switch"),
     ("submodules", "submodules updated", "submodules to update"),
+    ("worktree", "worktrees removed", "worktrees to remove"),
     ("branch", "branches deleted", "branches to delete"),
     ("remove", "artefacts removed", "artefacts to remove"),
     ("remove+quarantined", "artefacts quarantined", "artefacts to quarantine"),

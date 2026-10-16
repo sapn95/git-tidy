@@ -675,6 +675,80 @@ def test_prune_honours_keep(workspace: Path, remote: Path):
     assert "release/1.0" in git(repo, "branch", "--format=%(refname:short)").split()
 
 
+def make_worktree_on_gone_branch(repo: Path, remote: Path, name: str) -> Path:
+    """A linked worktree sitting on a branch whose upstream has been deleted."""
+    make_gone_branch(repo, remote, name)
+    where = repo.parent / f"wt-{name}"
+    git(repo, "worktree", "add", "-q", str(where), name)
+    return where
+
+
+def test_prune_reports_a_branch_a_worktree_holds(workspace: Path, remote: Path):
+    """The default: the worktree stays, and the branch says why it stayed."""
+    repo = workspace / "repo"
+    where = make_worktree_on_gone_branch(repo, remote, "held")
+
+    actions = gt.prune_branches(repo, "repo", config(), run(), fetched=True)
+    assert [(a.kind, a.detail) for a in actions] == [
+        ("branch", f"in use by the worktree at {where}")
+    ]
+    assert where.exists()
+    assert "held" in git(repo, "branch", "--format=%(refname:short)").split()
+
+
+def test_prune_removes_the_worktree_then_the_branch(workspace: Path, remote: Path):
+    repo = workspace / "repo"
+    where = make_worktree_on_gone_branch(repo, remote, "held")
+    cfg = config(branches={"worktrees": True})
+
+    actions = gt.prune_branches(repo, "repo", cfg, run(), fetched=True)
+    assert [(a.kind, a.applied) for a in actions] == [("worktree", True), ("branch", True)]
+    assert not where.exists()
+    assert "held" not in git(repo, "branch", "--format=%(refname:short)").split()
+
+
+def test_prune_keeps_a_worktree_with_uncommitted_work(workspace: Path, remote: Path):
+    """git's own refusal is the safety model, so the files decide the outcome."""
+    repo = workspace / "repo"
+    where = make_worktree_on_gone_branch(repo, remote, "held")
+    (where / "scratch.txt").write_text("not committed", encoding="utf-8")
+    cfg = config(branches={"worktrees": True})
+
+    actions = gt.prune_branches(repo, "repo", cfg, run(), fetched=True)
+    assert [(a.kind, a.applied, a.skipped) for a in actions] == [("worktree", False, True)]
+    assert "in use by the worktree" in actions[0].detail
+    assert (where / "scratch.txt").exists()
+    assert "held" in git(repo, "branch", "--format=%(refname:short)").split()
+
+
+def test_prune_keeps_the_worktree_of_an_unmerged_branch(workspace: Path, remote: Path):
+    """require_merged decides before the worktree does.
+
+    The other order removed a clean checkout and then kept its branch for
+    holding commits that are nowhere else, which costs the checkout for nothing.
+    """
+    repo = workspace / "repo"
+    make_gone_branch(repo, remote, "held", extra_commit=True)
+    where = repo.parent / "wt-held"
+    git(repo, "worktree", "add", "-q", str(where), "held")
+    cfg = config(branches={"worktrees": True})
+
+    actions = gt.prune_branches(repo, "repo", cfg, run(), fetched=True)
+    assert [a.kind for a in actions] == ["branch"]
+    assert actions[0].skipped
+    assert where.exists()
+
+
+def test_prune_worktree_removal_waits_for_apply(workspace: Path, remote: Path):
+    repo = workspace / "repo"
+    where = make_worktree_on_gone_branch(repo, remote, "held")
+    cfg = config(branches={"worktrees": True})
+
+    actions = gt.prune_branches(repo, "repo", cfg, gt.Decider(gt.DRY), fetched=True)
+    assert [(a.kind, a.applied) for a in actions] == [("worktree", False)]
+    assert where.exists()
+
+
 def test_prune_leaves_local_only_branches_alone(workspace: Path):
     repo = workspace / "repo"
     git(repo, "branch", "scratch")

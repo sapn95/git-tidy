@@ -122,6 +122,17 @@ git-tidy run --force --ask     # fetches, then asks about each unmerged branch
 `prune --ask` will not offer them: a branch the containment test keeps is
 reported, not proposed, so there is nothing to answer.
 
+**A worktree holds its branch.** git refuses to delete a branch another worktree
+has checked out, so a `git worktree add` from months ago keeps its branch for
+ever and no flag changes that. `branches.worktrees: true` removes the worktree
+first and then deletes the branch by the rules above. It is off by default.
+
+The worktree goes only once the branch has passed every other test, so a run
+with `require_merged` on never trades a checkout for a branch it then keeps. And
+the removal is `git worktree remove` without `--force`: git refuses a worktree
+holding modified or untracked files, and that refusal is reported, so
+uncommitted work keeps the worktree and the worktree keeps the branch.
+
 ### clean
 
 Two mechanisms, and the first is usually all you need:

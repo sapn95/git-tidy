@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.10"
 
 [[package]]
@@ -128,7 +128,7 @@ wheels = [
 
 [[package]]
 name = "git-tidy"
-version = "3.1.1"
+version = "3.2.0"
 source = { editable = "." }
 
 [package.dev-dependencies]
