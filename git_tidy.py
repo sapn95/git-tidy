@@ -171,7 +171,7 @@ DEFAULTS: dict[str, Any] = {
         "prune_gone": True,
         "require_merged": True,
         "prune_local_only": False,
-        "worktrees": False,
+        "prune_worktrees": False,
         "keep": ["main", "master", "trunk", "develop", "release/*"],
     },
     "clean": {
@@ -328,7 +328,7 @@ COMMENTS: dict[str, str] = {
     "default branch. Turning this off deletes unpushed work.",
     "branches.prune_local_only": "Branches that never had an upstream. Usually local\n"
     "scratch work, so they are reported rather than deleted.",
-    "branches.worktrees": "A branch a linked worktree has checked out cannot be\n"
+    "branches.prune_worktrees": "A branch a linked worktree has checked out cannot be\n"
     "deleted while that worktree exists, so a `git worktree add` made months ago\n"
     "keeps its branch for ever. With this on, such a worktree is removed first\n"
     "and the branch then goes by the rules above. git refuses to remove a\n"
@@ -2844,75 +2844,42 @@ def _consider_branches(
 
         # A branch checked out in a linked worktree cannot be deleted either.
         # Saying so beats one failure line per branch. --force does not help:
-        # the answer is to remove the worktree, which branches.worktrees turns
-        # into part of the run and is otherwise a decision, not a detail.
+        # the answer is to remove the worktree, which branches.prune_worktrees
+        # turns into part of the run and is otherwise a decision, not a detail.
         held_by = _checked_out_elsewhere(git, branch.name)
-        if held_by and not _free_the_worktree(
-            git, name, branch.name, held_by, rules, decider, actions
-        ):
+        if held_by and not rules["prune_worktrees"]:
+            actions.append(
+                Action(
+                    "branch",
+                    name,
+                    branch.name,
+                    f"in use by the worktree at {held_by}",
+                    skipped=True,
+                )
+            )
             continue
 
-        action = Action("branch", name, branch.name, f"delete ({reason})")
-        if not decider.allow(action):
-            actions.append(action)
-            continue
-        # --delete without --force makes git re-check containment at the moment
-        # of deletion, which closes the gap between the check above and here.
-        # --force is only used where containment was deliberately waived.
-        args = ["branch", "--delete", branch.name]
-        if not rules["require_merged"]:
-            args.insert(2, "--force")
-        result = git.run(*args, check=False)
-        if result.returncode == 0:
-            action.applied = True
-            action.detail = f"deleted ({reason})"
-        elif not git.ok("show-ref", "--verify", "--quiet", f"refs/heads/{branch.name}"):
-            # Gone already. Two entries in the workspace can share one ref store —
-            # a linked worktree, or a second clone made with --shared — so another
-            # worker may have deleted it between the listing and here. The
-            # outcome is the one that was wanted; it is not a failure.
-            action.skipped = True
-            action.detail = f"already deleted ({reason})"
-        else:
-            action.error = last_line(result)
-        actions.append(action)
+        _delete_the_branch(git, name, branch.name, reason, held_by, rules, decider, actions)
 
 
-def _free_the_worktree(
-    git: Git,
-    name: str,
-    branch: str,
-    held_by: str,
-    rules: dict[str, Any],
-    decider: Decider,
-    actions: list[Action],
-) -> bool:
-    """Remove the linked worktree holding `branch`, so the branch can go.
+def _remove_worktree(git: Git, name: str, branch: str, held_by: str, actions: list[Action]) -> bool:
+    """Remove the linked worktree holding `branch`. True when it is gone.
 
-    True when the branch is free to be deleted now. False reports why it is not,
-    on the branch's own line, because the branch is what the person came for.
+    Called only after the branch has passed every other test and the removal has
+    been allowed, so the one question left is git's.
 
     `git worktree remove` without --force is the whole safety model here: git
     refuses a worktree holding modified or untracked files, and that refusal is
-    reported rather than overridden. Deciding what counts as dirty in a second
-    place would be a second answer to a question git already answers, and the
-    one case that matters — a checkout somebody is working in — is exactly the
-    one git refuses.
+    reported rather than overridden. Deciding what counts as dirty here would be
+    a second answer to a question git already answers, and the case that matters
+    — a checkout somebody is working in — is exactly the one git refuses.
     """
-    if not rules["worktrees"]:
-        actions.append(
-            Action("branch", name, branch, f"in use by the worktree at {held_by}", skipped=True)
-        )
-        return False
     action = Action("worktree", name, held_by, f"remove, so {branch} can go")
-    if not decider.allow(action):
-        actions.append(action)
-        return False
     result = git.run("worktree", "remove", held_by, check=False)
     if result.returncode != 0:
         # Usually "contains modified or untracked files", which is the refusal
         # this is built around rather than a fault in it. Reported on the
-        # worktree, since that is the thing that stayed.
+        # worktree, because the worktree is what stayed.
         action.skipped = True
         action.detail = f"in use by the worktree at {held_by}: {last_line(result)}"
         actions.append(action)
@@ -2921,6 +2888,62 @@ def _free_the_worktree(
     action.detail = f"removed, so {branch} can go"
     actions.append(action)
     return True
+
+
+def _delete_the_branch(
+    git: Git,
+    name: str,
+    branch: str,
+    reason: str,
+    held_by: str | None,
+    rules: dict[str, Any],
+    decider: Decider,
+    actions: list[Action],
+) -> None:
+    """Delete one branch that has already passed every test that keeps it."""
+    # One action for one outcome, named on the branch, including the
+    # worktree that has to go first. Asking twice let somebody say yes to
+    # the worktree and no to the branch, which spends the checkout and
+    # keeps the branch — and in a dry run the branch no longer appeared at
+    # all, so the preview was missing the thing an apply would do.
+    action = Action(
+        "branch",
+        name,
+        branch,
+        f"delete ({reason})"
+        if not held_by
+        else f"delete ({reason}), removing the worktree at {held_by} first",
+    )
+    if not decider.allow(action):
+        actions.append(action)
+        return
+    if held_by and not _remove_worktree(git, name, branch, held_by, actions):
+        return
+    # --delete without --force makes git re-check containment at the moment
+    # of deletion, which closes the gap between the check above and here.
+    # --force is only used where containment was deliberately waived, or
+    # where this run has already proved more than git is about to check: a
+    # branch whose upstream is gone makes `git branch --delete` fall back to
+    # containment in HEAD, so a HEAD behind the trunk refused a branch
+    # _why_keep had just found contained in origin/main — after its worktree
+    # had been removed for it.
+    args = ["branch", "--delete", branch]
+    if not rules["require_merged"] or held_by:
+        args.insert(2, "--force")
+    result = git.run(*args, check=False)
+    if result.returncode == 0:
+        action.applied = True
+        action.detail = f"deleted ({reason})"
+    elif not git.ok("show-ref", "--verify", "--quiet", f"refs/heads/{branch}"):
+        # Gone already. Two entries in the workspace can share one ref store —
+        # a linked worktree, or a second clone made with --shared — so another
+        # worker may have deleted it between the listing and here. The
+        # outcome is the one that was wanted; it is not a failure.
+        action.skipped = True
+        action.detail = f"already deleted ({reason})"
+    else:
+        action.error = last_line(result)
+    actions.append(action)
 
 
 # The branch was there when it was listed and is not there now: another worker

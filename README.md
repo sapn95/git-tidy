@@ -124,7 +124,7 @@ reported, not proposed, so there is nothing to answer.
 
 **A worktree holds its branch.** git refuses to delete a branch another worktree
 has checked out, so a `git worktree add` from months ago keeps its branch for
-ever and no flag changes that. `branches.worktrees: true` removes the worktree
+ever and no flag changes that. `branches.prune_worktrees: true` removes the worktree
 first and then deletes the branch by the rules above. It is off by default.
 
 The worktree goes only once the branch has passed every other test, so a run
