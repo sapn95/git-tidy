@@ -699,7 +699,7 @@ def test_prune_reports_a_branch_a_worktree_holds(workspace: Path, remote: Path):
 def test_prune_removes_the_worktree_then_the_branch(workspace: Path, remote: Path):
     repo = workspace / "repo"
     where = make_worktree_on_gone_branch(repo, remote, "held")
-    cfg = config(branches={"worktrees": True})
+    cfg = config(branches={"prune_worktrees": True})
 
     actions = gt.prune_branches(repo, "repo", cfg, run(), fetched=True)
     assert [(a.kind, a.applied) for a in actions] == [("worktree", True), ("branch", True)]
@@ -712,7 +712,7 @@ def test_prune_keeps_a_worktree_with_uncommitted_work(workspace: Path, remote: P
     repo = workspace / "repo"
     where = make_worktree_on_gone_branch(repo, remote, "held")
     (where / "scratch.txt").write_text("not committed", encoding="utf-8")
-    cfg = config(branches={"worktrees": True})
+    cfg = config(branches={"prune_worktrees": True})
 
     actions = gt.prune_branches(repo, "repo", cfg, run(), fetched=True)
     assert [(a.kind, a.applied, a.skipped) for a in actions] == [("worktree", False, True)]
@@ -731,7 +731,7 @@ def test_prune_keeps_the_worktree_of_an_unmerged_branch(workspace: Path, remote:
     make_gone_branch(repo, remote, "held", extra_commit=True)
     where = repo.parent / "wt-held"
     git(repo, "worktree", "add", "-q", str(where), "held")
-    cfg = config(branches={"worktrees": True})
+    cfg = config(branches={"prune_worktrees": True})
 
     actions = gt.prune_branches(repo, "repo", cfg, run(), fetched=True)
     assert [a.kind for a in actions] == ["branch"]
@@ -740,13 +740,61 @@ def test_prune_keeps_the_worktree_of_an_unmerged_branch(workspace: Path, remote:
 
 
 def test_prune_worktree_removal_waits_for_apply(workspace: Path, remote: Path):
+    """A dry run names the branch it would delete, and the worktree it would take.
+
+    Reporting only the worktree left the branch out of the preview entirely, so
+    the one thing an apply would do was the one thing the plan did not mention.
+    """
     repo = workspace / "repo"
     where = make_worktree_on_gone_branch(repo, remote, "held")
-    cfg = config(branches={"worktrees": True})
+    cfg = config(branches={"prune_worktrees": True})
 
     actions = gt.prune_branches(repo, "repo", cfg, gt.Decider(gt.DRY), fetched=True)
-    assert [(a.kind, a.applied) for a in actions] == [("worktree", False)]
+    assert [(a.kind, a.applied) for a in actions] == [("branch", False)]
+    assert f"removing the worktree at {where} first" in actions[0].detail
     assert where.exists()
+
+
+def test_prune_declining_the_branch_keeps_its_worktree(workspace: Path, remote: Path):
+    """One question, one outcome.
+
+    Two prompts let somebody accept the worktree and refuse the branch, which
+    spends the checkout and keeps the branch it was removed for.
+    """
+    repo = workspace / "repo"
+    where = make_worktree_on_gone_branch(repo, remote, "held")
+    cfg = config(branches={"prune_worktrees": True})
+    decider = gt.Decider(gt.ASK, stream=io.StringIO(), prompt_input=lambda _: "n")
+
+    actions = gt.prune_branches(repo, "repo", cfg, decider, fetched=True)
+    assert [(a.kind, a.applied) for a in actions] == [("branch", False)]
+    assert where.exists()
+    assert "held" in git(repo, "branch", "--format=%(refname:short)").split()
+
+
+def test_prune_deletes_the_branch_with_a_head_behind_the_trunk(workspace: Path, remote: Path):
+    """`git branch --delete` falls back to HEAD once the upstream is gone.
+
+    A branch contained in origin/main but not in a HEAD that sits behind it was
+    refused by git after its worktree had already been removed for it, which is
+    the removed-checkout-and-kept-branch outcome by another route.
+    """
+    repo = workspace / "repo"
+    make_gone_branch(repo, remote, "held")
+    where = repo.parent / "wt-held"
+    git(repo, "worktree", "add", "-q", str(where), "held")
+    # The trunk moves on, and this checkout does not follow: HEAD is now behind
+    # origin/main, while `held` is contained in it.
+    other = workspace / "other"
+    git(workspace, "clone", "-q", str(remote), "other")
+    commit(other, "later.txt")
+    git(other, "push", "-q", "origin", "main")
+    git(repo, "fetch", "-q", "origin")
+    cfg = config(branches={"prune_worktrees": True})
+
+    actions = gt.prune_branches(repo, "repo", cfg, run(), fetched=True)
+    assert [(a.kind, a.applied) for a in actions] == [("worktree", True), ("branch", True)]
+    assert "held" not in git(repo, "branch", "--format=%(refname:short)").split()
 
 
 def test_prune_leaves_local_only_branches_alone(workspace: Path):
