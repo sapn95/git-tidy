@@ -772,6 +772,30 @@ def test_prune_declining_the_branch_keeps_its_worktree(workspace: Path, remote: 
     assert "held" in git(repo, "branch", "--format=%(refname:short)").split()
 
 
+def test_prune_keeps_a_commit_made_while_the_prompt_waited(workspace: Path, remote: Path):
+    """The branch is checked again once its worktree is gone.
+
+    --force is only earned by the containment check this run did, and a commit
+    made in the worktree while --ask waited is exactly the work that check no
+    longer covers. The checkout can be made again; the commit cannot.
+    """
+    repo = workspace / "repo"
+    where = make_worktree_on_gone_branch(repo, remote, "held")
+    cfg = config(branches={"prune_worktrees": True})
+
+    def answer(_prompt: str) -> str:
+        commit(where, "late.txt")  # somebody is still working in there
+        return "y"
+
+    decider = gt.Decider(gt.ASK, stream=io.StringIO(), prompt_input=answer)
+    actions = gt.prune_branches(repo, "repo", cfg, decider, fetched=True)
+
+    assert [(a.kind, a.applied) for a in actions] == [("worktree", True), ("branch", False)]
+    assert "has already been removed" in actions[1].detail
+    assert "held" in git(repo, "branch", "--format=%(refname:short)").split()
+    assert git(repo, "log", "-1", "--format=%s", "held") == "add late.txt"
+
+
 def test_prune_deletes_the_branch_with_a_head_behind_the_trunk(workspace: Path, remote: Path):
     """`git branch --delete` falls back to HEAD once the upstream is gone.
 

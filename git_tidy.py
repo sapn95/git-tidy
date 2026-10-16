@@ -55,6 +55,7 @@ import argparse
 import concurrent.futures
 import contextlib
 import fnmatch
+import functools
 import json
 import os
 import re
@@ -2859,7 +2860,19 @@ def _consider_branches(
             )
             continue
 
-        _delete_the_branch(git, name, branch.name, reason, held_by, rules, decider, actions)
+        _delete_the_branch(
+            git,
+            name,
+            branch.name,
+            reason,
+            held_by,
+            rules,
+            decider,
+            actions,
+            recheck=functools.partial(
+                _why_keep, git, branch, trunk, remote, reason, rules, fetched
+            ),
+        )
 
 
 def _remove_worktree(git: Git, name: str, branch: str, held_by: str, actions: list[Action]) -> bool:
@@ -2899,6 +2912,7 @@ def _delete_the_branch(
     rules: dict[str, Any],
     decider: Decider,
     actions: list[Action],
+    recheck: Callable[[], str | None],
 ) -> None:
     """Delete one branch that has already passed every test that keeps it."""
     # One action for one outcome, named on the branch, including the
@@ -2917,8 +2931,27 @@ def _delete_the_branch(
     if not decider.allow(action):
         actions.append(action)
         return
-    if held_by and not _remove_worktree(git, name, branch, held_by, actions):
-        return
+    if held_by:
+        if not _remove_worktree(git, name, branch, held_by, actions):
+            return
+        # Asked again, because the gap between the first answer and here is now
+        # as long as a prompt somebody can commit in: a commit made in the
+        # worktree while --ask waited is inside the branch and outside the
+        # trunk, and the --force below would take it. The worktree is gone by
+        # then, so the line says so — a checkout can be made again, a commit
+        # that exists nowhere else cannot.
+        kept_now = recheck()
+        if kept_now is not None:
+            actions.append(
+                Action(
+                    "branch",
+                    name,
+                    branch,
+                    f"{kept_now}, and the worktree at {held_by} has already been removed",
+                    skipped=True,
+                )
+            )
+            return
     # --delete without --force makes git re-check containment at the moment
     # of deletion, which closes the gap between the check above and here.
     # --force is only used where containment was deliberately waived, or
@@ -5551,6 +5584,12 @@ REASONS: tuple[tuple[str, str], ...] = (
     ("detached", "detached HEAD"),
     ("remote branch missing", "no usable default branch"),
     ("no default branch", "no usable default branch"),
+    # Last, and after every needle a kept-reason can match: this message starts
+    # with one of those reasons, which is the more useful of the two.
+    (
+        "has already been removed",
+        "branches kept after their worktree was removed for them",
+    ),
     ("consider git gc", ".git big enough to be worth a git gc"),
 )
 
