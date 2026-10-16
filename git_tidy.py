@@ -2902,8 +2902,7 @@ def _worktree_in_the_way(git: Git, held_by: str, rules: dict[str, Any]) -> str |
         return f"in use by the main working tree at {held_by}"
     if not rules["prune_worktrees"]:
         return f"in use by the worktree at {held_by}"
-    locked = any(path == held_by and "locked" in words for path, words in entries)
-    stays = "it is locked" if locked else _why_worktree_stays(git, held_by)
+    stays = _why_worktree_stays(git, held_by)
     return None if stays is None else f"in use by the worktree at {held_by}: {stays}"
 
 
@@ -2916,6 +2915,9 @@ def _why_worktree_stays(git: Git, held_by: str) -> str | None:
     worktree holding submodules before it ever looks at what is in it, so for
     those this is the only answer there is.
     """
+    if any(path == held_by and "locked" in words for path, words in _worktrees(git)):
+        # A lock is somebody having already said what happens to this checkout.
+        return "it is locked"
     where = Path(held_by)
     if where.is_symlink():
         return "it is reached through a symlink"
@@ -2942,11 +2944,26 @@ def _holds_submodules(git: Git, held_by: str) -> bool:
     return bool(worktree.out("submodule", "status", check=False))
 
 
+def _may_take_the_worktree(git: Git, held_by: str) -> bool:
+    """Everything that has to hold before git-tidy removes a worktree itself.
+
+    Asked again at the moment of removal, because --ask can wait as long as
+    somebody takes to answer, and in that time a worktree can be locked or
+    written in. This is the one place git's refusal is overridden, so it
+    repeats every question git would have asked, and the submodules that are
+    the only refusal worth overriding have to be there too.
+    """
+    entries = _worktrees(git)
+    if not entries or held_by == entries[0][0]:
+        return False  # the main working tree, which nothing can remove
+    return _holds_submodules(git, held_by) and _why_worktree_stays(git, held_by) is None
+
+
 def _take_the_worktree_out(git: Git, held_by: str) -> str | None:
     """Delete the worktree's directory and let git forget it. None when it is gone.
 
     Only reached for a worktree git declined over the submodules in it, and
-    only once _why_worktree_stays has found nothing in it to lose. git refuses
+    only once _may_take_the_worktree has found nothing in it to lose. git refuses
     that worktree whatever its state, because *moving* a submodule is what it
     cannot do safely; removing one is an rmtree, and the submodule's own
     repository lives in the parent's .git rather than in here.
@@ -2972,9 +2989,9 @@ def _remove_worktree(git: Git, name: str, branch: str, held_by: str, actions: li
     `git worktree remove` without --force is the first answer and the safety
     model: git refuses a worktree holding modified or untracked files. The one
     refusal that is overridden is the blanket one over submodules, which git
-    gives before it looks at what is in the worktree at all — and only after
-    _why_worktree_stays has asked git's own question about the files and found
-    nothing to lose.
+    gives before it looks at what is in the worktree at all — and only once
+    _may_take_the_worktree has asked every question git would have asked, at
+    the moment of the removal rather than before the prompt.
     """
     action = Action("worktree", name, held_by, f"remove, so {branch} can go")
     result = git.run("worktree", "remove", held_by, check=False)
@@ -2983,7 +3000,7 @@ def _remove_worktree(git: Git, name: str, branch: str, held_by: str, actions: li
         action.detail = f"removed, so {branch} can go"
         actions.append(action)
         return True
-    if _holds_submodules(git, held_by) and _why_worktree_stays(git, held_by) is None:
+    if _may_take_the_worktree(git, held_by):
         problem = _take_the_worktree_out(git, held_by)
         if problem is not None:
             action.error = problem
