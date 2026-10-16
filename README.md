@@ -128,10 +128,25 @@ ever and no flag changes that. `branches.prune_worktrees: true` removes the work
 first and then deletes the branch by the rules above. It is off by default.
 
 The worktree goes only once the branch has passed every other test, so a run
-with `require_merged` on never trades a checkout for a branch it then keeps. And
-the removal is `git worktree remove` without `--force`: git refuses a worktree
-holding modified or untracked files, and that refusal is reported, so
-uncommitted work keeps the worktree and the worktree keeps the branch.
+with `require_merged` on never trades a checkout for a branch it then keeps. The
+removal is `git worktree remove` without `--force`: a worktree holding modified
+or untracked files keeps itself and keeps its branch, and so does a locked one.
+A dry run asks the same questions, so the plan names the branches an apply will
+really delete.
+
+The main working tree keeps its branch whatever this setting says, because git
+has no way to remove it. It comes up at all because a linked worktree is a
+repository of its own to a workspace walk: read from inside one, the branch the
+main checkout has is a branch somebody else holds. Those are reported as
+`in use by the main working tree at <path>`, and there is nothing to do about
+them.
+
+One refusal is overridden. git declines to remove a worktree holding submodules
+before it has looked at what is in it, and no flag changes that, so a workspace
+of repositories with submodules would keep every branch its worktrees hold for
+ever. git-tidy asks git's own question about the files instead, down through
+every submodule, and when nothing in there would be lost it deletes the
+directory and runs `git worktree prune`.
 
 ### clean
 
