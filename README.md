@@ -210,13 +210,18 @@ where builds run unattended, such as fresh clones that agents work in: emptying
 a `node_modules` under a running build breaks it, and the same tree a week later
 is just disk.
 
-"Changed" means a source file, the artefact directories and what sits directly
-in them, or `.git/HEAD` and its reflog. The inside of a dependency tree is not
-walked, because the directory itself changes when anything installs into it.
-ctime counts as well as mtime, since npm and tar stamp what they unpack with the
-archive's date. `git status` and `git fetch` do not count, because git-tidy runs
-both everywhere. A fast-forward by `sync` does count. A busy repository is left
-whole and reported as `kept: <path> changed within clean.idle_days`.
+"Changed" means a file or the directory holding it (a deleted file leaves only
+that), the artefact directories and what sits directly in them, or `.git/HEAD`
+and its reflog. The inside of a dependency tree is not walked, because the
+directory itself changes when anything installs into it. `build/` and `dist/`
+are walked like source while `clean.builds` is off. ctime counts as well as
+mtime, since npm and tar stamp what they unpack with the archive's date.
+`git status` and `git fetch` do not count, because git-tidy runs both
+everywhere. A fast-forward by `sync` does count, and so does a clean: the
+folder it cleaned reads as busy for the next `idle_days`, with nothing left in
+it to clean. A busy repository is left whole and reported as
+`kept: <path> changed within clean.idle_days`. With `--ask`, a yes is checked
+again before anything goes, since a build can start while the question is open.
 
 Inside a repository, a **tracked file is never deleted**, however much it looks
 like an artefact — unless `clean.tracked: true` says so, which is off by default

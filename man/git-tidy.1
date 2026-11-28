@@ -28,8 +28,8 @@ already calls disposable. A tracked file is never deleted, unless
 \fIclean.tracked\fR says so.
 With \fIclean.idle_days\fR set, a repository is only cleaned once nothing in
 it has changed for that many days; outside a repository the directory holding
-the artefact counts. Changes are source files, the artefact directories and
-their direct entries, and
+the artefact counts. Changes are files and the directories holding them, the
+artefact directories and their direct entries, and
 .IR .git/HEAD ;
 not the index, not what a fetch writes.
 .TP
