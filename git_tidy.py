@@ -70,7 +70,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NoReturn
 
-__version__ = "3.3.0"
+__version__ = "3.4.0"
 
 CONFIG_NAMES = (".git-tidy.yaml", ".git-tidy.yml")
 QUARANTINE_DIRNAME = ".git-tidy-trash"
@@ -236,6 +236,7 @@ DEFAULTS: dict[str, Any] = {
         "builds": False,
         "tracked": False,
         "keep": [],
+        "idle_days": 0,
         "quarantine": False,
     },
     "trash": {
@@ -377,6 +378,11 @@ COMMENTS: dict[str, str] = {
     "inside that repository alone, so web/node_modules or *-mcp/node_modules\n"
     "keeps the one dependency tree that has to survive, where a bare\n"
     "node_modules would keep every one in the workspace.",
+    "clean.idle_days": "Leave a repository alone until nothing in it has changed for this\n"
+    "many days. Outside a repository the directory holding the artefact counts.\n"
+    "For a workspace where builds run unattended: emptying a node_modules under\n"
+    "a running build breaks it, and the same tree a week later is just disk.\n"
+    "A fast-forward by sync counts as a change. 0 cleans whatever its age.",
     "clean.quarantine": "Move removals to the quarantine instead of deleting them.\n"
     "Note this changes what happens to a protected file inside a directory that\n"
     "is being removed: without it the file stays where it is and the directory\n"
@@ -1648,10 +1654,20 @@ def is_repo(path: Path) -> bool:
 
     Strict on purpose: this answers "is this a checkout we can sync", and one
     that cannot be read is not. holds_git_data is the guard, and it is not.
+
+    A .git file has to point somewhere. uv leaves an empty one at the top of its
+    cache so that git stops walking there, and taking that for a worktree made
+    every run end in "invalid gitfile format" for a directory that holds no
+    repository at all.
     """
     dot_git = path / ".git"
     try:
-        return dot_git.is_dir() or dot_git.is_file()
+        if dot_git.is_dir():
+            return True
+        if not dot_git.is_file():
+            return False
+        with dot_git.open("rb") as pointer:
+            return pointer.read(7) == b"gitdir:"
     except OSError:
         return False
 
@@ -1665,9 +1681,11 @@ def holds_git_data(path: Path) -> bool:
     guard that looked for one walked straight past them. A directory nobody can
     list gets the same answer, for the same reason.
     """
-    if is_repo(path):
-        return True
     try:
+        # Any .git at all, not is_repo: an unreadable or odd .git file is still
+        # no reason to delete what it sits in.
+        if (path / ".git").exists() or (path / ".git").is_symlink():
+            return True
         if (path / "HEAD").is_file() and (path / "objects").is_dir():
             return (path / "refs").is_dir()
     except OSError:
@@ -3218,6 +3236,140 @@ def _measure(path: Path) -> tuple[int, bool, bool]:
     # made a project.old/ with one chmod-000 subdirectory in it and no git
     # anywhere report "kept: contains a git repository", which is simply untrue.
     return total, holds_repo, unreadable.hit
+
+
+# Inside .git, only what moves when somebody works in the checkout: a commit, a
+# checkout, a reset. Not the index, which a plain `git status` rewrites, and
+# git-tidy runs one in every repository it looks at. Not FETCH_HEAD or the
+# remote-tracking refs either, which every fetch moves, its own included. Either
+# would make every repository look busy for ever.
+GIT_ACTIVITY = ("HEAD", "logs/HEAD")
+
+
+def _git_dir(repo: Path) -> Path | None:
+    """The .git directory of `repo`, following the pointer a linked worktree has."""
+    dot_git = repo / ".git"
+    if dot_git.is_dir():
+        return dot_git
+    try:
+        pointer = dot_git.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    if not pointer.startswith("gitdir:"):
+        return None
+    target = Path(pointer[len("gitdir:") :].strip())
+    return target if target.is_absolute() else repo / target
+
+
+def _changed_since(path: Path, cutoff: float) -> bool:
+    """Whether `path` itself was written, created or renamed at or after `cutoff`.
+
+    ctime as well as mtime, because mtime is whatever the writer says it is:
+    npm and tar stamp what they unpack with the date in the archive, so a
+    node_modules installed an hour ago is full of files from 1985. ctime is the
+    inode's own clock and nobody can set it back.
+    """
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    return max(info.st_mtime, info.st_ctime) >= cutoff
+
+
+def recent_change(path: Path, clean: dict[str, Any], cutoff: float) -> str | None:
+    """Something under `path` that changed at or after `cutoff`, or None.
+
+    The question is "is anybody working here?", and it is answered from the
+    files people and builds write: source, the artefact directories themselves
+    and what sits directly in them, and the HEAD of the repository. The inside
+    of an artefact is not walked. A node_modules holds a hundred thousand files,
+    and the directory and its first level already change when anything installs
+    into it or a build writes its output. A nested repository is its own unit
+    and is left out.
+
+    Returns a path relative to `path` for the report. Anything that cannot be
+    read answers "in use": not being able to tell is not the same as idle.
+    """
+    git_dir = _git_dir(path)
+    if git_dir is not None:
+        for name in GIT_ACTIVITY:
+            if _changed_since(git_dir / name, cutoff):
+                return f".git/{name}"
+    dir_patterns, _ = clean_patterns(clean)
+    artefacts = [*dir_patterns, *clean["dependency_dirs"], *clean["build_dirs"]]
+    unreadable = _Unreadable()
+    for dirpath, dirnames, filenames in os.walk(path, followlinks=False, onerror=unreadable):
+        here = Path(dirpath)
+        descend: list[str] = []
+        for name in sorted(dirnames):
+            child = here / name
+            if name in (".git", QUARANTINE_DIRNAME) or child.is_symlink():
+                continue
+            if (child / ".git").exists():
+                continue  # a repository of its own, judged on its own
+            if _matches(name, artefacts):
+                found = _changed_at_the_top(child, cutoff)
+                if found is not None:
+                    return found.relative_to(path).as_posix()
+                continue
+            descend.append(name)
+        dirnames[:] = descend
+        for name in filenames:
+            if _changed_since(here / name, cutoff):
+                return (here / name).relative_to(path).as_posix()
+    return "a subtree nobody can read" if unreadable.hit else None
+
+
+def _changed_at_the_top(directory: Path, cutoff: float) -> Path | None:
+    """The artefact directory, or one of its direct entries, if either is recent.
+
+    One level, because a build that overwrites its output in place (.next's
+    BUILD_ID, a dist/index.js) leaves the directory's own times alone.
+    """
+    if _changed_since(directory, cutoff):
+        return directory
+    try:
+        entries = list(os.scandir(directory))
+    except OSError:
+        return directory  # cannot tell, so in use
+    for entry in entries:
+        if _changed_since(Path(entry.path), cutoff):
+            return Path(entry.path)
+    return None
+
+
+def idle_cutoff(clean: dict[str, Any], now: float | None = None) -> float | None:
+    """The moment before which a change no longer counts, or None when it is off."""
+    days = clean["idle_days"]
+    if not days:
+        return None
+    return (time.time() if now is None else now) - days * 86400
+
+
+def still_in_use(
+    path: Path,
+    root: Path,
+    scope: str,
+    clean: dict[str, Any],
+    target: str = ".",
+    look: Callable[[Path, dict[str, Any], float], str | None] = recent_change,
+) -> Action | None:
+    """A skipped action when clean.idle_days says `path` is too recent to clean."""
+    cutoff = idle_cutoff(clean)
+    if cutoff is None:
+        return None
+    found = look(path, clean, cutoff)
+    if found is None:
+        return None
+    where = found if path == root else f"{path.relative_to(root).as_posix()}/{found}"
+    return Action(
+        "remove",
+        scope,
+        target,
+        f"kept: {where} changed within clean.idle_days ({clean['idle_days']})",
+        skipped=True,
+        settled=True,
+    )
 
 
 def tracked_paths(git: Git) -> set[str]:
@@ -5676,6 +5828,7 @@ REASONS: tuple[tuple[str, str], ...] = (
     ("checked out in", "default branch checked out in another worktree"),
     ("ignored_keep", "ignored files kept as local state (.env, *.tfstate, keys)"),
     ("kept by clean.keep", "paths clean.keep protects"),
+    ("clean.idle_days", "in use within clean.idle_days, cleaned once idle"),
     ("a dependency tree", "dependency trees — clean.dependencies is off"),
     ("build output", "build output — clean.builds is off"),
     ("orphaned worktree", "orphaned worktrees — the parent pruned them away"),
@@ -6041,6 +6194,11 @@ def cmd_clean(context: Context, report: Report) -> None:
         cfg = context.config_for(repo)
         if not cfg["clean"]["enabled"]:
             return []
+        # Before anything is measured: a repository somebody is working in is
+        # left whole, not thinned, so a build running there keeps its tree.
+        busy = still_in_use(repo, repo, context.name_of(repo), cfg["clean"])
+        if busy is not None:
+            return [busy]
         actions: list[Action] = []
         # `actions` accumulates across both mechanisms, and clean_tree guards
         # only its own list, so the guard belongs around the pair of them.
@@ -6154,9 +6312,30 @@ def _outside_repos(
     workspace = context.workspace
 
     done: list[Action] = []
+    # One walk per directory, not one per artefact in it: a loose tree with a
+    # __pycache__ in every package would otherwise walk itself once for each.
+    answers: dict[tuple[Path, int], str | None] = {}
+
+    def look(parent: Path, clean: dict[str, Any], cutoff: float) -> str | None:
+        key = (parent, clean["idle_days"])
+        if key not in answers:
+            answers[key] = recent_change(parent, clean, cutoff)
+        return answers[key]
 
     def handle(item: tuple[Path, bool, dict[str, Any]]) -> Action:
         path, is_dir, here_cfg = item
+        # No repository owns it, so the directory holding it stands in for one:
+        # a build in a scratch directory writes its dist/ next to its sources.
+        busy = still_in_use(
+            path.parent,
+            workspace,
+            "workspace",
+            here_cfg,
+            target=path.relative_to(workspace).as_posix(),
+            look=look,
+        )
+        if busy is not None:
+            return busy
         # Both the quarantine decision and the regenerable list come from the
         # config that governs *this* path, not the workspace root's.
         return _remove(
