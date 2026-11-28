@@ -203,6 +203,21 @@ dependency tree where a bare `node_modules` would keep all of them. The usual
 reason to name one is a checkout that something outside the workspace starts:
 reinstalling the tree needs a network.
 
+`clean.idle_days` waits instead of keeping. With it set, a repository is cleaned
+only once nothing in it has changed for that many days. Outside a repository the
+directory holding the artefact stands in for one. It is meant for a workspace
+where builds run unattended, such as fresh clones that agents work in: emptying
+a `node_modules` under a running build breaks it, and the same tree a week later
+is just disk.
+
+"Changed" means a source file, the artefact directories and what sits directly
+in them, or `.git/HEAD` and its reflog. The inside of a dependency tree is not
+walked, because the directory itself changes when anything installs into it.
+ctime counts as well as mtime, since npm and tar stamp what they unpack with the
+archive's date. `git status` and `git fetch` do not count, because git-tidy runs
+both everywhere. A fast-forward by `sync` does count. A busy repository is left
+whole and reported as `kept: <path> changed within clean.idle_days`.
+
 Inside a repository, a **tracked file is never deleted**, however much it looks
 like an artefact — unless `clean.tracked: true` says so, which is off by default
 and the only way `clean` will touch committed content. Symlinks are never followed. Nested repositories are left for

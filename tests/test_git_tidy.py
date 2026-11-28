@@ -7492,3 +7492,217 @@ def test_a_symlink_to_a_protected_file_is_not_protected(workspace: Path):
     assert (cache / ".env").read_text(encoding="utf-8") == "SECRET"
     assert not (cache / "current").exists()
     assert not (cache / "m.pyc").exists()
+
+
+# --------------------------------------------------------------------------- #
+# clean.idle_days
+# --------------------------------------------------------------------------- #
+
+
+def _a_moment_later() -> float:
+    """A cutoff after everything written so far, with room for the clock's grain."""
+    time.sleep(0.05)
+    moment = time.time()
+    time.sleep(0.05)
+    return moment
+
+
+def _idle_config(days: int = 7) -> dict:
+    return config(clean={"dependencies": True, "builds": True, "idle_days": days})["clean"]
+
+
+def _days_from_now(monkeypatch, days: int) -> None:
+    """Move the clock forward, which is the only way to make a ctime look old."""
+    real = time.time
+    monkeypatch.setattr(gt.time, "time", lambda: real() + days * 86400)
+
+
+def test_a_repository_somebody_works_in_keeps_its_dependencies(workspace: Path, capsys):
+    repo = workspace / "repo"
+    (repo / "node_modules" / "pkg").mkdir(parents=True)
+    (repo / "node_modules" / "pkg" / "index.js").write_text("x", encoding="utf-8")
+    (workspace / ".git-tidy.yaml").write_text(
+        "clean:\n  dependencies: true\n  idle_days: 7\n", encoding="utf-8"
+    )
+
+    gt.main(["-C", str(workspace), "clean", "--apply", "-v"])
+    assert (repo / "node_modules" / "pkg" / "index.js").exists()
+    assert "changed within clean.idle_days (7)" in capsys.readouterr().out
+
+
+def test_a_repository_idle_for_long_enough_is_cleaned(workspace: Path, monkeypatch):
+    repo = workspace / "repo"
+    (repo / "node_modules" / "pkg").mkdir(parents=True)
+    (repo / "node_modules" / "pkg" / "index.js").write_text("x", encoding="utf-8")
+    (workspace / ".git-tidy.yaml").write_text(
+        "clean:\n  dependencies: true\n  idle_days: 7\n", encoding="utf-8"
+    )
+    _days_from_now(monkeypatch, 8)
+
+    gt.main(["-C", str(workspace), "clean", "--apply"])
+    assert not (repo / "node_modules").exists()
+
+
+def test_idle_days_zero_cleans_a_busy_repository(workspace: Path):
+    repo = workspace / "repo"
+    (repo / "node_modules").mkdir()
+    (workspace / ".git-tidy.yaml").write_text("clean:\n  dependencies: true\n", encoding="utf-8")
+
+    gt.main(["-C", str(workspace), "clean", "--apply"])
+    assert not (repo / "node_modules").exists()
+
+
+def test_a_status_or_a_fetch_is_not_work(workspace: Path):
+    """git-tidy runs both in every repository; counting them kept everything for ever."""
+    repo = workspace / "repo"
+    cutoff = _a_moment_later()
+    git(repo, "fetch", "-q")
+    (repo / ".git" / "index").touch()
+    git(repo, "status", "--porcelain")
+    assert gt.recent_change(repo, _idle_config(), cutoff) is None
+
+
+def test_a_checkout_is_work(workspace: Path):
+    repo = workspace / "repo"
+    cutoff = _a_moment_later()
+    git(repo, "switch", "-q", "-c", "feature")
+    assert gt.recent_change(repo, _idle_config(), cutoff) in (".git/HEAD", ".git/logs/HEAD")
+
+
+def test_an_edited_source_file_is_work(workspace: Path):
+    repo = workspace / "repo"
+    (repo / "src").mkdir()
+    cutoff = _a_moment_later()
+    (repo / "src" / "app.ts").write_text("x", encoding="utf-8")
+    assert gt.recent_change(repo, _idle_config(), cutoff) == "src/app.ts"
+
+
+def test_an_install_is_work_even_with_archive_dates(workspace: Path):
+    """npm stamps what it unpacks with 1985; ctime is what tells the truth."""
+    repo = workspace / "repo"
+    (repo / "node_modules").mkdir()
+    cutoff = _a_moment_later()
+    package = repo / "node_modules" / "left-pad"
+    package.mkdir()
+    os.utime(package, (499_162_500, 499_162_500))
+    os.utime(repo / "node_modules", (499_162_500, 499_162_500))
+    assert gt.recent_change(repo, _idle_config(), cutoff) is not None
+
+
+def test_a_build_overwriting_its_output_is_work(workspace: Path):
+    repo = workspace / "repo"
+    (repo / ".next").mkdir()
+    (repo / ".next" / "BUILD_ID").write_text("a", encoding="utf-8")
+    cutoff = _a_moment_later()
+    (repo / ".next" / "BUILD_ID").write_text("b", encoding="utf-8")
+    assert gt.recent_change(repo, _idle_config(), cutoff) == ".next/BUILD_ID"
+
+
+def test_the_inside_of_a_dependency_tree_is_not_walked(workspace: Path):
+    """A hundred thousand files, and the top level already says whether it changed."""
+    repo = workspace / "repo"
+    deep = repo / "node_modules" / "pkg" / "lib"
+    deep.mkdir(parents=True)
+    cutoff = _a_moment_later()
+    (deep / "x.js").write_text("x", encoding="utf-8")
+    assert gt.recent_change(repo, _idle_config(), cutoff) is None
+
+
+def test_a_nested_repository_is_judged_on_its_own(workspace: Path, remote: Path):
+    outer = workspace / "outer"
+    outer.mkdir()
+    git(outer, "clone", "-q", str(remote), "inner")
+    cutoff = _a_moment_later()
+    (outer / "inner" / "new.txt").write_text("x", encoding="utf-8")
+    assert gt.recent_change(outer, _idle_config(), cutoff) is None
+
+
+def test_a_linked_worktree_reads_the_head_it_points_at(workspace: Path, tmp_path: Path):
+    repo = workspace / "repo"
+    linked = tmp_path / "linked"
+    git(repo, "worktree", "add", "-q", "-b", "side", str(linked))
+    assert gt._git_dir(linked) == Path(git(linked, "rev-parse", "--absolute-git-dir"))
+    cutoff = _a_moment_later()
+    git(linked, "switch", "-q", "-c", "other")
+    assert gt.recent_change(linked, _idle_config(), cutoff) in (".git/HEAD", ".git/logs/HEAD")
+
+
+def test_a_broken_gitdir_pointer_reads_as_no_git_dir(tmp_path: Path):
+    (tmp_path / ".git").write_text("not a pointer", encoding="utf-8")
+    assert gt._git_dir(tmp_path) is None
+
+
+@needs_permissions
+def test_a_tree_nobody_can_read_counts_as_in_use(tmp_path: Path):
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    cutoff = _a_moment_later()
+    locked.chmod(0)
+    try:
+        assert gt.recent_change(tmp_path, _idle_config(), cutoff) is not None
+    finally:
+        locked.chmod(0o755)
+
+
+def test_a_loose_build_next_to_fresh_sources_stays(workspace: Path):
+    """No repository owns it, so the directory holding it is what counts."""
+    scratch = workspace / "scratch"
+    (scratch / "build").mkdir(parents=True)
+    (scratch / "build" / "out.js").write_text("x", encoding="utf-8")
+    (scratch / "make.py").write_text("x", encoding="utf-8")
+    (workspace / ".git-tidy.yaml").write_text(
+        "clean:\n  builds: true\n  idle_days: 3\n", encoding="utf-8"
+    )
+
+    gt.main(["-C", str(workspace), "clean", "--apply"])
+    assert (scratch / "build" / "out.js").exists()
+
+
+def test_a_loose_build_left_alone_long_enough_goes(workspace: Path, monkeypatch):
+    scratch = workspace / "scratch"
+    (scratch / "build").mkdir(parents=True)
+    (scratch / "build" / "out.js").write_text("x", encoding="utf-8")
+    (scratch / "pkg" / "__pycache__").mkdir(parents=True)
+    (scratch / ".git-tidy.yaml").write_text(
+        "clean:\n  builds: true\n  idle_days: 3\n", encoding="utf-8"
+    )
+    _days_from_now(monkeypatch, 4)
+
+    gt.main(["-C", str(workspace), "clean", "--apply"])
+    assert not (scratch / "build").exists()
+    assert not (scratch / "pkg" / "__pycache__").exists()
+    assert (scratch / "pkg").exists()
+
+
+def test_a_busy_repository_is_summarised_not_listed_as_other(workspace: Path, capsys):
+    (workspace / "repo" / "__pycache__").mkdir()
+    (workspace / ".git-tidy.yaml").write_text("clean:\n  idle_days: 1\n", encoding="utf-8")
+
+    gt.main(["-C", str(workspace), "clean"])
+    out = capsys.readouterr().out
+    assert "in use within clean.idle_days, cleaned once idle" in out
+    assert "other, see the lines marked" not in out
+
+
+def test_idle_days_refuses_a_negative_number(workspace: Path):
+    (workspace / ".git-tidy.yaml").write_text("clean:\n  idle_days: -1\n", encoding="utf-8")
+    with pytest.raises(gt.Failure, match="cannot be negative"):
+        gt.main(["-C", str(workspace), "clean"])
+
+
+def test_an_empty_dot_git_file_is_not_a_checkout(workspace: Path):
+    """uv marks its cache with one so git stops there; syncing it failed every run."""
+    cache = workspace / "tools" / "cache" / "uv" / "sdists-v10"
+    cache.mkdir(parents=True)
+    (cache / ".git").touch()
+    assert not gt.is_repo(cache)
+    assert gt.holds_git_data(cache), "still never deleted wholesale"
+    repos = gt.find_repos(workspace, [])
+    assert cache not in repos
+    assert workspace / "repo" in repos
+
+
+def test_a_worktree_pointer_is_a_checkout(workspace: Path, tmp_path: Path):
+    linked = tmp_path / "linked"
+    git(workspace / "repo", "worktree", "add", "-q", "-b", "side", str(linked))
+    assert gt.is_repo(linked)
