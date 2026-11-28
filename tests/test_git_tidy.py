@@ -7572,9 +7572,31 @@ def test_a_checkout_is_work(workspace: Path):
 def test_an_edited_source_file_is_work(workspace: Path):
     repo = workspace / "repo"
     (repo / "src").mkdir()
-    cutoff = _a_moment_later()
     (repo / "src" / "app.ts").write_text("x", encoding="utf-8")
+    cutoff = _a_moment_later()
+    (repo / "src" / "app.ts").write_text("y", encoding="utf-8")
     assert gt.recent_change(repo, _idle_config(), cutoff) == "src/app.ts"
+
+
+def test_a_deleted_source_file_is_work(workspace: Path):
+    """A deletion leaves nothing behind but the stamp of its directory."""
+    repo = workspace / "repo"
+    (repo / "src").mkdir()
+    (repo / "src" / "app.ts").write_text("x", encoding="utf-8")
+    cutoff = _a_moment_later()
+    (repo / "src" / "app.ts").unlink()
+    assert gt.recent_change(repo, _idle_config(), cutoff) == "src"
+
+
+def test_build_is_source_while_clean_builds_is_off(workspace: Path):
+    repo = workspace / "repo"
+    (repo / "build" / "src").mkdir(parents=True)
+    (repo / "build" / "src" / "app.ts").write_text("x", encoding="utf-8")
+    clean = config(clean={"idle_days": 7})["clean"]
+    cutoff = _a_moment_later()
+    (repo / "build" / "src" / "app.ts").write_text("y", encoding="utf-8")
+    assert gt.recent_change(repo, clean, cutoff) == "build/src/app.ts"
+    assert gt.recent_change(repo, _idle_config(), cutoff) is None, "an artefact with it on"
 
 
 def test_an_install_is_work_even_with_archive_dates(workspace: Path):
@@ -7706,3 +7728,77 @@ def test_a_worktree_pointer_is_a_checkout(workspace: Path, tmp_path: Path):
     linked = tmp_path / "linked"
     git(workspace / "repo", "worktree", "add", "-q", "-b", "side", str(linked))
     assert gt.is_repo(linked)
+
+
+def test_two_loose_artefacts_in_one_folder_both_go(workspace: Path, monkeypatch):
+    """Removing the first changes the folder's stamp; the second was decided before."""
+    scratch = workspace / "scratch"
+    for name in ("build", "dist", "__pycache__"):
+        (scratch / name).mkdir(parents=True)
+        (scratch / name / "f").write_text("x", encoding="utf-8")
+    (scratch / ".git-tidy.yaml").write_text(
+        "clean:\n  builds: true\n  idle_days: 3\n", encoding="utf-8"
+    )
+    _days_from_now(monkeypatch, 4)
+
+    gt.main(["-C", str(workspace), "clean", "--apply", "-j", "4"])
+    assert sorted(p.name for p in scratch.iterdir()) == [".git-tidy.yaml"]
+
+
+def test_the_cache_does_not_lend_one_configs_answer_to_another(workspace: Path):
+    """Sibling artefacts can be governed by configs that walk the folder differently."""
+    scratch = workspace / "scratch"
+    (scratch / "generated" / "deep").mkdir(parents=True)
+    (scratch / "generated" / "deep" / "out.txt").write_text("x", encoding="utf-8")
+    cutoff = _a_moment_later()
+    (scratch / "generated" / "deep" / "out.txt").write_text("y", encoding="utf-8")
+    wide = config(clean={"idle_days": 7, "extra_dirs": ["generated"]})["clean"]
+    plain = config(clean={"idle_days": 7})["clean"]
+    assert gt.recent_change(scratch, wide, cutoff, stamps=False) is None
+    assert gt.recent_change(scratch, plain, cutoff, stamps=False) == "generated/deep/out.txt"
+
+
+def _asking(answers: list[str]) -> gt.Decider:
+    return gt.Decider(gt.ASK, stream=io.StringIO(), prompt_input=lambda _: answers.pop(0))
+
+
+def test_a_yes_is_checked_again_against_work_that_began_meanwhile(workspace: Path, monkeypatch):
+    repo = workspace / "repo"
+    (repo / "src").mkdir()
+    (repo / "src" / "app.ts").write_text("x", encoding="utf-8")
+    moment = _a_moment_later()
+    monkeypatch.setattr(gt, "idle_cutoff", lambda _clean, now=None: moment)
+    decider = gt.rechecking(_asking(["a"]), repo, repo, _idle_config())
+    assert isinstance(decider, gt._IdleRecheck)
+    assert decider.dry is False, "everything else is the inner decider's"
+
+    first = gt.Action("remove", "repo", "node_modules", "remove directory")
+    assert decider.allow(first)
+    (repo / "src" / "app.ts").write_text("y", encoding="utf-8")
+    second = gt.Action("remove", "repo", "dist", "remove directory")
+    assert not decider.allow(second)
+    assert second.skipped
+    assert "src/app.ts changed while the question was open" in second.detail
+
+
+def test_a_no_is_not_asked_about_again(workspace: Path):
+    decider = gt.rechecking(_asking(["n"]), workspace / "repo", workspace, _idle_config())
+    action = gt.Action("remove", "repo", "node_modules", "remove directory")
+    assert not decider.allow(action)
+    assert action.detail.startswith("declined")
+
+
+def test_only_a_person_answering_gets_the_second_look(workspace: Path):
+    repo = workspace / "repo"
+    assert gt.rechecking(run(), repo, repo, _idle_config()).__class__ is gt.Decider
+    assert gt.rechecking(_asking([]), repo, repo, _idle_config(0)).__class__ is gt.Decider
+
+
+def test_a_busy_folder_is_named_when_its_own_stamp_changed(workspace: Path):
+    repo = workspace / "repo"
+    cutoff = _a_moment_later()
+    (repo / "new.txt").write_text("x", encoding="utf-8")
+    assert gt.recent_change(repo, _idle_config(), cutoff) == "."
+    assert gt._where(repo, repo, ".") == "repo"
+    assert gt._where(repo / "a", repo, ".") == "a"
+    assert gt._where(repo / "a", repo, "b/c") == "a/b/c"

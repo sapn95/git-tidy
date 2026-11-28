@@ -3276,48 +3276,72 @@ def _changed_since(path: Path, cutoff: float) -> bool:
     return max(info.st_mtime, info.st_ctime) >= cutoff
 
 
-def recent_change(path: Path, clean: dict[str, Any], cutoff: float) -> str | None:
+def recent_change(
+    path: Path, clean: dict[str, Any], cutoff: float, stamps: bool = True
+) -> str | None:
     """Something under `path` that changed at or after `cutoff`, or None.
 
-    The question is "is anybody working here?", and it is answered from the
-    files people and builds write: source, the artefact directories themselves
-    and what sits directly in them, and the HEAD of the repository. The inside
-    of an artefact is not walked. A node_modules holds a hundred thousand files,
-    and the directory and its first level already change when anything installs
-    into it or a build writes its output. A nested repository is its own unit
-    and is left out.
+    The question is "is anybody working here?", and it is answered from what
+    people and builds write: files, the directories that hold them (a deleted
+    file leaves nothing behind but its directory's stamp), the artefact
+    directories and what sits directly in them, and the HEAD of the repository.
+    A nested repository is its own unit and is left out.
 
-    Returns a path relative to `path` for the report. Anything that cannot be
-    read answers "in use": not being able to tell is not the same as idle.
+    The inside of an artefact is not walked. A node_modules holds a hundred
+    thousand files, and the directory and its first level already change when
+    anything installs into it or a build writes its output. Dependency trees
+    count as artefacts whatever clean.dependencies says, because nobody edits
+    one by hand. build/ and dist/ count only while clean.builds is on: with it
+    off they are ordinary source directory names, and an edit in one is work.
+
+    `stamps` False leaves out the two things this run's own removals touch: the
+    stamps of directories and the artefacts themselves. That is the question
+    asked again after a prompt, when something here may already have gone.
+
+    Returns a path relative to `path` for the report, "." for `path` itself.
+    Anything that cannot be read answers "in use": not being able to tell is not
+    the same as idle.
     """
     git_dir = _git_dir(path)
     if git_dir is not None:
         for name in GIT_ACTIVITY:
             if _changed_since(git_dir / name, cutoff):
                 return f".git/{name}"
+    if stamps and _changed_since(path, cutoff):
+        return "."
     dir_patterns, _ = clean_patterns(clean)
-    artefacts = [*dir_patterns, *clean["dependency_dirs"], *clean["build_dirs"]]
+    shallow = [*dir_patterns, *clean["dependency_dirs"]]
     unreadable = _Unreadable()
     for dirpath, dirnames, filenames in os.walk(path, followlinks=False, onerror=unreadable):
         here = Path(dirpath)
-        descend: list[str] = []
-        for name in sorted(dirnames):
-            child = here / name
-            if name in (".git", QUARANTINE_DIRNAME) or child.is_symlink():
-                continue
-            if (child / ".git").exists():
-                continue  # a repository of its own, judged on its own
-            if _matches(name, artefacts):
-                found = _changed_at_the_top(child, cutoff)
-                if found is not None:
-                    return found.relative_to(path).as_posix()
-                continue
-            descend.append(name)
-        dirnames[:] = descend
-        for name in filenames:
-            if _changed_since(here / name, cutoff):
-                return (here / name).relative_to(path).as_posix()
+        found, dirnames[:] = _recent_below(here, dirnames, shallow, cutoff, stamps)
+        if found is None:
+            found = next((here / n for n in filenames if _changed_since(here / n, cutoff)), None)
+        if found is not None:
+            return found.relative_to(path).as_posix()
     return "a subtree nobody can read" if unreadable.hit else None
+
+
+def _recent_below(
+    here: Path, dirnames: list[str], shallow: Sequence[str], cutoff: float, stamps: bool
+) -> tuple[Path | None, list[str]]:
+    """One level of recent_change: a recent directory, and the ones to walk into."""
+    descend: list[str] = []
+    for name in sorted(dirnames):
+        child = here / name
+        if name in (".git", QUARANTINE_DIRNAME) or child.is_symlink():
+            continue
+        if (child / ".git").exists():
+            continue  # a repository of its own, judged on its own
+        if _matches(name, shallow):
+            found = _changed_at_the_top(child, cutoff) if stamps else None
+            if found is not None:
+                return found, []
+            continue
+        if stamps and _changed_since(child, cutoff):
+            return child, []
+        descend.append(name)
+    return None, descend
 
 
 def _changed_at_the_top(directory: Path, cutoff: float) -> Path | None:
@@ -3346,6 +3370,12 @@ def idle_cutoff(clean: dict[str, Any], now: float | None = None) -> float | None
     return (time.time() if now is None else now) - days * 86400
 
 
+def _where(path: Path, root: Path, found: str) -> str:
+    """`found`, said from `root`, for the report."""
+    base = "" if path == root else path.relative_to(root).as_posix()
+    return "/".join(part for part in (base, found) if part and part != ".") or path.name
+
+
 def still_in_use(
     path: Path,
     root: Path,
@@ -3361,15 +3391,55 @@ def still_in_use(
     found = look(path, clean, cutoff)
     if found is None:
         return None
-    where = found if path == root else f"{path.relative_to(root).as_posix()}/{found}"
     return Action(
         "remove",
         scope,
         target,
-        f"kept: {where} changed within clean.idle_days ({clean['idle_days']})",
+        f"kept: {_where(path, root, found)} changed within clean.idle_days ({clean['idle_days']})",
         skipped=True,
         settled=True,
     )
+
+
+class _IdleRecheck:
+    """A Decider that asks clean.idle_days again once a person has said yes.
+
+    --ask waits as long as somebody takes to answer, and a build can start in
+    the folder in the meantime. The first look happened before the question, so
+    the yes is only good for the folder as it was then. Asked again without the
+    stamps this run's own removals change, or the first yes in a folder would
+    hold back every later one.
+    """
+
+    def __init__(self, inner: Decider, path: Path, root: Path, clean: dict[str, Any]) -> None:
+        self.inner = inner
+        self.path = path
+        self.root = root
+        self.clean = clean
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.inner, name)
+
+    def allow(self, action: Action) -> bool:
+        if not self.inner.allow(action):
+            return False
+        cutoff = idle_cutoff(self.clean)
+        found = None if cutoff is None else recent_change(self.path, self.clean, cutoff, False)
+        if found is None:
+            return True
+        action.skipped = True
+        action.detail = (
+            f"kept: {_where(self.path, self.root, found)} changed while the question was "
+            "open (clean.idle_days)"
+        )
+        return False
+
+
+def rechecking(decider: Decider, path: Path, root: Path, clean: dict[str, Any]) -> Decider:
+    """`decider`, made to look again after a yes when a person is answering."""
+    if decider.mode != ASK or idle_cutoff(clean) is None:
+        return decider
+    return _IdleRecheck(decider, path, root, clean)  # type: ignore[return-value]
 
 
 def tracked_paths(git: Git) -> set[str]:
@@ -6199,11 +6269,12 @@ def cmd_clean(context: Context, report: Report) -> None:
         busy = still_in_use(repo, repo, context.name_of(repo), cfg["clean"])
         if busy is not None:
             return [busy]
+        decider = rechecking(context.decider, repo, repo, cfg["clean"])
         actions: list[Action] = []
         # `actions` accumulates across both mechanisms, and clean_tree guards
         # only its own list, so the guard belongs around the pair of them.
         with keeping(actions):
-            _clean_repo(repo, context.name_of(repo), cfg, context, actions)
+            _clean_repo(repo, context.name_of(repo), cfg, context, actions, decider)
         return actions
 
     _in_parallel(context, work, report)
@@ -6255,8 +6326,10 @@ def _clean_repo(
     cfg: dict[str, Any],
     context: Context,
     actions: list[Action],
+    decider: Decider | None = None,
 ) -> None:
     """Both cleaning mechanisms for one repository, accumulating in place."""
+    decider = decider or context.decider
     # Once, here: clean.ignored and the pattern walk both read
     # cfg["clean"]["keep"], and resolving the workspace-relative patterns
     # separately in each of them is how they would come to disagree about what
@@ -6274,7 +6347,7 @@ def _clean_repo(
     # leaves the pattern walk below far less ground to cover.
     already: set[str] = set()
     if cfg["clean"]["ignored"]:
-        ignored = clean_ignored(repo, name, cfg, context.decider, holding, git, context.quarantine)
+        ignored = clean_ignored(repo, name, cfg, decider, holding, git, context.quarantine)
         actions += ignored
         # Every path clean.ignored actually decided about — removed, quarantined,
         # declined, or refused for what is inside it. A path it merely did not
@@ -6286,7 +6359,7 @@ def _clean_repo(
         repo,
         name,
         cfg,
-        context.decider,
+        decider,
         git,
         holding,
         already=already,
@@ -6312,21 +6385,25 @@ def _outside_repos(
     workspace = context.workspace
 
     done: list[Action] = []
-    # One walk per directory, not one per artefact in it: a loose tree with a
-    # __pycache__ in every package would otherwise walk itself once for each.
-    answers: dict[tuple[Path, int], str | None] = {}
+    # No repository owns a loose artefact, so the directory holding it stands
+    # in for one: a build in a scratch directory writes its dist/ next to its
+    # sources. All of them are looked at before anything is removed, because a
+    # removal changes the stamp of the directory it happened in, and the next
+    # artefact there would then read as busy, or not, depending on which thread
+    # got there first. One walk per directory and configuration, not one per
+    # artefact: a loose tree with a __pycache__ in every package would
+    # otherwise walk itself once for each.
+    answers: dict[tuple[Path, int, tuple[str, ...]], str | None] = {}
+    busy: dict[Path, Action] = {}
 
     def look(parent: Path, clean: dict[str, Any], cutoff: float) -> str | None:
-        key = (parent, clean["idle_days"])
+        key = (parent, clean["idle_days"], (*clean_patterns(clean)[0], *clean["dependency_dirs"]))
         if key not in answers:
             answers[key] = recent_change(parent, clean, cutoff)
         return answers[key]
 
-    def handle(item: tuple[Path, bool, dict[str, Any]]) -> Action:
-        path, is_dir, here_cfg = item
-        # No repository owns it, so the directory holding it stands in for one:
-        # a build in a scratch directory writes its dist/ next to its sources.
-        busy = still_in_use(
+    for path, _, here_cfg in candidates:
+        held = still_in_use(
             path.parent,
             workspace,
             "workspace",
@@ -6334,15 +6411,20 @@ def _outside_repos(
             target=path.relative_to(workspace).as_posix(),
             look=look,
         )
-        if busy is not None:
-            return busy
+        if held is not None:
+            busy[path] = held
+
+    def handle(item: tuple[Path, bool, dict[str, Any]]) -> Action:
+        path, is_dir, here_cfg = item
+        if path in busy:
+            return busy[path]
         # Both the quarantine decision and the regenerable list come from the
         # config that governs *this* path, not the workspace root's.
         return _remove(
             path,
             workspace,
             "workspace",
-            context.decider,
+            rechecking(context.decider, path.parent, workspace, here_cfg),
             quarantine if here_cfg["quarantine"] else None,
             is_dir,
             protect_nested=(guarded := not _matches(path.name, here_cfg["regenerable"])),
