@@ -7706,6 +7706,61 @@ def test_a_busy_repository_is_summarised_not_listed_as_other(workspace: Path, ca
     assert "other, see the lines marked" not in out
 
 
+def test_a_busy_repository_with_nothing_to_remove_is_not_held_back(workspace: Path, capsys):
+    """A clean changes the stamps it removed from; the next run must not call that work."""
+    (workspace / "repo" / "src").mkdir()
+    (workspace / ".git-tidy.yaml").write_text("clean:\n  idle_days: 3\n", encoding="utf-8")
+
+    gt.main(["-C", str(workspace), "clean", "-v"])
+    out = capsys.readouterr().out
+    assert "changed within clean.idle_days" not in out
+    assert "in use within clean.idle_days" not in out
+
+
+def test_the_removal_probe_stops_at_the_first_candidate(workspace: Path, monkeypatch):
+    repo = workspace / "repo"
+    for package in ("a", "b"):
+        (repo / package / "__pycache__").mkdir(parents=True)
+    context = gt.Context(
+        workspace,
+        gt.ConfigResolver(workspace),
+        run(gt.DRY),
+        quiet_printer(),
+        gt.find_repos(workspace, []),
+        _holding(workspace),
+    )
+    asked: list[gt.Action] = []
+
+    def allow(self, action):
+        asked.append(action)
+        raise gt._WouldRemove
+
+    monkeypatch.setattr(gt._Probe, "allow", allow)
+    assert gt.offers_a_removal(repo, "repo", context.config_for(repo), context)
+    assert len(asked) == 1
+    assert (repo / "a" / "__pycache__").exists()
+    assert (repo / "b" / "__pycache__").exists()
+
+
+def test_a_directory_whose_only_contents_lead_to_protected_entries_is_kept_whole(tmp_path):
+    modules = tmp_path / "node_modules"
+    kept = modules / "next" / "dist" / "compiled" / "jsonwebtoken"
+    kept.mkdir(parents=True)
+    (kept / "index.js").write_text("x", encoding="utf-8")
+    assert gt._nothing_else_inside(modules, [kept])
+
+    (modules / "next" / "dist" / "server.js").write_text("x", encoding="utf-8")
+    assert not gt._nothing_else_inside(modules, [kept])
+
+
+def test_an_empty_directory_beside_a_protected_entry_still_goes(tmp_path):
+    modules = tmp_path / "node_modules"
+    kept = modules / "js-tokens"
+    kept.mkdir(parents=True)
+    (modules / "left-over").mkdir()
+    assert not gt._nothing_else_inside(modules, [kept])
+
+
 def test_idle_days_refuses_a_negative_number(workspace: Path):
     (workspace / ".git-tidy.yaml").write_text("clean:\n  idle_days: -1\n", encoding="utf-8")
     with pytest.raises(gt.Failure, match="cannot be negative"):

@@ -70,7 +70,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NoReturn
 
-__version__ = "3.4.0"
+__version__ = "3.4.1"
 
 CONFIG_NAMES = (".git-tidy.yaml", ".git-tidy.yml")
 QUARANTINE_DIRNAME = ".git-tidy-trash"
@@ -4367,6 +4367,12 @@ def _nothing_else_inside(directory: Path, rescue: Sequence[Path]) -> bool:
     everything in it is protected" when what was left over happened to be
     zero-byte files or bare sub-directories — and because that check comes
     before the prompt, they were then never removed on any run.
+
+    A directory on the way to a protected entry is not something else either:
+    it cannot go while the entry stays. Counting next/dist/compiled above a
+    kept jsonwebtoken/ as removable offered the same node_modules for emptying
+    on every run, freeing nothing, and its stamp then read as work for
+    clean.idle_days.
     """
     # Compared as written, not resolved: a symlink `current -> .env` resolves to
     # the protected .env and would count as protected itself, so the directory
@@ -4377,8 +4383,11 @@ def _nothing_else_inside(directory: Path, rescue: Sequence[Path]) -> bool:
         here = Path(dirpath)
         for name in (*dirnames, *filenames):
             candidate = Path(os.path.normpath(here / name))
-            if candidate not in kept and not any(one in candidate.parents for one in kept):
-                return False
+            if candidate in kept or any(
+                one in candidate.parents or candidate in one.parents for one in kept
+            ):
+                continue
+            return False
         dirnames[:] = [d for d in dirnames if Path(os.path.normpath(here / d)) not in kept]
     return True
 
@@ -6256,6 +6265,35 @@ def cmd_prune(context: Context, report: Report) -> None:
     _in_parallel(context, work, report)
 
 
+class _WouldRemove(Exception):
+    """Raised by _Probe at the first removal a repository offers."""
+
+
+class _Probe(Decider):
+    """A dry Decider that stops at the first thing it is asked to remove."""
+
+    def __init__(self) -> None:
+        super().__init__(DRY)
+
+    def allow(self, action: Action) -> bool:
+        raise _WouldRemove
+
+
+def offers_a_removal(repo: Path, name: str, cfg: dict[str, Any], context: Context) -> bool:
+    """Whether cleaning `repo` would remove anything at all.
+
+    A clean changes the stamps of the directories it removed things from, so
+    for clean.idle_days after it every cleaned repository read as in use. The
+    run after a clean of ~/git/.claude-harness then held back 181 repositories
+    that had nothing left to remove, and called them work for the user.
+    """
+    try:
+        _clean_repo(repo, name, cfg, context, [], _Probe())
+    except _WouldRemove:
+        return True
+    return False
+
+
 def cmd_clean(context: Context, report: Report) -> None:
     context.printer.heading("Artefacts")
     root_cfg = context.config_for(context.workspace)
@@ -6268,7 +6306,7 @@ def cmd_clean(context: Context, report: Report) -> None:
         # left whole, not thinned, so a build running there keeps its tree.
         busy = still_in_use(repo, repo, context.name_of(repo), cfg["clean"])
         if busy is not None:
-            return [busy]
+            return [busy] if offers_a_removal(repo, context.name_of(repo), cfg, context) else []
         decider = rechecking(context.decider, repo, repo, cfg["clean"])
         actions: list[Action] = []
         # `actions` accumulates across both mechanisms, and clean_tree guards
